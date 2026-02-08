@@ -1,0 +1,25 @@
+[package]
+name = "hypr-nav"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+description = "Smart, hackable navigation between Hyprland windows and terminal multiplexers (Tmux, Kitty)."
+repository = "https://github.com/joe-butler-23/hypr-nav"
+
+[lib]
+name = "hypr_nav_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hypr-kitty-nav"
+path = "src/main.rs"
+
+[[bin]]
+name = "hypr-tmux-nav"
+path = "src/tmux.rs"
+
+[[bin]]
+name = "hypr-smart-close"
+path = "src/close.rs"
+
+[dependencies]
