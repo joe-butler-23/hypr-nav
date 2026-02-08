@@ -1,5 +1,7 @@
 # hypr-nav
 
+![hypr-nav-banner](assets/hypr-nav.png)
+
 **Context-Aware Navigation for Hyprland, Tmux, and Kitty.**
 
 Stop fighting with your keybinds. `hypr-nav` is a "smart bridge" that lets you use the same keys (e.g., `Super+H/J/K/L`) to navigate:
