@@ -4,13 +4,11 @@
 
 **Context-Aware Navigation for Hyprland, Tmux, and Kitty.**
 
-Stop fighting with your keybinds. `hypr-nav` is a "smart bridge" that lets you use the same keys (e.g., `Super+H/J/K/L`) to navigate:
+Stop fighting with your keybinds (or memorizing different binds for different apps). `hypr-nav` is like a bridge that lets you reuse binds, e.g:
 1.  **Inside** your terminal multiplexer (Tmux panes, Kitty windows)
 2.  **Between** Hyprland windows (when you hit the edge of a pane)
 
-It also includes `hypr-smart-close`, a context-aware `Super+C` that knows when to close a pane, detach a session, or kill a window.
-
-## Features
+I have also included `hypr-smart-close`, a context-aware `Super+C` that knows when to close a pane, detach a session, or kill a window:
 
 - **Seamless Context Switching**: Automatically detects if you are in a terminal running Tmux.
 - **Edge Detection**: Smart enough to know when you're at the top pane of Tmux and pass the `Up` command to Hyprland instead.
@@ -19,6 +17,8 @@ It also includes `hypr-smart-close`, a context-aware `Super+C` that knows when t
     - Closing a generic pane? **Kills** it.
     - Closing the last pane? **Closes** the window.
 - **Zero Config for Apps**: Works by inspecting the process tree and IPC sockets. No plugins required for Hyprland (just binds).
+
+The tmux/kitty stuff may be useful for people in its current form. I imagine the smart-close thing will mostly be useful for me and my specific needs. But it should serve as a useful demonstration of how the approach taken with this tool could be adapted to your own specific needs. 
 
 ## Installation
 
@@ -35,7 +35,7 @@ sudo cp target/release/hypr-kitty-nav /usr/local/bin/
 
 ## Configuration (Hyprland)
 
-Add this to your `~/.config/hypr/hyprland.conf`:
+Replace your binds to call the relevant tools in your `~/.config/hypr/hyprland.conf`, e.g:
 
 ```ini
 # Navigation (replace with your preferred keys)
@@ -50,7 +50,7 @@ bind = SUPER, c, exec, hypr-smart-close
 
 ## How It Works
 
-The architecture follows a **Discover -> Inspect -> Act** pipeline:
+The architecture is basically **Discover -> Inspect -> Act**, for example hypr-smart-close does the following:
 
 1.  **Discover**: Queries Hyprland to see if the active window is a terminal.
 2.  **Inspect**: Walks the process tree (`/proc`) to see if `tmux` is running inside that terminal.
@@ -59,9 +59,9 @@ The architecture follows a **Discover -> Inspect -> Act** pipeline:
     - If yes, tells Hyprland to move focus.
     - If no, tells Tmux to select the next pane.
 
-## Hacking
+## Forking 
 
-The core logic is modularized in `src/lib.rs`. You can easily extend this to support other multiplexers (Zellij?) or editors (Neovim?) by adding new detection logic.
+The core logic is modularized in `src/lib.rs`. I am pretty confident you could easily extend this to support other multiplexers (Zellij?) or editors (Neovim?) by adding new detection logic.
 
 ## License
 
