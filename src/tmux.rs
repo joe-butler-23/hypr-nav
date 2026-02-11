@@ -26,13 +26,17 @@ fn main() {
         if is_terminal_class(&class) {
             if let Some(runtime) = detect_tmux_runtime(pid) {
                 let socket_path = runtime.socket_path.as_deref();
-                if let Some(pane) = find_tmux_client_pane(&runtime.tty, socket_path) {
+                if let Some(pane) = find_tmux_client_pane(&runtime.tty, socket_path)
+                    .or_else(|| find_tmux_pane_by_tty(&runtime.tty, socket_path))
+                {
                     if !is_pane_at_edge(&pane, tmux_dir, socket_path)
                         && try_tmux_navigate(&pane, tmux_dir, socket_path)
                     {
                         return;
                     }
-                } else if let Some(session) = find_tmux_session(&runtime.tty, socket_path) {
+                } else if let Some(session) = find_tmux_session(&runtime.tty, socket_path)
+                    .or_else(|| find_tmux_session_by_pane_tty(&runtime.tty, socket_path))
+                {
                     if !is_pane_at_edge(&session, tmux_dir, socket_path)
                         && try_tmux_navigate(&session, tmux_dir, socket_path)
                     {

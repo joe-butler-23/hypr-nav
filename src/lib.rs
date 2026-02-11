@@ -125,6 +125,16 @@ fn read_tmux_socket_from_environ(pid: u32) -> Option<String> {
     parse_tmux_socket_from_environ(&environ)
 }
 
+fn read_process_tty(pid: u32) -> Option<String> {
+    let link = fs::read_link(format!("/proc/{}/fd/0", pid)).ok()?;
+    let tty = link.to_str()?.to_string();
+    if tty.starts_with("/dev/pts/") {
+        Some(tty)
+    } else {
+        None
+    }
+}
+
 /// Combined detection: find TTY, tmux presence, and tmux socket from process tree.
 pub fn detect_tmux_runtime(pid: u32) -> Option<TmuxRuntime> {
     let mut tty: Option<String> = None;
@@ -142,15 +152,11 @@ pub fn detect_tmux_runtime(pid: u32) -> Option<TmuxRuntime> {
         }
         checked.insert(current_pid);
 
+        let current_tty = read_process_tty(current_pid);
+
         // Check for TTY on this process
         if tty.is_none() {
-            if let Ok(link) = fs::read_link(format!("/proc/{}/fd/0", current_pid)) {
-                if let Some(tty_str) = link.to_str() {
-                    if tty_str.starts_with("/dev/pts/") {
-                        tty = Some(tty_str.to_string());
-                    }
-                }
-            }
+            tty = current_tty.clone();
         }
 
         // Check if this process is tmux
@@ -165,6 +171,12 @@ pub fn detect_tmux_runtime(pid: u32) -> Option<TmuxRuntime> {
 
         if socket_path.is_none() {
             socket_path = read_tmux_socket_from_environ(current_pid);
+            if socket_path.is_some() {
+                has_tmux = true;
+                if current_tty.is_some() {
+                    tty = current_tty.clone();
+                }
+            }
         }
 
         // Early exit if we found everything useful
@@ -248,6 +260,36 @@ fn parse_tmux_client_pane(clients: &str, tty: &str) -> Option<String> {
     None
 }
 
+fn parse_tmux_pane_by_tty(panes: &str, tty: &str) -> Option<String> {
+    for line in panes.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let pane_tty = parts[0];
+        let pane_id = parts[1];
+        if pane_tty == tty {
+            return Some(pane_id.to_string());
+        }
+    }
+    None
+}
+
+fn parse_tmux_session_by_pane_tty(panes: &str, tty: &str) -> Option<String> {
+    for line in panes.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let pane_tty = parts[0];
+        let session_id = parts[1];
+        if pane_tty == tty {
+            return Some(session_id.to_string());
+        }
+    }
+    None
+}
+
 /// Find the active tmux pane for a given client TTY
 pub fn find_tmux_client_pane(tty: &str, socket_path: Option<&str>) -> Option<String> {
     let output = tmux_command(socket_path)
@@ -263,6 +305,40 @@ pub fn find_tmux_client_pane(tty: &str, socket_path: Option<&str>) -> Option<Str
 
     let clients = String::from_utf8_lossy(&output.stdout);
     parse_tmux_client_pane(&clients, tty)
+}
+
+/// Find pane by pane tty when we discovered a pane PTY rather than client TTY.
+pub fn find_tmux_pane_by_tty(tty: &str, socket_path: Option<&str>) -> Option<String> {
+    let output = tmux_command(socket_path)
+        .args(["list-panes", "-a", "-F", "#{pane_tty} #{pane_id}"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let panes = String::from_utf8_lossy(&output.stdout);
+    parse_tmux_pane_by_tty(&panes, tty)
+}
+
+/// Find session by pane tty when we discovered a pane PTY rather than client TTY.
+pub fn find_tmux_session_by_pane_tty(tty: &str, socket_path: Option<&str>) -> Option<String> {
+    let output = tmux_command(socket_path)
+        .args(["list-panes", "-a", "-F", "#{pane_tty} #{session_id}"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let panes = String::from_utf8_lossy(&output.stdout);
+    parse_tmux_session_by_pane_tty(&panes, tty)
 }
 
 /// Check if the active pane in the session is at the edge in the given direction
@@ -409,5 +485,23 @@ mod tests {
     fn parse_tmux_socket_from_environ_ignores_missing_tmux_entry() {
         let env = b"SHELL=/bin/zsh\0PATH=/usr/bin\0";
         assert_eq!(parse_tmux_socket_from_environ(env), None);
+    }
+
+    #[test]
+    fn parse_tmux_pane_by_tty_matches_exact_tty() {
+        let data = "/dev/pts/12 %3\n/dev/pts/13 %4\n";
+        assert_eq!(
+            parse_tmux_pane_by_tty(data, "/dev/pts/13"),
+            Some("%4".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_tmux_session_by_pane_tty_matches_exact_tty() {
+        let data = "/dev/pts/12 $3\n/dev/pts/13 $4\n";
+        assert_eq!(
+            parse_tmux_session_by_pane_tty(data, "/dev/pts/12"),
+            Some("$3".to_string())
+        );
     }
 }

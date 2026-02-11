@@ -11,7 +11,9 @@ fn main() {
         if is_terminal_class(&class) {
             if let Some(runtime) = detect_tmux_runtime(pid) {
                 let socket_path = runtime.socket_path.as_deref();
-                if let Some(session) = find_tmux_session(&runtime.tty, socket_path) {
+                if let Some(session) = find_tmux_session(&runtime.tty, socket_path)
+                    .or_else(|| find_tmux_session_by_pane_tty(&runtime.tty, socket_path))
+                {
                     if handle_tmux_close(&session, socket_path) {
                         return;
                     }
