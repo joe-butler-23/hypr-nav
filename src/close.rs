@@ -9,12 +9,11 @@ fn main() {
 
     if let Some((class, pid)) = get_active_window_info(&hypr_socket) {
         if is_terminal_class(&class) {
-            if let Some((tty, has_tmux)) = detect_tmux_and_tty(pid) {
-                if has_tmux {
-                    if let Some(session) = find_tmux_session(&tty) {
-                        if handle_tmux_close(&session, &hypr_socket) {
-                            return;
-                        }
+            if let Some(runtime) = detect_tmux_runtime(pid) {
+                let socket_path = runtime.socket_path.as_deref();
+                if let Some(session) = find_tmux_session(&runtime.tty, socket_path) {
+                    if handle_tmux_close(&session, socket_path) {
+                        return;
                     }
                 }
             }
@@ -24,25 +23,35 @@ fn main() {
     hypr_dispatch(&hypr_socket, "killactive");
 }
 
-fn handle_tmux_close(session: &str, _hypr_socket: &std::path::PathBuf) -> bool {
-    if let Some(info) = get_tmux_session_info(session) {
+fn handle_tmux_close(session: &str, socket_path: Option<&str>) -> bool {
+    if let Some(info) = get_tmux_session_info(session, socket_path) {
         if info.is_named || (info.window_count == 1 && info.pane_count == 1) {
-            let _ = Command::new("tmux")
-                .args(&["detach-client", "-t", session])
+            let mut command = Command::new("tmux");
+            if let Some(path) = socket_path {
+                command.args(["-S", path]);
+            }
+            return command
+                .args(["detach-client", "-t", session])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .output();
-            return false;
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
         }
 
-        return try_tmux_close_pane(session);
+        return try_tmux_close_pane(session, socket_path);
     }
     false
 }
 
-fn try_tmux_close_pane(session: &str) -> bool {
-    let output = Command::new("tmux")
-        .args(&["kill-pane", "-t", session])
+fn try_tmux_close_pane(session: &str, socket_path: Option<&str>) -> bool {
+    let mut command = Command::new("tmux");
+    if let Some(path) = socket_path {
+        command.args(["-S", path]);
+    }
+
+    let output = command
+        .args(["kill-pane", "-t", session])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .output();

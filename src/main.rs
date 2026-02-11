@@ -29,14 +29,16 @@ fn main() {
         let kitty_sock = PathBuf::from(&xdg).join("kitty");
 
         if kitty_sock.exists() {
+            let kitty_socket_uri = format!("unix:{}", kitty_sock.display());
+            let neighbor_match = format!("neighbor:{}", kitty_dir);
             let status = Command::new("kitty")
-                .args(&[
+                .args([
                     "@",
                     "--to",
-                    &format!("unix:{}", kitty_sock.display()),
+                    &kitty_socket_uri,
                     "focus-window",
                     "--match",
-                    &format!("neighbor:{}", kitty_dir),
+                    &neighbor_match,
                 ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -60,6 +62,7 @@ fn is_kitty_active(socket_path: &PathBuf) -> bool {
 
     if let Ok(mut stream) = UnixStream::connect(socket_path) {
         if stream.write_all(b"activewindow").is_ok() {
+            let _ = stream.shutdown(std::net::Shutdown::Write);
             let mut response = String::new();
             if stream.read_to_string(&mut response).is_ok() {
                 return response.contains("class: kitty");

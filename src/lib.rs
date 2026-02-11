@@ -2,12 +2,18 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 /// Known terminal emulator window classes
 pub const KNOWN_TERMINALS: &[&str] = &["kitty"];
+
+pub struct TmuxRuntime {
+    pub tty: String,
+    pub socket_path: Option<String>,
+}
 
 /// Check if the window class represents a terminal emulator
 pub fn is_terminal_class(class: &str) -> bool {
@@ -41,16 +47,20 @@ pub fn find_hyprland_socket() -> Option<PathBuf> {
     }
 
     let hypr_dir = PathBuf::from(&xdg).join("hypr").join(&sig);
-    let socket_names = [".socket.sock", ".socket2.sock", "socket.sock"];
+    let socket_names = [".socket.sock", "socket.sock"];
 
     for name in &socket_names {
         let path = hypr_dir.join(name);
         if path.exists() {
-            return Some(path);
+            if let Ok(meta) = fs::metadata(&path) {
+                if meta.file_type().is_socket() {
+                    return Some(path);
+                }
+            }
         }
     }
 
-    Some(hypr_dir.join(".socket.sock"))
+    None
 }
 
 /// Get active window class and PID in a single Hyprland query
@@ -84,11 +94,42 @@ pub fn get_active_window_info(socket_path: &PathBuf) -> Option<(String, u32)> {
     }
 }
 
-/// Combined detection: find TTY and check for tmux in process tree
-/// Returns (tty_path, has_tmux)
-pub fn detect_tmux_and_tty(pid: u32) -> Option<(String, bool)> {
+fn parse_tmux_socket_from_value(tmux_value: &str) -> Option<String> {
+    // TMUX format: "<socket_path>,<server_pid>,<session_id>"
+    let mut parts = tmux_value.rsplitn(3, ',');
+    let _session_id = parts.next()?;
+    let _server_pid = parts.next()?;
+    let socket_path = parts.next()?.trim();
+    if socket_path.is_empty() {
+        None
+    } else {
+        Some(socket_path.to_string())
+    }
+}
+
+fn parse_tmux_socket_from_environ(environ: &[u8]) -> Option<String> {
+    for entry in environ.split(|b| *b == 0) {
+        if let Some(value) = entry.strip_prefix(b"TMUX=") {
+            if let Ok(tmux_value) = std::str::from_utf8(value) {
+                if let Some(socket_path) = parse_tmux_socket_from_value(tmux_value) {
+                    return Some(socket_path);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn read_tmux_socket_from_environ(pid: u32) -> Option<String> {
+    let environ = fs::read(format!("/proc/{}/environ", pid)).ok()?;
+    parse_tmux_socket_from_environ(&environ)
+}
+
+/// Combined detection: find TTY, tmux presence, and tmux socket from process tree.
+pub fn detect_tmux_runtime(pid: u32) -> Option<TmuxRuntime> {
     let mut tty: Option<String> = None;
     let mut has_tmux = false;
+    let mut socket_path: Option<String> = None;
 
     // BFS through process tree (downward) to find both TTY and tmux
     const MAX_DEPTH: usize = 10;
@@ -122,8 +163,12 @@ pub fn detect_tmux_and_tty(pid: u32) -> Option<(String, bool)> {
             }
         }
 
-        // Early exit if we found both
-        if tty.is_some() && has_tmux {
+        if socket_path.is_none() {
+            socket_path = read_tmux_socket_from_environ(current_pid);
+        }
+
+        // Early exit if we found everything useful
+        if tty.is_some() && has_tmux && socket_path.is_some() {
             break;
         }
 
@@ -138,14 +183,26 @@ pub fn detect_tmux_and_tty(pid: u32) -> Option<(String, bool)> {
         }
     }
 
-    tty.map(|t| (t, has_tmux))
+    if !has_tmux {
+        return None;
+    }
+
+    tty.map(|tty| TmuxRuntime { tty, socket_path })
+}
+
+fn tmux_command(socket_path: Option<&str>) -> Command {
+    let mut command = Command::new("tmux");
+    if let Some(path) = socket_path.filter(|path| !path.is_empty()) {
+        command.args(["-S", path]);
+    }
+    command
 }
 
 /// Find the tmux session for a given TTY
-pub fn find_tmux_session(tty: &str) -> Option<String> {
+pub fn find_tmux_session(tty: &str, socket_path: Option<&str>) -> Option<String> {
     // Single tmux call to get all client info
-    let output = Command::new("tmux")
-        .args(&["list-clients", "-F", "#{client_session} #{client_tty}"])
+    let output = tmux_command(socket_path)
+        .args(["list-clients", "-F", "#{client_session} #{client_tty}"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -160,8 +217,6 @@ pub fn find_tmux_session(tty: &str) -> Option<String> {
 }
 
 fn parse_tmux_client_session(clients: &str, tty: &str) -> Option<String> {
-    let mut sessions: HashSet<String> = HashSet::new();
-
     for line in clients.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 2 {
@@ -172,13 +227,7 @@ fn parse_tmux_client_session(clients: &str, tty: &str) -> Option<String> {
             if tty == client_tty {
                 return Some(session.to_string());
             }
-            sessions.insert(session.to_string());
         }
-    }
-
-    // If only one session exists, use it (common case)
-    if sessions.len() == 1 {
-        return sessions.into_iter().next();
     }
 
     None
@@ -200,9 +249,9 @@ fn parse_tmux_client_pane(clients: &str, tty: &str) -> Option<String> {
 }
 
 /// Find the active tmux pane for a given client TTY
-pub fn find_tmux_client_pane(tty: &str) -> Option<String> {
-    let output = Command::new("tmux")
-        .args(&["list-clients", "-F", "#{client_tty} #{pane_id}"])
+pub fn find_tmux_client_pane(tty: &str, socket_path: Option<&str>) -> Option<String> {
+    let output = tmux_command(socket_path)
+        .args(["list-clients", "-F", "#{client_tty} #{pane_id}"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -217,7 +266,7 @@ pub fn find_tmux_client_pane(tty: &str) -> Option<String> {
 }
 
 /// Check if the active pane in the session is at the edge in the given direction
-pub fn is_pane_at_edge(session: &str, direction: &str) -> bool {
+pub fn is_pane_at_edge(session: &str, direction: &str, socket_path: Option<&str>) -> bool {
     let flag = match direction {
         "L" => "#{pane_at_left}",
         "R" => "#{pane_at_right}",
@@ -226,8 +275,8 @@ pub fn is_pane_at_edge(session: &str, direction: &str) -> bool {
         _ => return false,
     };
 
-    let output = Command::new("tmux")
-        .args(&["display-message", "-t", session, "-p", flag])
+    let output = tmux_command(socket_path)
+        .args(["display-message", "-t", session, "-p", flag])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output();
@@ -248,10 +297,10 @@ pub struct TmuxSessionInfo {
     pub pane_count: usize,
 }
 
-pub fn get_tmux_session_info(session: &str) -> Option<TmuxSessionInfo> {
+pub fn get_tmux_session_info(session: &str, socket_path: Option<&str>) -> Option<TmuxSessionInfo> {
     // Format: #{session_name} #{window_panes} #{session_windows}
-    let output = Command::new("tmux")
-        .args(&[
+    let output = tmux_command(socket_path)
+        .args([
             "display-message",
             "-t",
             session,
@@ -333,11 +382,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_tmux_client_session_accepts_single_unique_session() {
+    fn parse_tmux_client_session_returns_none_without_exact_tty_match() {
         let data = "$3 /dev/pts/1\n$3 /dev/pts/5\n";
+        assert_eq!(parse_tmux_client_session(data, "/dev/pts/99"), None);
+    }
+
+    #[test]
+    fn parse_tmux_socket_from_value_extracts_socket_path() {
+        let value = "/tmp/tmux-1000/custom,41204,7";
         assert_eq!(
-            parse_tmux_client_session(data, "/dev/pts/99"),
-            Some("$3".to_string())
+            parse_tmux_socket_from_value(value),
+            Some("/tmp/tmux-1000/custom".to_string())
         );
+    }
+
+    #[test]
+    fn parse_tmux_socket_from_environ_finds_tmux_entry() {
+        let env = b"SHELL=/bin/zsh\0TMUX=/tmp/tmux-1000/default,1234,0\0";
+        assert_eq!(
+            parse_tmux_socket_from_environ(env),
+            Some("/tmp/tmux-1000/default".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_tmux_socket_from_environ_ignores_missing_tmux_entry() {
+        let env = b"SHELL=/bin/zsh\0PATH=/usr/bin\0";
+        assert_eq!(parse_tmux_socket_from_environ(env), None);
     }
 }
