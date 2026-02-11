@@ -142,6 +142,10 @@ fn find_entry_assist_pane(
         socket_path,
     )?;
 
+    choose_entry_assist_pane(&pane_rows, direction)
+}
+
+fn choose_entry_assist_pane(pane_rows: &str, direction: &str) -> Option<String> {
     let target_flag_index = match direction {
         "L" => 2, // moving left -> prefer right-edge pane on entry
         "R" => 1, // moving right -> prefer left-edge pane on entry
@@ -150,27 +154,32 @@ fn find_entry_assist_pane(
         _ => return None,
     };
 
+    let mut pane_count = 0usize;
     let mut inactive_candidate: Option<String> = None;
-    let mut active_candidate: Option<String> = None;
 
     for row in pane_rows.lines() {
         let parts: Vec<&str> = row.split_whitespace().collect();
         if parts.len() < 6 {
             continue;
         }
+        pane_count += 1;
         if parts[target_flag_index] != "1" {
             continue;
         }
         let pane_id = parts[0].to_string();
         let pane_active = parts[5] == "1";
-        if pane_active {
-            active_candidate = Some(pane_id);
-        } else if inactive_candidate.is_none() {
+        if !pane_active && inactive_candidate.is_none() {
             inactive_candidate = Some(pane_id);
         }
     }
 
-    inactive_candidate.or(active_candidate)
+    // Option 2: only apply entry assist when there is more than one pane.
+    if pane_count <= 1 {
+        return None;
+    }
+
+    // Option 1: jump to the opposite edge pane, but only if it's different from current.
+    inactive_candidate
 }
 
 fn main() {
@@ -328,4 +337,33 @@ fn try_tmux_navigate(target: &str, direction: &str, socket_path: Option<&str>) -
         ),
     );
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::choose_entry_assist_pane;
+
+    #[test]
+    fn choose_entry_assist_pane_prefers_inactive_opposite_edge() {
+        let rows = "\
+%0 1 0 1 1 1
+%1 0 1 1 1 0
+";
+        assert_eq!(choose_entry_assist_pane(rows, "L"), Some("%1".to_string()));
+    }
+
+    #[test]
+    fn choose_entry_assist_pane_requires_multiple_panes() {
+        let rows = "%0 1 1 1 1 1\n";
+        assert_eq!(choose_entry_assist_pane(rows, "L"), None);
+    }
+
+    #[test]
+    fn choose_entry_assist_pane_never_returns_active_same_pane() {
+        let rows = "\
+%0 0 1 1 1 1
+%1 1 0 1 1 0
+";
+        assert_eq!(choose_entry_assist_pane(rows, "L"), None);
+    }
 }
