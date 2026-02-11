@@ -14,7 +14,7 @@ fn main() {
                 "smart-close",
                 &format!("terminal active class={} pid={}", class, pid),
             );
-            if let Some(runtime) = detect_tmux_runtime(pid) {
+            if let Some(runtime) = detect_tmux_runtime(pid, &class) {
                 let socket_path = runtime.socket_path.as_deref();
                 if let Some(session) = find_tmux_session(&runtime.tty, socket_path)
                     .or_else(|| find_tmux_session_by_pane_tty(&runtime.tty, socket_path))

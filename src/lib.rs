@@ -1,3 +1,4 @@
+use serde_json::Value;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -13,6 +14,12 @@ pub const KNOWN_TERMINALS: &[&str] = &["kitty"];
 pub struct TmuxRuntime {
     pub tty: String,
     pub socket_path: Option<String>,
+}
+
+enum KittyRuntimeProbe {
+    Found(TmuxRuntime),
+    NoTmux,
+    Unavailable,
 }
 
 pub fn debug_enabled() -> bool {
@@ -163,8 +170,182 @@ fn read_process_tty(pid: u32) -> Option<String> {
     }
 }
 
+fn process_has_tmux(pid: u32) -> bool {
+    if let Ok(cmdline) = fs::read_to_string(format!("/proc/{}/cmdline", pid)) {
+        let cmd = cmdline.replace('\0', " ");
+        return cmd.contains("tmux") && !cmd.contains("hypr-tmux-nav");
+    }
+    false
+}
+
+fn kitty_socket_path() -> PathBuf {
+    let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(xdg).join("kitty")
+}
+
+fn find_focused_index(items: &[Value]) -> usize {
+    items
+        .iter()
+        .position(|item| {
+            item.get("is_focused")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .unwrap_or(0)
+}
+
+fn read_pids_from_kitty_window(window: &Value) -> Vec<u32> {
+    let mut pids = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(procs) = window.get("foreground_processes").and_then(Value::as_array) {
+        for proc_info in procs {
+            if let Some(pid) = proc_info.get("pid").and_then(Value::as_u64) {
+                if let Ok(pid_u32) = u32::try_from(pid) {
+                    if seen.insert(pid_u32) {
+                        pids.push(pid_u32);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(pid) = window.get("pid").and_then(Value::as_u64) {
+        if let Ok(pid_u32) = u32::try_from(pid) {
+            if seen.insert(pid_u32) {
+                pids.push(pid_u32);
+            }
+        }
+    }
+
+    pids
+}
+
+fn parse_focused_kitty_pids(json: &str) -> Vec<u32> {
+    let parsed: Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let os_windows = match parsed.as_array() {
+        Some(v) if !v.is_empty() => v,
+        _ => return Vec::new(),
+    };
+    let os_window = &os_windows[find_focused_index(os_windows)];
+
+    let tabs = match os_window.get("tabs").and_then(Value::as_array) {
+        Some(v) if !v.is_empty() => v,
+        _ => return Vec::new(),
+    };
+    let tab = &tabs[find_focused_index(tabs)];
+
+    let windows = match tab.get("windows").and_then(Value::as_array) {
+        Some(v) if !v.is_empty() => v,
+        _ => return Vec::new(),
+    };
+    let window = &windows[find_focused_index(windows)];
+
+    read_pids_from_kitty_window(window)
+}
+
+fn detect_tmux_runtime_from_kitty() -> KittyRuntimeProbe {
+    let kitty_socket = kitty_socket_path();
+    if !kitty_socket.exists() {
+        return KittyRuntimeProbe::Unavailable;
+    }
+
+    let kitty_uri = format!("unix:{}", kitty_socket.display());
+    let output = Command::new("kitty")
+        .args(["@", "--to", &kitty_uri, "ls"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok();
+
+    let output = match output {
+        Some(out) => out,
+        None => {
+            debug_log(
+                "lib",
+                "kitty ls failed while resolving focused kitty context",
+            );
+            return KittyRuntimeProbe::Unavailable;
+        }
+    };
+
+    if !output.status.success() {
+        debug_log(
+            "lib",
+            "kitty ls failed while resolving focused kitty context",
+        );
+        return KittyRuntimeProbe::Unavailable;
+    }
+
+    let parsed = String::from_utf8_lossy(&output.stdout);
+    let candidate_pids = parse_focused_kitty_pids(&parsed);
+    if candidate_pids.is_empty() {
+        debug_log(
+            "lib",
+            "kitty ls returned no focused foreground pid candidates",
+        );
+        return KittyRuntimeProbe::Unavailable;
+    }
+
+    for pid in candidate_pids {
+        let tty = read_process_tty(pid);
+        let tmux_socket = read_tmux_socket_from_environ(pid);
+        let has_tmux = tmux_socket.is_some() || process_has_tmux(pid);
+        debug_log(
+            "lib",
+            &format!(
+                "kitty-focused candidate pid={} tty={} tmux_socket={} has_tmux={}",
+                pid,
+                tty.as_deref().unwrap_or("<none>"),
+                tmux_socket.as_deref().unwrap_or("<none>"),
+                has_tmux
+            ),
+        );
+
+        if has_tmux {
+            if let Some(tty) = tty {
+                return KittyRuntimeProbe::Found(TmuxRuntime {
+                    tty,
+                    socket_path: tmux_socket,
+                });
+            }
+        }
+    }
+
+    debug_log(
+        "lib",
+        "kitty-focused context found but no tmux in focused window",
+    );
+    KittyRuntimeProbe::NoTmux
+}
+
 /// Combined detection: find TTY, tmux presence, and tmux socket from process tree.
-pub fn detect_tmux_runtime(pid: u32) -> Option<TmuxRuntime> {
+pub fn detect_tmux_runtime(pid: u32, class: &str) -> Option<TmuxRuntime> {
+    if class.to_ascii_lowercase().contains("kitty") {
+        match detect_tmux_runtime_from_kitty() {
+            KittyRuntimeProbe::Found(runtime) => {
+                debug_log(
+                    "lib",
+                    &format!(
+                        "tmux runtime from kitty tty={} socket={}",
+                        runtime.tty,
+                        runtime.socket_path.as_deref().unwrap_or("<default>")
+                    ),
+                );
+                return Some(runtime);
+            }
+            KittyRuntimeProbe::NoTmux => {
+                debug_log("lib", "kitty-focused probe confirms no tmux");
+                return None;
+            }
+            KittyRuntimeProbe::Unavailable => {}
+        }
+    }
+
     let mut tty: Option<String> = None;
     let mut has_tmux = false;
     let mut socket_path: Option<String> = None;
@@ -189,12 +370,7 @@ pub fn detect_tmux_runtime(pid: u32) -> Option<TmuxRuntime> {
 
         // Check if this process is tmux
         if !has_tmux {
-            if let Ok(cmdline) = fs::read_to_string(format!("/proc/{}/cmdline", current_pid)) {
-                let cmd = cmdline.replace('\0', " ");
-                if cmd.contains("tmux") && !cmd.contains("hypr-tmux-nav") {
-                    has_tmux = true;
-                }
-            }
+            has_tmux = process_has_tmux(current_pid);
         }
 
         if socket_path.is_none() {
@@ -667,5 +843,45 @@ mod tests {
             parse_tmux_session_by_pane_tty(data, "/dev/pts/12"),
             Some("$3".to_string())
         );
+    }
+
+    #[test]
+    fn parse_focused_kitty_pids_prefers_focused_os_window_tab_and_window() {
+        let data = r#"
+[
+  {
+    "is_focused": false,
+    "tabs": [
+      {"is_focused": true, "windows": [{"is_focused": true, "pid": 999}]}
+    ]
+  },
+  {
+    "is_focused": true,
+    "tabs": [
+      {
+        "is_focused": true,
+        "windows": [
+          {
+            "is_focused": false,
+            "pid": 1000
+          },
+          {
+            "is_focused": true,
+            "pid": 2000,
+            "foreground_processes": [{"pid": 2001}, {"pid": 2002}]
+          }
+        ]
+      }
+    ]
+  }
+]
+"#;
+
+        assert_eq!(parse_focused_kitty_pids(data), vec![2001, 2002, 2000]);
+    }
+
+    #[test]
+    fn parse_focused_kitty_pids_returns_empty_on_invalid_json() {
+        assert!(parse_focused_kitty_pids("not-json").is_empty());
     }
 }
