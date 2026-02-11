@@ -6,7 +6,7 @@ use hypr_nav_lib::*;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: hypr-kitty-nav <h|j|k|l|left|right|up|down>");
+        eprintln!("usage: hypr-nav <h|j|k|l|left|right|up|down>");
         std::process::exit(1);
     }
 

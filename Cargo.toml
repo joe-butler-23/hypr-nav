@@ -11,7 +11,7 @@ name = "hypr_nav_lib"
 path = "src/lib.rs"
 
 [[bin]]
-name = "hypr-kitty-nav"
+name = "hypr-nav"
 path = "src/main.rs"
 
 [[bin]]

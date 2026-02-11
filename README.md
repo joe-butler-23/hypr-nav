@@ -30,7 +30,7 @@ cd hypr-nav
 cargo build --release
 sudo cp target/release/hypr-tmux-nav /usr/local/bin/
 sudo cp target/release/hypr-smart-close /usr/local/bin/
-sudo cp target/release/hypr-kitty-nav /usr/local/bin/
+sudo cp target/release/hypr-nav /usr/local/bin/
 ```
 
 ## Configuration (Hyprland)
