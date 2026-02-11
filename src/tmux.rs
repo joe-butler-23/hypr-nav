@@ -234,7 +234,15 @@ fn main() {
                         if let Some(entry_pane) =
                             find_entry_assist_pane(&pane, tmux_dir, socket_path)
                         {
-                            if select_tmux_pane(&entry_pane, socket_path) {
+                            if entry_pane == pane {
+                                debug_log(
+                                    "tmux-nav",
+                                    &format!(
+                                        "entry assist target {} already active; continuing",
+                                        entry_pane
+                                    ),
+                                );
+                            } else if select_tmux_pane(&entry_pane, socket_path) {
                                 debug_log(
                                     "tmux-nav",
                                     &format!(
@@ -269,7 +277,19 @@ fn main() {
                         if let Some(entry_pane) =
                             find_entry_assist_pane(&session, tmux_dir, socket_path)
                         {
-                            if select_tmux_pane(&entry_pane, socket_path) {
+                            let current_pane = tmux_capture(
+                                &["display-message", "-t", &session, "-p", "#{pane_id}"],
+                                socket_path,
+                            );
+                            if current_pane.as_deref() == Some(entry_pane.as_str()) {
+                                debug_log(
+                                    "tmux-nav",
+                                    &format!(
+                                        "entry assist target {} already active; continuing",
+                                        entry_pane
+                                    ),
+                                );
+                            } else if select_tmux_pane(&entry_pane, socket_path) {
                                 debug_log(
                                     "tmux-nav",
                                     &format!(
