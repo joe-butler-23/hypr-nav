@@ -9,7 +9,7 @@ fn main() {
     debug_log("smart-close", "invoked");
 
     if let Some((class, pid)) = get_active_window_info(&hypr_socket) {
-        if is_terminal_class(&class) {
+        if is_terminal_window(&class, pid) {
             debug_log(
                 "smart-close",
                 &format!("terminal active class={} pid={}", class, pid),

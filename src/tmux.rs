@@ -216,7 +216,7 @@ fn main() {
     let mut current_tty: Option<String> = None;
 
     if let Some((class, pid)) = get_active_window_info(&hypr_socket) {
-        if is_terminal_class(&class) {
+        if is_terminal_window(&class, pid) {
             debug_log(
                 "tmux-nav",
                 &format!("terminal active class={} pid={}", class, pid),

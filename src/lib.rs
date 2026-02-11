@@ -64,6 +64,40 @@ pub fn is_terminal_class(class: &str) -> bool {
         .any(|t| class_lower.contains(&t.to_lowercase()))
 }
 
+fn read_process_comm(pid: u32) -> Option<String> {
+    let comm = fs::read_to_string(format!("/proc/{}/comm", pid)).ok()?;
+    Some(comm.trim().to_ascii_lowercase())
+}
+
+fn process_matches_terminal_name(pid: u32, terminal: &str) -> bool {
+    if let Some(comm) = read_process_comm(pid) {
+        if comm == terminal {
+            return true;
+        }
+    }
+
+    if let Ok(path) = fs::read_link(format!("/proc/{}/exe", pid)) {
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            if name.eq_ignore_ascii_case(terminal) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Check whether the active window is a terminal using both Hypr class and PID metadata.
+pub fn is_terminal_window(class: &str, pid: u32) -> bool {
+    if is_terminal_class(class) {
+        return true;
+    }
+
+    KNOWN_TERMINALS
+        .iter()
+        .any(|terminal| process_matches_terminal_name(pid, terminal))
+}
+
 /// Find the Hyprland socket path
 pub fn find_hyprland_socket() -> Option<PathBuf> {
     let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
@@ -325,7 +359,18 @@ fn detect_tmux_runtime_from_kitty() -> KittyRuntimeProbe {
 
 /// Combined detection: find TTY, tmux presence, and tmux socket from process tree.
 pub fn detect_tmux_runtime(pid: u32, class: &str) -> Option<TmuxRuntime> {
-    if class.to_ascii_lowercase().contains("kitty") {
+    let kitty_by_class = class.to_ascii_lowercase().contains("kitty");
+    let kitty_by_pid = process_matches_terminal_name(pid, "kitty");
+    if kitty_by_class || kitty_by_pid {
+        if kitty_by_pid && !kitty_by_class {
+            debug_log(
+                "lib",
+                &format!(
+                    "active pid={} is kitty with custom class={} ; using kitty-focused probe",
+                    pid, class
+                ),
+            );
+        }
         match detect_tmux_runtime_from_kitty() {
             KittyRuntimeProbe::Found(runtime) => {
                 debug_log(
