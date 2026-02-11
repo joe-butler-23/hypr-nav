@@ -70,15 +70,32 @@ fn read_process_comm(pid: u32) -> Option<String> {
 }
 
 fn process_matches_terminal_name(pid: u32, terminal: &str) -> bool {
+    let terminal_lower = terminal.to_ascii_lowercase();
+
     if let Some(comm) = read_process_comm(pid) {
-        if comm == terminal {
+        if comm == terminal_lower || comm.contains(&terminal_lower) {
             return true;
+        }
+    }
+
+    if let Ok(cmdline) = fs::read(format!("/proc/{}/cmdline", pid)) {
+        if let Some(arg0) = cmdline.split(|b| *b == 0).next() {
+            if let Ok(arg0_str) = std::str::from_utf8(arg0) {
+                let arg0_name = std::path::Path::new(arg0_str)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(arg0_str)
+                    .to_ascii_lowercase();
+                if arg0_name == terminal_lower {
+                    return true;
+                }
+            }
         }
     }
 
     if let Ok(path) = fs::read_link(format!("/proc/{}/exe", pid)) {
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-            if name.eq_ignore_ascii_case(terminal) {
+            if name.eq_ignore_ascii_case(&terminal_lower) {
                 return true;
             }
         }
