@@ -156,6 +156,7 @@ fn choose_entry_assist_pane(pane_rows: &str, direction: &str) -> Option<String> 
 
     let mut pane_count = 0usize;
     let mut inactive_candidate: Option<String> = None;
+    let mut active_candidate: Option<String> = None;
 
     for row in pane_rows.lines() {
         let parts: Vec<&str> = row.split_whitespace().collect();
@@ -170,6 +171,8 @@ fn choose_entry_assist_pane(pane_rows: &str, direction: &str) -> Option<String> 
         let pane_active = parts[5] == "1";
         if !pane_active && inactive_candidate.is_none() {
             inactive_candidate = Some(pane_id);
+        } else if pane_active && active_candidate.is_none() {
+            active_candidate = Some(pane_id);
         }
     }
 
@@ -178,8 +181,9 @@ fn choose_entry_assist_pane(pane_rows: &str, direction: &str) -> Option<String> 
         return None;
     }
 
-    // Option 1: jump to the opposite edge pane, but only if it's different from current.
-    inactive_candidate
+    // Prefer changing panes when possible, but allow selecting the current edge pane
+    // to keep cross-window entry deterministic and avoid accidental directional jumps.
+    inactive_candidate.or(active_candidate)
 }
 
 fn main() {
@@ -224,20 +228,9 @@ fn main() {
                     .or_else(|| find_tmux_pane_by_tty(&runtime.tty, socket_path))
                 {
                     debug_log("tmux-nav", &format!("resolved tmux pane target={}", pane));
-                    let at_edge = is_pane_at_edge(&pane, tmux_dir, socket_path);
-                    if !at_edge && try_tmux_navigate(&pane, tmux_dir, socket_path) {
-                        debug_log("tmux-nav", "tmux pane navigation succeeded");
-                        save_nav_state("tmux_select", move_dir, Some(&runtime.tty));
-                        return;
-                    }
-
-                    if at_edge
-                        && should_apply_entry_assist(
-                            previous_state.as_ref(),
-                            move_dir,
-                            &runtime.tty,
-                        )
-                    {
+                    let should_entry_assist =
+                        should_apply_entry_assist(previous_state.as_ref(), move_dir, &runtime.tty);
+                    if should_entry_assist {
                         if let Some(entry_pane) =
                             find_entry_assist_pane(&pane, tmux_dir, socket_path)
                         {
@@ -252,7 +245,16 @@ fn main() {
                                 save_nav_state("tmux_entry_assist", move_dir, Some(&runtime.tty));
                                 return;
                             }
+                        } else {
+                            debug_log("tmux-nav", "entry assist active but no edge pane found");
                         }
+                    }
+
+                    let at_edge = is_pane_at_edge(&pane, tmux_dir, socket_path);
+                    if !at_edge && try_tmux_navigate(&pane, tmux_dir, socket_path) {
+                        debug_log("tmux-nav", "tmux pane navigation succeeded");
+                        save_nav_state("tmux_select", move_dir, Some(&runtime.tty));
+                        return;
                     }
                 } else if let Some(session) = find_tmux_session(&runtime.tty, socket_path)
                     .or_else(|| find_tmux_session_by_pane_tty(&runtime.tty, socket_path))
@@ -261,20 +263,9 @@ fn main() {
                         "tmux-nav",
                         &format!("resolved tmux session fallback target={}", session),
                     );
-                    let at_edge = is_pane_at_edge(&session, tmux_dir, socket_path);
-                    if !at_edge && try_tmux_navigate(&session, tmux_dir, socket_path) {
-                        debug_log("tmux-nav", "tmux session navigation succeeded");
-                        save_nav_state("tmux_select", move_dir, Some(&runtime.tty));
-                        return;
-                    }
-
-                    if at_edge
-                        && should_apply_entry_assist(
-                            previous_state.as_ref(),
-                            move_dir,
-                            &runtime.tty,
-                        )
-                    {
+                    let should_entry_assist =
+                        should_apply_entry_assist(previous_state.as_ref(), move_dir, &runtime.tty);
+                    if should_entry_assist {
                         if let Some(entry_pane) =
                             find_entry_assist_pane(&session, tmux_dir, socket_path)
                         {
@@ -289,7 +280,16 @@ fn main() {
                                 save_nav_state("tmux_entry_assist", move_dir, Some(&runtime.tty));
                                 return;
                             }
+                        } else {
+                            debug_log("tmux-nav", "entry assist active but no edge pane found");
                         }
+                    }
+
+                    let at_edge = is_pane_at_edge(&session, tmux_dir, socket_path);
+                    if !at_edge && try_tmux_navigate(&session, tmux_dir, socket_path) {
+                        debug_log("tmux-nav", "tmux session navigation succeeded");
+                        save_nav_state("tmux_select", move_dir, Some(&runtime.tty));
+                        return;
                     }
                 } else {
                     debug_log("tmux-nav", "no tmux pane/session target resolved");
@@ -359,11 +359,20 @@ mod tests {
     }
 
     #[test]
-    fn choose_entry_assist_pane_never_returns_active_same_pane() {
+    fn choose_entry_assist_pane_can_fallback_to_active_edge_pane() {
         let rows = "\
 %0 0 1 1 1 1
 %1 1 0 1 1 0
 ";
-        assert_eq!(choose_entry_assist_pane(rows, "L"), None);
+        assert_eq!(choose_entry_assist_pane(rows, "L"), Some("%0".to_string()));
+    }
+
+    #[test]
+    fn choose_entry_assist_pane_uses_active_edge_when_no_inactive_edge_exists() {
+        let rows = "\
+%0 1 0 1 1 1
+%1 0 1 1 1 0
+";
+        assert_eq!(choose_entry_assist_pane(rows, "R"), Some("%0".to_string()));
     }
 }
