@@ -156,7 +156,7 @@ pub fn find_tmux_session(tty: &str) -> Option<String> {
     }
 
     let clients = String::from_utf8_lossy(&output.stdout);
-    let mut sessions: Vec<&str> = Vec::new();
+    let mut sessions: HashSet<String> = HashSet::new();
 
     for line in clients.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -168,16 +168,48 @@ pub fn find_tmux_session(tty: &str) -> Option<String> {
             if tty == client_tty {
                 return Some(session.to_string());
             }
-            sessions.push(session);
+            sessions.insert(session.to_string());
         }
     }
 
     // If only one session exists, use it (common case)
     if sessions.len() == 1 {
-        return Some(sessions[0].to_string());
+        return sessions.into_iter().next();
     }
 
     None
+}
+
+fn parse_tmux_client_pane(clients: &str, tty: &str) -> Option<String> {
+    for line in clients.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let client_tty = parts[0];
+        let pane_id = parts[1];
+        if client_tty == tty {
+            return Some(pane_id.to_string());
+        }
+    }
+    None
+}
+
+/// Find the active tmux pane for a given client TTY
+pub fn find_tmux_client_pane(tty: &str) -> Option<String> {
+    let output = Command::new("tmux")
+        .args(&["list-clients", "-F", "#{client_tty} #{pane_id}"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let clients = String::from_utf8_lossy(&output.stdout);
+    parse_tmux_client_pane(&clients, tty)
 }
 
 /// Check if the active pane in the session is at the edge in the given direction
@@ -256,5 +288,34 @@ pub fn hypr_dispatch(socket_path: &PathBuf, dispatcher: &str) {
         let cmd = format!("dispatch {}", dispatcher);
         let _ = stream.write_all(cmd.as_bytes());
         let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tmux_client_pane_matches_exact_tty() {
+        let data = "/dev/pts/2 %11\n/dev/pts/9 %42\n";
+        assert_eq!(
+            parse_tmux_client_pane(data, "/dev/pts/9"),
+            Some("%42".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_tmux_client_pane_ignores_malformed_lines() {
+        let data = "invalid-line\n/dev/pts/5 %7\n";
+        assert_eq!(
+            parse_tmux_client_pane(data, "/dev/pts/5"),
+            Some("%7".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_tmux_client_pane_returns_none_when_tty_missing() {
+        let data = "/dev/pts/2 %11\n/dev/pts/9 %42\n";
+        assert_eq!(parse_tmux_client_pane(data, "/dev/pts/4"), None);
     }
 }
