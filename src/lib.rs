@@ -379,6 +379,7 @@ pub fn detect_tmux_runtime(pid: u32, class: &str) -> Option<TmuxRuntime> {
     let kitty_by_class = class.to_ascii_lowercase().contains("kitty");
     let kitty_by_pid = process_matches_terminal_name(pid, "kitty");
     if kitty_by_class || kitty_by_pid {
+        let probe_authoritative = kitty_by_class;
         if kitty_by_pid && !kitty_by_class {
             debug_log(
                 "lib",
@@ -401,8 +402,14 @@ pub fn detect_tmux_runtime(pid: u32, class: &str) -> Option<TmuxRuntime> {
                 return Some(runtime);
             }
             KittyRuntimeProbe::NoTmux => {
-                debug_log("lib", "kitty-focused probe confirms no tmux");
-                return None;
+                if probe_authoritative {
+                    debug_log("lib", "kitty-focused probe confirms no tmux");
+                    return None;
+                }
+                debug_log(
+                    "lib",
+                    "kitty-focused probe found no tmux for custom class; trying process tree",
+                );
             }
             KittyRuntimeProbe::Unavailable => {}
         }
