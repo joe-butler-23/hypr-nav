@@ -1,7 +1,7 @@
-use std::env;
-use std::process::{Command, Stdio};
-use std::path::PathBuf;
 use hypr_nav_lib::*;
+use std::env;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -25,29 +25,29 @@ fn main() {
 
     // Check if active window is Kitty
     if is_kitty_active(&hypr_socket) {
-         let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-         let kitty_sock = PathBuf::from(&xdg).join("kitty");
-         
-         if kitty_sock.exists() {
-             let status = Command::new("kitty")
-                 .args(&[
-                     "@",
-                     "--to",
-                     &format!("unix:{}", kitty_sock.display()),
-                     "focus-window",
-                     "--match",
-                     &format!("neighbor:{}", kitty_dir),
-                 ])
-                 .stdout(Stdio::null())
-                 .stderr(Stdio::null())
-                 .status();
+        let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+        let kitty_sock = PathBuf::from(&xdg).join("kitty");
 
-             if let Ok(s) = status {
-                 if s.success() {
-                     return;
-                 }
-             }
-         }
+        if kitty_sock.exists() {
+            let status = Command::new("kitty")
+                .args(&[
+                    "@",
+                    "--to",
+                    &format!("unix:{}", kitty_sock.display()),
+                    "focus-window",
+                    "--match",
+                    &format!("neighbor:{}", kitty_dir),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+
+            if let Ok(s) = status {
+                if s.success() {
+                    return;
+                }
+            }
+        }
     }
 
     hypr_dispatch(&hypr_socket, &format!("movefocus {}", move_dir));

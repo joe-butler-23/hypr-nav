@@ -273,7 +273,7 @@ pub fn get_tmux_session_info(session: &str) -> Option<TmuxSessionInfo> {
         let name = parts[0].to_string();
         let pane_count = parts[1].parse().unwrap_or(1);
         let window_count = parts[2].parse().unwrap_or(1);
-        
+
         let is_named = name.parse::<u32>().is_err();
 
         Some(TmuxSessionInfo {

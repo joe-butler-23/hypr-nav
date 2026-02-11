@@ -1,6 +1,6 @@
+use hypr_nav_lib::*;
 use std::env;
 use std::process::{Command, Stdio};
-use hypr_nav_lib::*;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -31,7 +31,9 @@ fn main() {
                             return;
                         }
                     } else if let Some(session) = find_tmux_session(&tty) {
-                        if !is_pane_at_edge(&session, tmux_dir) && try_tmux_navigate(&session, tmux_dir) {
+                        if !is_pane_at_edge(&session, tmux_dir)
+                            && try_tmux_navigate(&session, tmux_dir)
+                        {
                             return;
                         }
                     }
