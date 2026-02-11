@@ -22,9 +22,20 @@ fn main() {
         Some(path) => path,
         None => std::process::exit(1),
     };
+    debug_log(
+        "kitty-nav",
+        &format!(
+            "input={} move_dir={} kitty_dir={}",
+            args[1], move_dir, kitty_dir
+        ),
+    );
 
     // Check if active window is Kitty
     if is_kitty_active(&hypr_socket) {
+        debug_log(
+            "kitty-nav",
+            "kitty is active, trying kitty neighbor navigation",
+        );
         let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
         let kitty_sock = PathBuf::from(&xdg).join("kitty");
 
@@ -46,12 +57,25 @@ fn main() {
 
             if let Ok(s) = status {
                 if s.success() {
+                    debug_log("kitty-nav", "kitty neighbor navigation succeeded");
                     return;
                 }
             }
+            debug_log("kitty-nav", "kitty command did not succeed");
+        } else {
+            debug_log(
+                "kitty-nav",
+                &format!("kitty socket missing at {}", kitty_sock.display()),
+            );
         }
+    } else {
+        debug_log("kitty-nav", "kitty not active");
     }
 
+    debug_log(
+        "kitty-nav",
+        &format!("fallback to hypr movefocus {}", move_dir),
+    );
     hypr_dispatch(&hypr_socket, &format!("movefocus {}", move_dir));
 }
 
@@ -65,7 +89,12 @@ fn is_kitty_active(socket_path: &PathBuf) -> bool {
             let _ = stream.shutdown(std::net::Shutdown::Write);
             let mut response = String::new();
             if stream.read_to_string(&mut response).is_ok() {
-                return response.contains("class: kitty");
+                let is_kitty = response.contains("class: kitty");
+                debug_log(
+                    "kitty-nav",
+                    &format!("activewindow class contains kitty={}", is_kitty),
+                );
+                return is_kitty;
             }
         }
     }

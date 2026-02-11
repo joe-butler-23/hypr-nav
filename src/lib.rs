@@ -15,6 +15,26 @@ pub struct TmuxRuntime {
     pub socket_path: Option<String>,
 }
 
+pub fn debug_enabled() -> bool {
+    match env::var("HYPR_NAV_DEBUG") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            !normalized.is_empty()
+                && normalized != "0"
+                && normalized != "false"
+                && normalized != "off"
+                && normalized != "no"
+        }
+        Err(_) => false,
+    }
+}
+
+pub fn debug_log(component: &str, message: &str) {
+    if debug_enabled() {
+        eprintln!("[hypr-nav][{}] {}", component, message);
+    }
+}
+
 /// Check if the window class represents a terminal emulator
 pub fn is_terminal_class(class: &str) -> bool {
     // First, check $TERMINAL environment variable
@@ -54,12 +74,14 @@ pub fn find_hyprland_socket() -> Option<PathBuf> {
         if path.exists() {
             if let Ok(meta) = fs::metadata(&path) {
                 if meta.file_type().is_socket() {
+                    debug_log("lib", &format!("hypr socket selected: {}", path.display()));
                     return Some(path);
                 }
             }
         }
     }
 
+    debug_log("lib", "no usable hypr socket found");
     None
 }
 
@@ -89,8 +111,14 @@ pub fn get_active_window_info(socket_path: &PathBuf) -> Option<(String, u32)> {
     }
 
     match (class, pid) {
-        (Some(c), Some(p)) => Some((c, p)),
-        _ => None,
+        (Some(c), Some(p)) => {
+            debug_log("lib", &format!("active window class={} pid={}", c, p));
+            Some((c, p))
+        }
+        _ => {
+            debug_log("lib", "active window query returned incomplete data");
+            None
+        }
     }
 }
 
@@ -196,10 +224,24 @@ pub fn detect_tmux_runtime(pid: u32) -> Option<TmuxRuntime> {
     }
 
     if !has_tmux {
+        debug_log("lib", &format!("no tmux runtime under pid {}", pid));
         return None;
     }
 
-    tty.map(|tty| TmuxRuntime { tty, socket_path })
+    let runtime = tty.map(|tty| TmuxRuntime { tty, socket_path });
+    if let Some(r) = runtime.as_ref() {
+        debug_log(
+            "lib",
+            &format!(
+                "tmux runtime tty={} socket={}",
+                r.tty,
+                r.socket_path.as_deref().unwrap_or("<default>")
+            ),
+        );
+    } else {
+        debug_log("lib", "tmux detected but tty missing");
+    }
+    runtime
 }
 
 fn tmux_command(socket_path: Option<&str>) -> Command {
@@ -221,11 +263,29 @@ pub fn find_tmux_session(tty: &str, socket_path: Option<&str>) -> Option<String>
         .ok()?;
 
     if !output.status.success() {
+        debug_log(
+            "lib",
+            &format!(
+                "find_tmux_session tty={} socket={} -> <none> (tmux error)",
+                tty,
+                socket_path.unwrap_or("<default>")
+            ),
+        );
         return None;
     }
 
     let clients = String::from_utf8_lossy(&output.stdout);
-    parse_tmux_client_session(&clients, tty)
+    let session = parse_tmux_client_session(&clients, tty);
+    debug_log(
+        "lib",
+        &format!(
+            "find_tmux_session tty={} socket={} -> {}",
+            tty,
+            socket_path.unwrap_or("<default>"),
+            session.as_deref().unwrap_or("<none>")
+        ),
+    );
+    session
 }
 
 fn parse_tmux_client_session(clients: &str, tty: &str) -> Option<String> {
@@ -300,11 +360,29 @@ pub fn find_tmux_client_pane(tty: &str, socket_path: Option<&str>) -> Option<Str
         .ok()?;
 
     if !output.status.success() {
+        debug_log(
+            "lib",
+            &format!(
+                "find_tmux_client_pane tty={} socket={} -> <none> (tmux error)",
+                tty,
+                socket_path.unwrap_or("<default>")
+            ),
+        );
         return None;
     }
 
     let clients = String::from_utf8_lossy(&output.stdout);
-    parse_tmux_client_pane(&clients, tty)
+    let pane = parse_tmux_client_pane(&clients, tty);
+    debug_log(
+        "lib",
+        &format!(
+            "find_tmux_client_pane tty={} socket={} -> {}",
+            tty,
+            socket_path.unwrap_or("<default>"),
+            pane.as_deref().unwrap_or("<none>")
+        ),
+    );
+    pane
 }
 
 /// Find pane by pane tty when we discovered a pane PTY rather than client TTY.
@@ -317,11 +395,29 @@ pub fn find_tmux_pane_by_tty(tty: &str, socket_path: Option<&str>) -> Option<Str
         .ok()?;
 
     if !output.status.success() {
+        debug_log(
+            "lib",
+            &format!(
+                "find_tmux_pane_by_tty tty={} socket={} -> <none> (tmux error)",
+                tty,
+                socket_path.unwrap_or("<default>")
+            ),
+        );
         return None;
     }
 
     let panes = String::from_utf8_lossy(&output.stdout);
-    parse_tmux_pane_by_tty(&panes, tty)
+    let pane = parse_tmux_pane_by_tty(&panes, tty);
+    debug_log(
+        "lib",
+        &format!(
+            "find_tmux_pane_by_tty tty={} socket={} -> {}",
+            tty,
+            socket_path.unwrap_or("<default>"),
+            pane.as_deref().unwrap_or("<none>")
+        ),
+    );
+    pane
 }
 
 /// Find session by pane tty when we discovered a pane PTY rather than client TTY.
@@ -334,11 +430,29 @@ pub fn find_tmux_session_by_pane_tty(tty: &str, socket_path: Option<&str>) -> Op
         .ok()?;
 
     if !output.status.success() {
+        debug_log(
+            "lib",
+            &format!(
+                "find_tmux_session_by_pane_tty tty={} socket={} -> <none> (tmux error)",
+                tty,
+                socket_path.unwrap_or("<default>")
+            ),
+        );
         return None;
     }
 
     let panes = String::from_utf8_lossy(&output.stdout);
-    parse_tmux_session_by_pane_tty(&panes, tty)
+    let session = parse_tmux_session_by_pane_tty(&panes, tty);
+    debug_log(
+        "lib",
+        &format!(
+            "find_tmux_session_by_pane_tty tty={} socket={} -> {}",
+            tty,
+            socket_path.unwrap_or("<default>"),
+            session.as_deref().unwrap_or("<none>")
+        ),
+    );
+    session
 }
 
 /// Check if the active pane in the session is at the edge in the given direction
@@ -360,9 +474,29 @@ pub fn is_pane_at_edge(session: &str, direction: &str, socket_path: Option<&str>
     if let Ok(out) = output {
         if out.status.success() {
             let result = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            return result == "1";
+            let at_edge = result == "1";
+            debug_log(
+                "lib",
+                &format!(
+                    "is_pane_at_edge target={} dir={} socket={} -> {}",
+                    session,
+                    direction,
+                    socket_path.unwrap_or("<default>"),
+                    at_edge
+                ),
+            );
+            return at_edge;
         }
     }
+    debug_log(
+        "lib",
+        &format!(
+            "is_pane_at_edge target={} dir={} socket={} -> false (tmux error)",
+            session,
+            direction,
+            socket_path.unwrap_or("<default>")
+        ),
+    );
     false
 }
 
@@ -389,6 +523,14 @@ pub fn get_tmux_session_info(session: &str, socket_path: Option<&str>) -> Option
         .ok()?;
 
     if !output.status.success() {
+        debug_log(
+            "lib",
+            &format!(
+                "get_tmux_session_info target={} socket={} -> <none> (tmux error)",
+                session,
+                socket_path.unwrap_or("<default>")
+            ),
+        );
         return None;
     }
 
@@ -401,13 +543,34 @@ pub fn get_tmux_session_info(session: &str, socket_path: Option<&str>) -> Option
 
         let is_named = name.parse::<u32>().is_err();
 
-        Some(TmuxSessionInfo {
+        let info = TmuxSessionInfo {
             name,
             is_named,
             window_count,
             pane_count,
-        })
+        };
+        debug_log(
+            "lib",
+            &format!(
+                "session_info target={} socket={} name={} named={} panes={} windows={}",
+                session,
+                socket_path.unwrap_or("<default>"),
+                info.name,
+                info.is_named,
+                info.pane_count,
+                info.window_count
+            ),
+        );
+        Some(info)
     } else {
+        debug_log(
+            "lib",
+            &format!(
+                "get_tmux_session_info target={} socket={} -> <none> (parse error)",
+                session,
+                socket_path.unwrap_or("<default>")
+            ),
+        );
         None
     }
 }
@@ -415,6 +578,7 @@ pub fn get_tmux_session_info(session: &str, socket_path: Option<&str>) -> Option
 pub fn hypr_dispatch(socket_path: &PathBuf, dispatcher: &str) {
     if let Ok(mut stream) = UnixStream::connect(socket_path) {
         let cmd = format!("dispatch {}", dispatcher);
+        debug_log("lib", &format!("hypr dispatch: {}", cmd));
         let _ = stream.write_all(cmd.as_bytes());
         let _ = stream.shutdown(std::net::Shutdown::Both);
     }
