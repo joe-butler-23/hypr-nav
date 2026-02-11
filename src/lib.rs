@@ -156,6 +156,10 @@ pub fn find_tmux_session(tty: &str) -> Option<String> {
     }
 
     let clients = String::from_utf8_lossy(&output.stdout);
+    parse_tmux_client_session(&clients, tty)
+}
+
+fn parse_tmux_client_session(clients: &str, tty: &str) -> Option<String> {
     let mut sessions: HashSet<String> = HashSet::new();
 
     for line in clients.lines() {
@@ -317,5 +321,23 @@ mod tests {
     fn parse_tmux_client_pane_returns_none_when_tty_missing() {
         let data = "/dev/pts/2 %11\n/dev/pts/9 %42\n";
         assert_eq!(parse_tmux_client_pane(data, "/dev/pts/4"), None);
+    }
+
+    #[test]
+    fn parse_tmux_client_session_prefers_exact_tty_match() {
+        let data = "$0 /dev/pts/2\n$1 /dev/pts/9\n";
+        assert_eq!(
+            parse_tmux_client_session(data, "/dev/pts/9"),
+            Some("$1".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_tmux_client_session_accepts_single_unique_session() {
+        let data = "$3 /dev/pts/1\n$3 /dev/pts/5\n";
+        assert_eq!(
+            parse_tmux_client_session(data, "/dev/pts/99"),
+            Some("$3".to_string())
+        );
     }
 }
