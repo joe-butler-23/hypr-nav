@@ -221,9 +221,56 @@ fn main() {
                 "tmux-nav",
                 &format!("terminal active class={} pid={}", class, pid),
             );
-            if let Some(runtime) = detect_tmux_runtime(pid, &class) {
+            let terminal = detect_terminal_runtime(pid, &class);
+            current_tty = terminal.tty.clone();
+
+            // Layer 1: Try nvim split navigation first
+            if let Some(ref nvim) = terminal.nvim {
+                debug_log(
+                    "tmux-nav",
+                    &format!("nvim detected socket={}", nvim.socket_path),
+                );
+
+                // Nvim entry assist: on cross-window entry, jump to opposite edge
+                let nvim_tty = current_tty.as_deref().unwrap_or("");
+                if !nvim_tty.is_empty()
+                    && should_apply_entry_assist(
+                        previous_state.as_ref(),
+                        move_dir,
+                        nvim_tty,
+                    )
+                {
+                    if try_nvim_entry_assist(&nvim.socket_path, tmux_dir) {
+                        debug_log("tmux-nav", "nvim entry assist applied");
+                        save_nav_state(
+                            "nvim_entry_assist",
+                            move_dir,
+                            current_tty.as_deref(),
+                        );
+                        return;
+                    } else {
+                        debug_log("tmux-nav", "nvim entry assist not applicable (single window or failed)");
+                    }
+                }
+
+                if !is_nvim_at_edge(&nvim.socket_path, tmux_dir) {
+                    if try_nvim_navigate(&nvim.socket_path, tmux_dir) {
+                        debug_log("tmux-nav", "nvim split navigation succeeded");
+                        save_nav_state(
+                            "nvim_wincmd",
+                            move_dir,
+                            current_tty.as_deref(),
+                        );
+                        return;
+                    }
+                } else {
+                    debug_log("tmux-nav", "nvim at edge, falling through");
+                }
+            }
+
+            // Layer 2: Try tmux pane navigation
+            if let Some(runtime) = terminal.tmux {
                 let socket_path = runtime.socket_path.as_deref();
-                current_tty = Some(runtime.tty.clone());
                 if let Some(pane) = find_tmux_client_pane(&runtime.tty, socket_path)
                     .or_else(|| find_tmux_pane_by_tty(&runtime.tty, socket_path))
                 {

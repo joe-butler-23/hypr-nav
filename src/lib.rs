@@ -16,9 +16,24 @@ pub struct TmuxRuntime {
     pub socket_path: Option<String>,
 }
 
+pub struct NvimRuntime {
+    pub socket_path: String,
+}
+
+pub struct TerminalRuntime {
+    pub tty: Option<String>,
+    pub tmux: Option<TmuxRuntime>,
+    pub nvim: Option<NvimRuntime>,
+}
+
+struct KittyProbeResult {
+    tmux: Option<TmuxRuntime>,
+    nvim_socket: Option<String>,
+}
+
 enum KittyRuntimeProbe {
-    Found(TmuxRuntime),
-    NoTmux,
+    Found(KittyProbeResult),
+    NothingFound,
     Unavailable,
 }
 
@@ -211,6 +226,172 @@ fn read_tmux_socket_from_environ(pid: u32) -> Option<String> {
     parse_tmux_socket_from_environ(&environ)
 }
 
+fn parse_nvim_socket_from_environ(environ: &[u8]) -> Option<String> {
+    for entry in environ.split(|b| *b == 0) {
+        if let Some(value) = entry.strip_prefix(b"NVIM=") {
+            if let Ok(s) = std::str::from_utf8(value) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+        if let Some(value) = entry.strip_prefix(b"NVIM_LISTEN_ADDRESS=") {
+            if let Ok(s) = std::str::from_utf8(value) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn read_nvim_socket_from_environ(pid: u32) -> Option<String> {
+    let environ = fs::read(format!("/proc/{}/environ", pid)).ok()?;
+    parse_nvim_socket_from_environ(&environ)
+}
+
+fn process_is_nvim(pid: u32) -> bool {
+    if let Some(comm) = read_process_comm(pid) {
+        return comm == "nvim";
+    }
+    false
+}
+
+fn find_nvim_listen_socket(pid: u32) -> Option<String> {
+    // Check --listen argument in cmdline
+    if let Ok(cmdline) = fs::read(format!("/proc/{}/cmdline", pid)) {
+        let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
+        for (i, arg) in args.iter().enumerate() {
+            if let Ok(s) = std::str::from_utf8(arg) {
+                if s == "--listen" {
+                    if let Some(next) = args.get(i + 1) {
+                        if let Ok(path) = std::str::from_utf8(next) {
+                            let path = path.trim();
+                            if !path.is_empty() {
+                                return Some(path.to_string());
+                            }
+                        }
+                    }
+                }
+                // Handle --listen=<path> form
+                if let Some(path) = s.strip_prefix("--listen=") {
+                    let path = path.trim();
+                    if !path.is_empty() {
+                        return Some(path.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: neovim >= 0.9 auto-creates sockets at $XDG_RUNTIME_DIR/nvim.<pid>.0
+    if let Ok(xdg) = env::var("XDG_RUNTIME_DIR") {
+        let auto_socket = format!("{}/nvim.{}.0", xdg, pid);
+        if std::path::Path::new(&auto_socket).exists() {
+            return Some(auto_socket);
+        }
+    }
+
+    None
+}
+
+fn nvim_socket_is_live(socket: &str) -> bool {
+    if !std::path::Path::new(socket).exists() {
+        return false;
+    }
+    UnixStream::connect(socket).is_ok()
+}
+
+/// Map navigation direction to vim wincmd character
+fn nvim_wincmd_char(direction: &str) -> Option<&'static str> {
+    match direction {
+        "L" => Some("h"),
+        "R" => Some("l"),
+        "U" => Some("k"),
+        "D" => Some("j"),
+        _ => None,
+    }
+}
+
+/// Map navigation direction to vim winnr() direction argument
+fn nvim_winnr_dir(direction: &str) -> Option<&'static str> {
+    // winnr('h') returns the window number of the neighbor to the left, etc.
+    nvim_wincmd_char(direction)
+}
+
+/// Check if the nvim window is at the edge in the given direction.
+/// Returns true when at edge (no neighbor), or on error (fail-open to fall through).
+pub fn is_nvim_at_edge(socket: &str, direction: &str) -> bool {
+    let dir_char = match nvim_winnr_dir(direction) {
+        Some(c) => c,
+        None => return true,
+    };
+
+    // winnr() == winnr('h') is true when there's no neighbor to the left
+    let expr = format!("winnr()==winnr('{}')", dir_char);
+    let output = Command::new("nvim")
+        .args(["--server", socket, "--remote-expr", &expr])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let result = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let at_edge = result == "1";
+            debug_log(
+                "lib",
+                &format!(
+                    "is_nvim_at_edge socket={} dir={} -> {}",
+                    socket, direction, at_edge
+                ),
+            );
+            at_edge
+        }
+        _ => {
+            debug_log(
+                "lib",
+                &format!(
+                    "is_nvim_at_edge socket={} dir={} -> true (error, fail-open)",
+                    socket, direction
+                ),
+            );
+            true
+        }
+    }
+}
+
+/// Navigate to the nvim split in the given direction.
+/// Returns true if the command was sent successfully.
+pub fn try_nvim_navigate(socket: &str, direction: &str) -> bool {
+    let dir_char = match nvim_wincmd_char(direction) {
+        Some(c) => c,
+        None => return false,
+    };
+
+    // Send <C-w>{dir} keysequence
+    let keys = format!("<C-w>{}", dir_char);
+    let result = Command::new("nvim")
+        .args(["--server", socket, "--remote-send", &keys])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    debug_log(
+        "lib",
+        &format!(
+            "try_nvim_navigate socket={} dir={} -> {}",
+            socket, direction, result
+        ),
+    );
+    result
+}
+
 fn read_process_tty(pid: u32) -> Option<String> {
     let link = fs::read_link(format!("/proc/{}/fd/0", pid)).ok()?;
     let tty = link.to_str()?.to_string();
@@ -299,7 +480,7 @@ fn parse_focused_kitty_pids(json: &str) -> Vec<u32> {
     read_pids_from_kitty_window(window)
 }
 
-fn detect_tmux_runtime_from_kitty() -> KittyRuntimeProbe {
+fn detect_terminal_runtime_from_kitty() -> KittyRuntimeProbe {
     let kitty_socket = kitty_socket_path();
     if !kitty_socket.exists() {
         return KittyRuntimeProbe::Unavailable;
@@ -342,42 +523,90 @@ fn detect_tmux_runtime_from_kitty() -> KittyRuntimeProbe {
         return KittyRuntimeProbe::Unavailable;
     }
 
+    let mut tmux_runtime: Option<TmuxRuntime> = None;
+    let mut nvim_socket: Option<String> = None;
+
     for pid in candidate_pids {
         let tty = read_process_tty(pid);
-        let tmux_socket = read_tmux_socket_from_environ(pid);
-        let has_tmux = tmux_socket.is_some() || process_has_tmux(pid);
+        let tmux_sock = read_tmux_socket_from_environ(pid);
+        let has_tmux = tmux_sock.is_some() || process_has_tmux(pid);
         debug_log(
             "lib",
             &format!(
                 "kitty-focused candidate pid={} tty={} tmux_socket={} has_tmux={}",
                 pid,
                 tty.as_deref().unwrap_or("<none>"),
-                tmux_socket.as_deref().unwrap_or("<none>"),
+                tmux_sock.as_deref().unwrap_or("<none>"),
                 has_tmux
             ),
         );
 
-        if has_tmux {
-            if let Some(tty) = tty {
-                return KittyRuntimeProbe::Found(TmuxRuntime {
-                    tty,
-                    socket_path: tmux_socket,
+        if tmux_runtime.is_none() && has_tmux {
+            if let Some(ref tty) = tty {
+                tmux_runtime = Some(TmuxRuntime {
+                    tty: tty.clone(),
+                    socket_path: tmux_sock,
                 });
             }
         }
+
+        // Check for nvim: is this process nvim itself?
+        if nvim_socket.is_none() && process_is_nvim(pid) {
+            nvim_socket = find_nvim_listen_socket(pid);
+            debug_log(
+                "lib",
+                &format!(
+                    "kitty-focused nvim process pid={} socket={}",
+                    pid,
+                    nvim_socket.as_deref().unwrap_or("<none>")
+                ),
+            );
+        }
+
+        // Check for nvim: is this a child of nvim (has $NVIM in environ)?
+        if nvim_socket.is_none() {
+            nvim_socket = read_nvim_socket_from_environ(pid);
+            if nvim_socket.is_some() {
+                debug_log(
+                    "lib",
+                    &format!(
+                        "kitty-focused nvim socket from environ pid={} socket={}",
+                        pid,
+                        nvim_socket.as_deref().unwrap_or("<none>")
+                    ),
+                );
+            }
+        }
+
+        if tmux_runtime.is_some() && nvim_socket.is_some() {
+            break;
+        }
     }
 
-    debug_log(
-        "lib",
-        "kitty-focused context found but no tmux in focused window",
-    );
-    KittyRuntimeProbe::NoTmux
+    if tmux_runtime.is_some() || nvim_socket.is_some() {
+        KittyRuntimeProbe::Found(KittyProbeResult {
+            tmux: tmux_runtime,
+            nvim_socket,
+        })
+    } else {
+        debug_log(
+            "lib",
+            "kitty-focused context found but no tmux or nvim in focused window",
+        );
+        KittyRuntimeProbe::NothingFound
+    }
 }
 
-/// Combined detection: find TTY, tmux presence, and tmux socket from process tree.
-pub fn detect_tmux_runtime(pid: u32, class: &str) -> Option<TmuxRuntime> {
+/// Combined detection: find TTY, tmux presence, tmux socket, and nvim socket from process tree.
+pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
+    let mut tmux_result: Option<TmuxRuntime> = None;
+    let mut nvim_result: Option<NvimRuntime> = None;
+    let mut kitty_nvim_socket: Option<String> = None;
+
+    // Kitty fast-path: check focused PIDs for both tmux and nvim
     let kitty_by_class = class.to_ascii_lowercase().contains("kitty");
     let kitty_by_pid = process_matches_terminal_name(pid, "kitty");
+    let mut kitty_authoritative_nothing = false;
     if kitty_by_class || kitty_by_pid {
         let probe_authoritative = kitty_by_class;
         if kitty_by_pid && !kitty_by_class {
@@ -389,37 +618,48 @@ pub fn detect_tmux_runtime(pid: u32, class: &str) -> Option<TmuxRuntime> {
                 ),
             );
         }
-        match detect_tmux_runtime_from_kitty() {
-            KittyRuntimeProbe::Found(runtime) => {
-                debug_log(
-                    "lib",
-                    &format!(
-                        "tmux runtime from kitty tty={} socket={}",
-                        runtime.tty,
-                        runtime.socket_path.as_deref().unwrap_or("<default>")
-                    ),
-                );
-                return Some(runtime);
-            }
-            KittyRuntimeProbe::NoTmux => {
-                if probe_authoritative {
-                    debug_log("lib", "kitty-focused probe confirms no tmux");
-                    return None;
+        match detect_terminal_runtime_from_kitty() {
+            KittyRuntimeProbe::Found(result) => {
+                if let Some(ref tmux) = result.tmux {
+                    debug_log(
+                        "lib",
+                        &format!(
+                            "tmux runtime from kitty tty={} socket={}",
+                            tmux.tty,
+                            tmux.socket_path.as_deref().unwrap_or("<default>")
+                        ),
+                    );
                 }
-                debug_log(
-                    "lib",
-                    "kitty-focused probe found no tmux for custom class; trying process tree",
-                );
+                if let Some(ref socket) = result.nvim_socket {
+                    debug_log(
+                        "lib",
+                        &format!("nvim socket from kitty: {}", socket),
+                    );
+                }
+                tmux_result = result.tmux;
+                kitty_nvim_socket = result.nvim_socket;
+            }
+            KittyRuntimeProbe::NothingFound => {
+                if probe_authoritative {
+                    debug_log("lib", "kitty-focused probe confirms no tmux or nvim");
+                    kitty_authoritative_nothing = true;
+                } else {
+                    debug_log(
+                        "lib",
+                        "kitty-focused probe found nothing for custom class; trying process tree",
+                    );
+                }
             }
             KittyRuntimeProbe::Unavailable => {}
         }
     }
 
+    // BFS through process tree to find TTY, tmux, and nvim
     let mut tty: Option<String> = None;
     let mut has_tmux = false;
-    let mut socket_path: Option<String> = None;
+    let mut tmux_socket_path: Option<String> = None;
+    let mut nvim_socket: Option<String> = kitty_nvim_socket;
 
-    // BFS through process tree (downward) to find both TTY and tmux
     const MAX_DEPTH: usize = 10;
     let mut to_check: Vec<(u32, usize)> = vec![(pid, 0)];
     let mut checked: HashSet<u32> = HashSet::new();
@@ -442,9 +682,9 @@ pub fn detect_tmux_runtime(pid: u32, class: &str) -> Option<TmuxRuntime> {
             has_tmux = process_has_tmux(current_pid);
         }
 
-        if socket_path.is_none() {
-            socket_path = read_tmux_socket_from_environ(current_pid);
-            if socket_path.is_some() {
+        if tmux_socket_path.is_none() {
+            tmux_socket_path = read_tmux_socket_from_environ(current_pid);
+            if tmux_socket_path.is_some() {
                 has_tmux = true;
                 if current_tty.is_some() {
                     tty = current_tty.clone();
@@ -452,9 +692,32 @@ pub fn detect_tmux_runtime(pid: u32, class: &str) -> Option<TmuxRuntime> {
             }
         }
 
-        // Early exit if we found everything useful
-        if tty.is_some() && has_tmux && socket_path.is_some() {
-            break;
+        // Check for nvim: is this process nvim itself?
+        if nvim_socket.is_none() && process_is_nvim(current_pid) {
+            nvim_socket = find_nvim_listen_socket(current_pid);
+            debug_log(
+                "lib",
+                &format!(
+                    "found nvim process pid={} socket={}",
+                    current_pid,
+                    nvim_socket.as_deref().unwrap_or("<none>")
+                ),
+            );
+        }
+
+        // Check for nvim: is this a child of nvim (has $NVIM in environ)?
+        if nvim_socket.is_none() {
+            if let Some(s) = read_nvim_socket_from_environ(current_pid) {
+                nvim_socket = Some(s);
+                debug_log(
+                    "lib",
+                    &format!(
+                        "found nvim socket from environ of pid={} socket={}",
+                        current_pid,
+                        nvim_socket.as_deref().unwrap_or("<none>")
+                    ),
+                );
+            }
         }
 
         // Get children - try fast path first
@@ -468,25 +731,124 @@ pub fn detect_tmux_runtime(pid: u32, class: &str) -> Option<TmuxRuntime> {
         }
     }
 
-    if !has_tmux {
-        debug_log("lib", &format!("no tmux runtime under pid {}", pid));
-        return None;
+    // Build tmux result from BFS if not already found via kitty
+    if tmux_result.is_none() && !kitty_authoritative_nothing {
+        if has_tmux {
+            let runtime = tty.clone().map(|tty| TmuxRuntime {
+                tty,
+                socket_path: tmux_socket_path,
+            });
+            if let Some(r) = runtime.as_ref() {
+                debug_log(
+                    "lib",
+                    &format!(
+                        "tmux runtime tty={} socket={}",
+                        r.tty,
+                        r.socket_path.as_deref().unwrap_or("<default>")
+                    ),
+                );
+            } else {
+                debug_log("lib", "tmux detected but tty missing");
+            }
+            tmux_result = runtime;
+        } else {
+            debug_log("lib", &format!("no tmux runtime under pid {}", pid));
+        }
     }
 
-    let runtime = tty.map(|tty| TmuxRuntime { tty, socket_path });
-    if let Some(r) = runtime.as_ref() {
+    // Build nvim result, validating socket liveness
+    if !kitty_authoritative_nothing {
+        if let Some(socket) = nvim_socket {
+            if nvim_socket_is_live(&socket) {
+                debug_log(
+                    "lib",
+                    &format!("nvim runtime socket={} (live)", socket),
+                );
+                nvim_result = Some(NvimRuntime {
+                    socket_path: socket,
+                });
+            } else {
+                debug_log(
+                    "lib",
+                    &format!("nvim socket={} is stale, ignoring", socket),
+                );
+            }
+        }
+    }
+
+    TerminalRuntime {
+        tty,
+        tmux: tmux_result,
+        nvim: nvim_result,
+    }
+}
+
+/// Combined detection: find TTY, tmux presence, and tmux socket from process tree.
+/// Delegates to detect_terminal_runtime and returns only the tmux portion.
+pub fn detect_tmux_runtime(pid: u32, class: &str) -> Option<TmuxRuntime> {
+    detect_terminal_runtime(pid, class).tmux
+}
+
+/// Attempt nvim entry assist: navigate to opposite-edge window on cross-window entry.
+/// Returns true if entry assist was applied (multiple windows and navigation succeeded).
+pub fn try_nvim_entry_assist(socket: &str, direction: &str) -> bool {
+    // Check if nvim has multiple windows
+    let output = Command::new("nvim")
+        .args(["--server", socket, "--remote-expr", "winnr('$')"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    let win_count: usize = match output {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(1)
+        }
+        _ => return false,
+    };
+
+    if win_count <= 1 {
         debug_log(
             "lib",
             &format!(
-                "tmux runtime tty={} socket={}",
-                r.tty,
-                r.socket_path.as_deref().unwrap_or("<default>")
+                "nvim entry assist skip: single window socket={}",
+                socket
             ),
         );
-    } else {
-        debug_log("lib", "tmux detected but tty missing");
+        return false;
     }
-    runtime
+
+    // Navigate to opposite edge: when entering from a direction,
+    // jump to the far side so the user lands at the expected edge.
+    // Moving left → entering from right → go to right edge (999<C-w>l)
+    // Moving right → entering from left → go to left edge (999<C-w>h)
+    let opposite = match direction {
+        "L" => "l",
+        "R" => "h",
+        "U" => "j",
+        "D" => "k",
+        _ => return false,
+    };
+
+    let keys = format!("999<C-w>{}", opposite);
+    let result = Command::new("nvim")
+        .args(["--server", socket, "--remote-send", &keys])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    debug_log(
+        "lib",
+        &format!(
+            "try_nvim_entry_assist socket={} dir={} opposite={} -> {}",
+            socket, direction, opposite, result
+        ),
+    );
+    result
 }
 
 fn tmux_command(socket_path: Option<&str>) -> Command {
@@ -952,5 +1314,35 @@ mod tests {
     #[test]
     fn parse_focused_kitty_pids_returns_empty_on_invalid_json() {
         assert!(parse_focused_kitty_pids("not-json").is_empty());
+    }
+
+    #[test]
+    fn parse_nvim_socket_from_environ_finds_nvim_entry() {
+        let env = b"SHELL=/bin/zsh\0NVIM=/run/user/1000/nvim.12345.0\0";
+        assert_eq!(
+            parse_nvim_socket_from_environ(env),
+            Some("/run/user/1000/nvim.12345.0".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_nvim_socket_from_environ_finds_legacy_listen_address() {
+        let env = b"SHELL=/bin/zsh\0NVIM_LISTEN_ADDRESS=/tmp/nvimsocket\0";
+        assert_eq!(
+            parse_nvim_socket_from_environ(env),
+            Some("/tmp/nvimsocket".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_nvim_socket_from_environ_returns_none_when_absent() {
+        let env = b"SHELL=/bin/zsh\0PATH=/usr/bin\0";
+        assert_eq!(parse_nvim_socket_from_environ(env), None);
+    }
+
+    #[test]
+    fn parse_nvim_socket_from_environ_ignores_empty_values() {
+        let env = b"NVIM=\0NVIM_LISTEN_ADDRESS=\0";
+        assert_eq!(parse_nvim_socket_from_environ(env), None);
     }
 }
