@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const NAV_STATE_PATH: &str = "/tmp/hypr-nav-navstate";
+const NAV_STATE_FILE: &str = "hypr-nav-navstate";
 const ENTRY_ASSIST_WINDOW_MS: u128 = 1500;
 
 struct NavState {
@@ -23,7 +23,23 @@ fn now_millis() -> u128 {
 }
 
 fn nav_state_path() -> PathBuf {
-    PathBuf::from(NAV_STATE_PATH)
+    let base = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let uid = current_uid_string();
+    PathBuf::from(base).join(format!("{}-{}", NAV_STATE_FILE, uid))
+}
+
+fn current_uid_string() -> String {
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("Uid:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() > 1 {
+                    return parts[1].to_string();
+                }
+            }
+        }
+    }
+    env::var("UID").unwrap_or_else(|_| "unknown".to_string())
 }
 
 fn load_nav_state() -> Option<NavState> {
@@ -63,7 +79,13 @@ fn save_nav_state(action: &str, dir: &str, tty: Option<&str>) {
         dir,
         tty.unwrap_or("-")
     );
-    let _ = fs::write(nav_state_path(), line);
+    let path = nav_state_path();
+    let mut tmp_path = path.clone();
+    tmp_path.set_extension(format!("tmp-{}", std::process::id()));
+
+    if fs::write(&tmp_path, line).is_ok() {
+        let _ = fs::rename(tmp_path, path);
+    }
 }
 
 fn should_apply_entry_assist(state: Option<&NavState>, move_dir: &str, current_tty: &str) -> bool {
@@ -234,33 +256,24 @@ fn main() {
                 // Nvim entry assist: on cross-window entry, jump to opposite edge
                 let nvim_tty = current_tty.as_deref().unwrap_or("");
                 if !nvim_tty.is_empty()
-                    && should_apply_entry_assist(
-                        previous_state.as_ref(),
-                        move_dir,
-                        nvim_tty,
-                    )
+                    && should_apply_entry_assist(previous_state.as_ref(), move_dir, nvim_tty)
                 {
                     if try_nvim_entry_assist(&nvim.socket_path, tmux_dir) {
                         debug_log("tmux-nav", "nvim entry assist applied");
-                        save_nav_state(
-                            "nvim_entry_assist",
-                            move_dir,
-                            current_tty.as_deref(),
-                        );
+                        save_nav_state("nvim_entry_assist", move_dir, current_tty.as_deref());
                         return;
                     } else {
-                        debug_log("tmux-nav", "nvim entry assist not applicable (single window or failed)");
+                        debug_log(
+                            "tmux-nav",
+                            "nvim entry assist not applicable (single window or failed)",
+                        );
                     }
                 }
 
                 if !is_nvim_at_edge(&nvim.socket_path, tmux_dir) {
                     if try_nvim_navigate(&nvim.socket_path, tmux_dir) {
                         debug_log("tmux-nav", "nvim split navigation succeeded");
-                        save_nav_state(
-                            "nvim_wincmd",
-                            move_dir,
-                            current_tty.as_deref(),
-                        );
+                        save_nav_state("nvim_wincmd", move_dir, current_tty.as_deref());
                         return;
                     }
                 } else {

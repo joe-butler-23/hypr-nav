@@ -16,14 +16,20 @@ fn main() {
             );
             if let Some(runtime) = detect_tmux_runtime(pid, &class) {
                 let socket_path = runtime.socket_path.as_deref();
+                let pane = find_tmux_client_pane(&runtime.tty, socket_path)
+                    .or_else(|| find_tmux_pane_by_tty(&runtime.tty, socket_path));
                 if let Some(session) = find_tmux_session(&runtime.tty, socket_path)
                     .or_else(|| find_tmux_session_by_pane_tty(&runtime.tty, socket_path))
                 {
                     debug_log(
                         "smart-close",
-                        &format!("resolved tmux session target={}", session),
+                        &format!(
+                            "resolved tmux session target={} pane={}",
+                            session,
+                            pane.as_deref().unwrap_or("<none>")
+                        ),
                     );
-                    if handle_tmux_close(&session, socket_path) {
+                    if handle_tmux_close(&session, pane.as_deref(), &runtime.tty, socket_path) {
                         debug_log("smart-close", "tmux close handled");
                         return;
                     }
@@ -52,7 +58,12 @@ fn main() {
     hypr_dispatch(&hypr_socket, "killactive");
 }
 
-fn handle_tmux_close(session: &str, socket_path: Option<&str>) -> bool {
+fn handle_tmux_close(
+    session: &str,
+    pane: Option<&str>,
+    client_tty: &str,
+    socket_path: Option<&str>,
+) -> bool {
     if let Some(info) = get_tmux_session_info(session, socket_path) {
         if info.is_named || (info.window_count == 1 && info.pane_count == 1) {
             let mut command = Command::new("tmux");
@@ -60,7 +71,7 @@ fn handle_tmux_close(session: &str, socket_path: Option<&str>) -> bool {
                 command.args(["-S", path]);
             }
             let detached = command
-                .args(["detach-client", "-t", session])
+                .args(["detach-client", "-t", client_tty])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
@@ -78,19 +89,25 @@ fn handle_tmux_close(session: &str, socket_path: Option<&str>) -> bool {
             return detached;
         }
 
-        return try_tmux_close_pane(session, socket_path);
+        if let Some(pane) = pane {
+            return try_tmux_close_pane(pane, socket_path);
+        }
+        debug_log(
+            "smart-close",
+            "tmux pane target unavailable; cannot safely kill pane",
+        );
     }
     false
 }
 
-fn try_tmux_close_pane(session: &str, socket_path: Option<&str>) -> bool {
+fn try_tmux_close_pane(pane: &str, socket_path: Option<&str>) -> bool {
     let mut command = Command::new("tmux");
     if let Some(path) = socket_path {
         command.args(["-S", path]);
     }
 
     let output = command
-        .args(["kill-pane", "-t", session])
+        .args(["kill-pane", "-t", pane])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .output();
@@ -103,7 +120,7 @@ fn try_tmux_close_pane(session: &str, socket_path: Option<&str>) -> bool {
         "smart-close",
         &format!(
             "tmux kill-pane target={} socket={} -> {}",
-            session,
+            pane,
             socket_path.unwrap_or("<default>"),
             killed
         ),

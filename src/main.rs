@@ -1,6 +1,5 @@
 use hypr_nav_lib::*;
 use std::env;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 fn main() {
@@ -36,11 +35,7 @@ fn main() {
             "kitty-nav",
             "kitty is active, trying kitty neighbor navigation",
         );
-        let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-        let kitty_sock = PathBuf::from(&xdg).join("kitty");
-
-        if kitty_sock.exists() {
-            let kitty_socket_uri = format!("unix:{}", kitty_sock.display());
+        if let Some(kitty_socket_uri) = kitty_control_socket_uri() {
             let neighbor_match = format!("neighbor:{}", kitty_dir);
             let status = Command::new("kitty")
                 .args([
@@ -63,10 +58,7 @@ fn main() {
             }
             debug_log("kitty-nav", "kitty command did not succeed");
         } else {
-            debug_log(
-                "kitty-nav",
-                &format!("kitty socket missing at {}", kitty_sock.display()),
-            );
+            debug_log("kitty-nav", "kitty socket unavailable");
         }
     } else {
         debug_log("kitty-nav", "kitty not active");
@@ -79,24 +71,15 @@ fn main() {
     hypr_dispatch(&hypr_socket, &format!("movefocus {}", move_dir));
 }
 
-fn is_kitty_active(socket_path: &PathBuf) -> bool {
-    use std::io::Read;
-    use std::io::Write;
-    use std::os::unix::net::UnixStream;
-
-    if let Ok(mut stream) = UnixStream::connect(socket_path) {
-        if stream.write_all(b"activewindow").is_ok() {
-            let _ = stream.shutdown(std::net::Shutdown::Write);
-            let mut response = String::new();
-            if stream.read_to_string(&mut response).is_ok() {
-                let is_kitty = response.contains("class: kitty");
-                debug_log(
-                    "kitty-nav",
-                    &format!("activewindow class contains kitty={}", is_kitty),
-                );
-                return is_kitty;
-            }
-        }
+fn is_kitty_active(socket_path: &std::path::PathBuf) -> bool {
+    if let Some((class, _pid)) = get_active_window_info(socket_path) {
+        let class = class.to_ascii_lowercase();
+        let is_kitty = class == "kitty" || class.starts_with("kitty-");
+        debug_log(
+            "kitty-nav",
+            &format!("activewindow class={} kitty={}", class, is_kitty),
+        );
+        return is_kitty;
     }
     false
 }

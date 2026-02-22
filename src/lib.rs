@@ -299,10 +299,13 @@ fn find_nvim_listen_socket(pid: u32) -> Option<String> {
 }
 
 fn nvim_socket_is_live(socket: &str) -> bool {
-    if !std::path::Path::new(socket).exists() {
-        return false;
+    if std::path::Path::new(socket).exists() {
+        return UnixStream::connect(socket).is_ok();
     }
-    UnixStream::connect(socket).is_ok()
+
+    // Some setups expose nvim remote endpoints as host:port.
+    // Let command execution decide in that case.
+    socket.contains(':')
 }
 
 /// Map navigation direction to vim wincmd character
@@ -403,9 +406,22 @@ fn read_process_tty(pid: u32) -> Option<String> {
 }
 
 fn process_has_tmux(pid: u32) -> bool {
-    if let Ok(cmdline) = fs::read_to_string(format!("/proc/{}/cmdline", pid)) {
-        let cmd = cmdline.replace('\0', " ");
-        return cmd.contains("tmux") && !cmd.contains("hypr-tmux-nav");
+    if let Some(comm) = read_process_comm(pid) {
+        if comm == "tmux" || comm.starts_with("tmux:") {
+            return true;
+        }
+    }
+
+    if let Ok(cmdline) = fs::read(format!("/proc/{}/cmdline", pid)) {
+        if let Some(arg0) = cmdline.split(|b| *b == 0).next() {
+            let arg0 = String::from_utf8_lossy(arg0);
+            let basename = std::path::Path::new(arg0.as_ref())
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(arg0.as_ref())
+                .to_ascii_lowercase();
+            return basename == "tmux";
+        }
     }
     false
 }
@@ -415,15 +431,32 @@ fn kitty_socket_path() -> PathBuf {
     PathBuf::from(xdg).join("kitty")
 }
 
-fn find_focused_index(items: &[Value]) -> usize {
-    items
-        .iter()
-        .position(|item| {
-            item.get("is_focused")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        })
-        .unwrap_or(0)
+pub fn kitty_control_socket_uri() -> Option<String> {
+    if let Ok(listen_on) = env::var("KITTY_LISTEN_ON") {
+        let listen_on = listen_on.trim();
+        if !listen_on.is_empty() {
+            // Preserve explicit kitty endpoint schemes (e.g. unix:, tcp:).
+            if listen_on.contains(':') {
+                return Some(listen_on.to_string());
+            }
+            return Some(format!("unix:{}", listen_on));
+        }
+    }
+
+    let kitty_socket = kitty_socket_path();
+    if kitty_socket.exists() {
+        Some(format!("unix:{}", kitty_socket.display()))
+    } else {
+        None
+    }
+}
+
+fn find_focused_index(items: &[Value]) -> Option<usize> {
+    items.iter().position(|item| {
+        item.get("is_focused")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    })
 }
 
 fn read_pids_from_kitty_window(window: &Value) -> Vec<u32> {
@@ -453,40 +486,39 @@ fn read_pids_from_kitty_window(window: &Value) -> Vec<u32> {
     pids
 }
 
-fn parse_focused_kitty_pids(json: &str) -> Vec<u32> {
+fn parse_focused_kitty_pids(json: &str) -> Option<Vec<u32>> {
     let parsed: Value = match serde_json::from_str(json) {
         Ok(v) => v,
-        Err(_) => return Vec::new(),
+        Err(_) => return None,
     };
 
     let os_windows = match parsed.as_array() {
         Some(v) if !v.is_empty() => v,
-        _ => return Vec::new(),
+        _ => return None,
     };
-    let os_window = &os_windows[find_focused_index(os_windows)];
+    let os_window = &os_windows[find_focused_index(os_windows)?];
 
     let tabs = match os_window.get("tabs").and_then(Value::as_array) {
         Some(v) if !v.is_empty() => v,
-        _ => return Vec::new(),
+        _ => return None,
     };
-    let tab = &tabs[find_focused_index(tabs)];
+    let tab = &tabs[find_focused_index(tabs)?];
 
     let windows = match tab.get("windows").and_then(Value::as_array) {
         Some(v) if !v.is_empty() => v,
-        _ => return Vec::new(),
+        _ => return None,
     };
-    let window = &windows[find_focused_index(windows)];
+    let window = &windows[find_focused_index(windows)?];
 
-    read_pids_from_kitty_window(window)
+    Some(read_pids_from_kitty_window(window))
 }
 
 fn detect_terminal_runtime_from_kitty() -> KittyRuntimeProbe {
-    let kitty_socket = kitty_socket_path();
-    if !kitty_socket.exists() {
-        return KittyRuntimeProbe::Unavailable;
-    }
+    let kitty_uri = match kitty_control_socket_uri() {
+        Some(uri) => uri,
+        None => return KittyRuntimeProbe::Unavailable,
+    };
 
-    let kitty_uri = format!("unix:{}", kitty_socket.display());
     let output = Command::new("kitty")
         .args(["@", "--to", &kitty_uri, "ls"])
         .stdout(Stdio::piped())
@@ -514,7 +546,7 @@ fn detect_terminal_runtime_from_kitty() -> KittyRuntimeProbe {
     }
 
     let parsed = String::from_utf8_lossy(&output.stdout);
-    let candidate_pids = parse_focused_kitty_pids(&parsed);
+    let candidate_pids = parse_focused_kitty_pids(&parsed).unwrap_or_default();
     if candidate_pids.is_empty() {
         debug_log(
             "lib",
@@ -631,10 +663,7 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
                     );
                 }
                 if let Some(ref socket) = result.nvim_socket {
-                    debug_log(
-                        "lib",
-                        &format!("nvim socket from kitty: {}", socket),
-                    );
+                    debug_log("lib", &format!("nvim socket from kitty: {}", socket));
                 }
                 tmux_result = result.tmux;
                 kitty_nvim_socket = result.nvim_socket;
@@ -760,18 +789,12 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
     if !kitty_authoritative_nothing {
         if let Some(socket) = nvim_socket {
             if nvim_socket_is_live(&socket) {
-                debug_log(
-                    "lib",
-                    &format!("nvim runtime socket={} (live)", socket),
-                );
+                debug_log("lib", &format!("nvim runtime socket={} (live)", socket));
                 nvim_result = Some(NvimRuntime {
                     socket_path: socket,
                 });
             } else {
-                debug_log(
-                    "lib",
-                    &format!("nvim socket={} is stale, ignoring", socket),
-                );
+                debug_log("lib", &format!("nvim socket={} is stale, ignoring", socket));
             }
         }
     }
@@ -800,22 +823,17 @@ pub fn try_nvim_entry_assist(socket: &str, direction: &str) -> bool {
         .output();
 
     let win_count: usize = match output {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout)
-                .trim()
-                .parse()
-                .unwrap_or(1)
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(1),
         _ => return false,
     };
 
     if win_count <= 1 {
         debug_log(
             "lib",
-            &format!(
-                "nvim entry assist skip: single window socket={}",
-                socket
-            ),
+            &format!("nvim entry assist skip: single window socket={}", socket),
         );
         return false;
     }
@@ -1114,15 +1132,32 @@ pub struct TmuxSessionInfo {
     pub pane_count: usize,
 }
 
+fn parse_tmux_session_info_output(result: &str) -> Option<TmuxSessionInfo> {
+    let mut parts = result.trim().splitn(3, '\t');
+    let name = parts.next()?.trim().to_string();
+    let pane_count = parts.next()?.trim().parse().ok()?;
+    let window_count = parts.next()?.trim().parse().ok()?;
+
+    let is_named = name.parse::<u32>().is_err();
+
+    Some(TmuxSessionInfo {
+        name,
+        is_named,
+        window_count,
+        pane_count,
+    })
+}
+
 pub fn get_tmux_session_info(session: &str, socket_path: Option<&str>) -> Option<TmuxSessionInfo> {
-    // Format: #{session_name} #{window_panes} #{session_windows}
+    // Use a stable delimiter because session names may contain spaces.
+    // Format: #{session_name}\t#{window_panes}\t#{session_windows}
     let output = tmux_command(socket_path)
         .args([
             "display-message",
             "-t",
             session,
             "-p",
-            "#{session_name} #{window_panes} #{session_windows}",
+            "#{session_name}\t#{window_panes}\t#{session_windows}",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1141,21 +1176,8 @@ pub fn get_tmux_session_info(session: &str, socket_path: Option<&str>) -> Option
         return None;
     }
 
-    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let parts: Vec<&str> = result.split_whitespace().collect();
-    if parts.len() >= 3 {
-        let name = parts[0].to_string();
-        let pane_count = parts[1].parse().unwrap_or(1);
-        let window_count = parts[2].parse().unwrap_or(1);
-
-        let is_named = name.parse::<u32>().is_err();
-
-        let info = TmuxSessionInfo {
-            name,
-            is_named,
-            window_count,
-            pane_count,
-        };
+    let result = String::from_utf8_lossy(&output.stdout);
+    if let Some(info) = parse_tmux_session_info_output(&result) {
         debug_log(
             "lib",
             &format!(
@@ -1183,11 +1205,21 @@ pub fn get_tmux_session_info(session: &str, socket_path: Option<&str>) -> Option
 }
 
 pub fn hypr_dispatch(socket_path: &PathBuf, dispatcher: &str) {
-    if let Ok(mut stream) = UnixStream::connect(socket_path) {
-        let cmd = format!("dispatch {}", dispatcher);
-        debug_log("lib", &format!("hypr dispatch: {}", cmd));
-        let _ = stream.write_all(cmd.as_bytes());
-        let _ = stream.shutdown(std::net::Shutdown::Both);
+    match UnixStream::connect(socket_path) {
+        Ok(mut stream) => {
+            let cmd = format!("dispatch {}", dispatcher);
+            debug_log("lib", &format!("hypr dispatch: {}", cmd));
+            if let Err(err) = stream.write_all(cmd.as_bytes()) {
+                debug_log("lib", &format!("hypr dispatch write failed: {}", err));
+                return;
+            }
+            if let Err(err) = stream.shutdown(std::net::Shutdown::Both) {
+                debug_log("lib", &format!("hypr dispatch shutdown failed: {}", err));
+            }
+        }
+        Err(err) => {
+            debug_log("lib", &format!("hypr dispatch connect failed: {}", err));
+        }
     }
 }
 
@@ -1308,12 +1340,30 @@ mod tests {
 ]
 "#;
 
-        assert_eq!(parse_focused_kitty_pids(data), vec![2001, 2002, 2000]);
+        assert_eq!(parse_focused_kitty_pids(data), Some(vec![2001, 2002, 2000]));
     }
 
     #[test]
     fn parse_focused_kitty_pids_returns_empty_on_invalid_json() {
-        assert!(parse_focused_kitty_pids("not-json").is_empty());
+        assert_eq!(parse_focused_kitty_pids("not-json"), None);
+    }
+
+    #[test]
+    fn parse_focused_kitty_pids_returns_none_without_focus_markers() {
+        let data = r#"
+[
+  {
+    "tabs": [
+      {
+        "windows": [
+          {"pid": 2000}
+        ]
+      }
+    ]
+  }
+]
+"#;
+        assert_eq!(parse_focused_kitty_pids(data), None);
     }
 
     #[test]
@@ -1344,5 +1394,24 @@ mod tests {
     fn parse_nvim_socket_from_environ_ignores_empty_values() {
         let env = b"NVIM=\0NVIM_LISTEN_ADDRESS=\0";
         assert_eq!(parse_nvim_socket_from_environ(env), None);
+    }
+
+    #[test]
+    fn parse_tmux_session_info_output_handles_named_session_with_spaces() {
+        let info = parse_tmux_session_info_output("work session\t3\t2")
+            .expect("session info should parse");
+        assert_eq!(info.name, "work session");
+        assert!(info.is_named);
+        assert_eq!(info.pane_count, 3);
+        assert_eq!(info.window_count, 2);
+    }
+
+    #[test]
+    fn parse_tmux_session_info_output_detects_numeric_session_name() {
+        let info = parse_tmux_session_info_output("3\t1\t1").expect("session info should parse");
+        assert_eq!(info.name, "3");
+        assert!(!info.is_named);
+        assert_eq!(info.pane_count, 1);
+        assert_eq!(info.window_count, 1);
     }
 }
