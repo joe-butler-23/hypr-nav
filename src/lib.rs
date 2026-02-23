@@ -433,13 +433,8 @@ fn kitty_socket_path() -> PathBuf {
 
 pub fn kitty_control_socket_uri() -> Option<String> {
     if let Ok(listen_on) = env::var("KITTY_LISTEN_ON") {
-        let listen_on = listen_on.trim();
-        if !listen_on.is_empty() {
-            // Preserve explicit kitty endpoint schemes (e.g. unix:, tcp:).
-            if listen_on.contains(':') {
-                return Some(listen_on.to_string());
-            }
-            return Some(format!("unix:{}", listen_on));
+        if let Some(uri) = normalize_kitty_listen_on(&listen_on) {
+            return Some(uri);
         }
     }
 
@@ -449,6 +444,20 @@ pub fn kitty_control_socket_uri() -> Option<String> {
     } else {
         None
     }
+}
+
+fn normalize_kitty_listen_on(listen_on: &str) -> Option<String> {
+    let listen_on = listen_on.trim();
+    if listen_on.is_empty() {
+        return None;
+    }
+
+    // Preserve explicit kitty endpoint schemes (e.g. unix:, tcp:).
+    if listen_on.contains(':') {
+        return Some(listen_on.to_string());
+    }
+
+    Some(format!("unix:{}", listen_on))
 }
 
 fn find_focused_index(items: &[Value]) -> Option<usize> {
@@ -1413,5 +1422,29 @@ mod tests {
         assert!(!info.is_named);
         assert_eq!(info.pane_count, 1);
         assert_eq!(info.window_count, 1);
+    }
+
+    #[test]
+    fn normalize_kitty_listen_on_preserves_tcp_uri() {
+        assert_eq!(
+            normalize_kitty_listen_on("tcp:127.0.0.1:5000"),
+            Some("tcp:127.0.0.1:5000".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_kitty_listen_on_preserves_unix_uri() {
+        assert_eq!(
+            normalize_kitty_listen_on("unix:/tmp/kitty"),
+            Some("unix:/tmp/kitty".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_kitty_listen_on_normalizes_bare_path() {
+        assert_eq!(
+            normalize_kitty_listen_on("/tmp/kitty"),
+            Some("unix:/tmp/kitty".to_string())
+        );
     }
 }

@@ -74,7 +74,7 @@ fn main() {
 fn is_kitty_active(socket_path: &std::path::PathBuf) -> bool {
     if let Some((class, _pid)) = get_active_window_info(socket_path) {
         let class = class.to_ascii_lowercase();
-        let is_kitty = class == "kitty" || class.starts_with("kitty-");
+        let is_kitty = class.contains("kitty");
         debug_log(
             "kitty-nav",
             &format!("activewindow class={} kitty={}", class, is_kitty),
