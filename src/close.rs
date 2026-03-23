@@ -1,5 +1,4 @@
 use hypr_nav_lib::*;
-use std::process::{Command, Stdio};
 
 #[derive(Debug, PartialEq, Eq)]
 enum TmuxCloseAction {
@@ -73,17 +72,8 @@ fn handle_tmux_close(
     if let Some(info) = get_tmux_session_info(session, socket_path) {
         match choose_tmux_close_action(&info, pane, client_tty) {
             Some(TmuxCloseAction::DetachClient(target_tty)) => {
-                let mut command = Command::new("tmux");
-                if let Some(path) = socket_path {
-                    command.args(["-S", path]);
-                }
-                let detached = command
-                    .args(["detach-client", "-t", &target_tty])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .map(|status| status.success())
-                    .unwrap_or(false);
+                let detached =
+                    tmux_status(["detach-client", "-t", &target_tty].as_ref(), socket_path);
                 debug_log(
                     "smart-close",
                     &format!(
@@ -111,21 +101,7 @@ fn handle_tmux_close(
 }
 
 fn try_tmux_close_pane(pane: &str, socket_path: Option<&str>) -> bool {
-    let mut command = Command::new("tmux");
-    if let Some(path) = socket_path {
-        command.args(["-S", path]);
-    }
-
-    let output = command
-        .args(["kill-pane", "-t", pane])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
-
-    let killed = match output {
-        Ok(out) => out.status.success(),
-        Err(_) => false,
-    };
+    let killed = tmux_status(["kill-pane", "-t", pane].as_ref(), socket_path);
     debug_log(
         "smart-close",
         &format!(

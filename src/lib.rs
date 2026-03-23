@@ -5,11 +5,85 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Known terminal emulator window classes
 pub const KNOWN_TERMINALS: &[&str] = &["kitty"];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl Direction {
+    pub fn parse(arg: &str) -> Option<Self> {
+        match arg {
+            "h" | "left" => Some(Self::Left),
+            "l" | "right" | "r" => Some(Self::Right),
+            "k" | "up" | "u" => Some(Self::Up),
+            "j" | "down" | "d" => Some(Self::Down),
+            _ => None,
+        }
+    }
+
+    pub fn hypr_movefocus_arg(self) -> &'static str {
+        match self {
+            Self::Left => "l",
+            Self::Right => "r",
+            Self::Up => "u",
+            Self::Down => "d",
+        }
+    }
+
+    pub fn kitty_neighbor(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Up => "top",
+            Self::Down => "bottom",
+        }
+    }
+
+    pub fn tmux_flag(self) -> &'static str {
+        match self {
+            Self::Left => "L",
+            Self::Right => "R",
+            Self::Up => "U",
+            Self::Down => "D",
+        }
+    }
+
+    fn nvim_wincmd_char(self) -> &'static str {
+        match self {
+            Self::Left => "h",
+            Self::Right => "l",
+            Self::Up => "k",
+            Self::Down => "j",
+        }
+    }
+
+    fn nvim_entry_assist_char(self) -> &'static str {
+        match self {
+            Self::Left => "l",
+            Self::Right => "h",
+            Self::Up => "j",
+            Self::Down => "k",
+        }
+    }
+
+    fn tmux_edge_flag(self) -> &'static str {
+        match self {
+            Self::Left => "#{pane_at_left}",
+            Self::Right => "#{pane_at_right}",
+            Self::Up => "#{pane_at_top}",
+            Self::Down => "#{pane_at_bottom}",
+        }
+    }
+}
 
 pub struct TmuxRuntime {
     pub tty: String,
@@ -130,32 +204,73 @@ pub fn is_terminal_window(class: &str, pid: u32) -> bool {
         .any(|terminal| process_matches_terminal_name(pid, terminal))
 }
 
-/// Find the Hyprland socket path
-pub fn find_hyprland_socket() -> Option<PathBuf> {
-    let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    let sig = env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
+fn hypr_socket_names() -> [&'static str; 2] {
+    [".socket.sock", "socket.sock"]
+}
 
-    if sig.is_empty() {
-        return None;
+fn valid_hypr_socket_paths(dir: &Path) -> Vec<PathBuf> {
+    hypr_socket_names()
+        .into_iter()
+        .map(|name| dir.join(name))
+        .filter(|path| {
+            fs::metadata(path)
+                .map(|meta| meta.file_type().is_socket())
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn find_hyprland_socket_with(
+    xdg_runtime_dir: &str,
+    instance_signature: Option<&str>,
+) -> Option<PathBuf> {
+    let hypr_root = Path::new(xdg_runtime_dir).join("hypr");
+
+    if let Some(sig) = instance_signature.filter(|sig| !sig.trim().is_empty()) {
+        return valid_hypr_socket_paths(&hypr_root.join(sig))
+            .into_iter()
+            .next();
     }
 
-    let hypr_dir = PathBuf::from(&xdg).join("hypr").join(&sig);
-    let socket_names = [".socket.sock", "socket.sock"];
-
-    for name in &socket_names {
-        let path = hypr_dir.join(name);
-        if path.exists() {
-            if let Ok(meta) = fs::metadata(&path) {
-                if meta.file_type().is_socket() {
-                    debug_log("lib", &format!("hypr socket selected: {}", path.display()));
-                    return Some(path);
-                }
-            }
+    let mut candidates = Vec::new();
+    let entries = fs::read_dir(&hypr_root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            candidates.extend(valid_hypr_socket_paths(&path));
         }
     }
 
-    debug_log("lib", "no usable hypr socket found");
+    if candidates.len() == 1 {
+        return candidates.pop();
+    }
+
+    if candidates.len() > 1 {
+        debug_log(
+            "lib",
+            &format!(
+                "multiple hypr sockets found under {}; refusing ambiguous fallback",
+                hypr_root.display()
+            ),
+        );
+    }
+
     None
+}
+
+/// Find the Hyprland socket path
+pub fn find_hyprland_socket() -> Option<PathBuf> {
+    let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let sig = env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+    let socket = find_hyprland_socket_with(&xdg, sig.as_deref());
+
+    if let Some(ref path) = socket {
+        debug_log("lib", &format!("hypr socket selected: {}", path.display()));
+    } else {
+        debug_log("lib", "no usable hypr socket found");
+    }
+
+    socket
 }
 
 /// Get active window class and PID in a single Hyprland query
@@ -308,33 +423,11 @@ fn nvim_socket_is_live(socket: &str) -> bool {
     socket.contains(':')
 }
 
-/// Map navigation direction to vim wincmd character
-fn nvim_wincmd_char(direction: &str) -> Option<&'static str> {
-    match direction {
-        "L" => Some("h"),
-        "R" => Some("l"),
-        "U" => Some("k"),
-        "D" => Some("j"),
-        _ => None,
-    }
-}
-
-/// Map navigation direction to vim winnr() direction argument
-fn nvim_winnr_dir(direction: &str) -> Option<&'static str> {
-    // winnr('h') returns the window number of the neighbor to the left, etc.
-    nvim_wincmd_char(direction)
-}
-
 /// Check if the nvim window is at the edge in the given direction.
 /// Returns true when at edge (no neighbor), or on error (fail-open to fall through).
-pub fn is_nvim_at_edge(socket: &str, direction: &str) -> bool {
-    let dir_char = match nvim_winnr_dir(direction) {
-        Some(c) => c,
-        None => return true,
-    };
-
+pub fn is_nvim_at_edge(socket: &str, direction: Direction) -> bool {
     // winnr() == winnr('h') is true when there's no neighbor to the left
-    let expr = format!("winnr()==winnr('{}')", dir_char);
+    let expr = format!("winnr()==winnr('{}')", direction.nvim_wincmd_char());
     let output = Command::new("nvim")
         .args(["--server", socket, "--remote-expr", &expr])
         .stdout(Stdio::piped())
@@ -349,7 +442,9 @@ pub fn is_nvim_at_edge(socket: &str, direction: &str) -> bool {
                 "lib",
                 &format!(
                     "is_nvim_at_edge socket={} dir={} -> {}",
-                    socket, direction, at_edge
+                    socket,
+                    direction.tmux_flag(),
+                    at_edge
                 ),
             );
             at_edge
@@ -359,7 +454,8 @@ pub fn is_nvim_at_edge(socket: &str, direction: &str) -> bool {
                 "lib",
                 &format!(
                     "is_nvim_at_edge socket={} dir={} -> true (error, fail-open)",
-                    socket, direction
+                    socket,
+                    direction.tmux_flag()
                 ),
             );
             true
@@ -369,14 +465,9 @@ pub fn is_nvim_at_edge(socket: &str, direction: &str) -> bool {
 
 /// Navigate to the nvim split in the given direction.
 /// Returns true if the command was sent successfully.
-pub fn try_nvim_navigate(socket: &str, direction: &str) -> bool {
-    let dir_char = match nvim_wincmd_char(direction) {
-        Some(c) => c,
-        None => return false,
-    };
-
+pub fn try_nvim_navigate(socket: &str, direction: Direction) -> bool {
     // Send <C-w>{dir} keysequence
-    let keys = format!("<C-w>{}", dir_char);
+    let keys = format!("<C-w>{}", direction.nvim_wincmd_char());
     let result = Command::new("nvim")
         .args(["--server", socket, "--remote-send", &keys])
         .stdout(Stdio::null())
@@ -389,7 +480,9 @@ pub fn try_nvim_navigate(socket: &str, direction: &str) -> bool {
         "lib",
         &format!(
             "try_nvim_navigate socket={} dir={} -> {}",
-            socket, direction, result
+            socket,
+            direction.tmux_flag(),
+            result
         ),
     );
     result
@@ -823,7 +916,7 @@ pub fn detect_tmux_runtime(pid: u32, class: &str) -> Option<TmuxRuntime> {
 
 /// Attempt nvim entry assist: navigate to opposite-edge window on cross-window entry.
 /// Returns true if entry assist was applied (multiple windows and navigation succeeded).
-pub fn try_nvim_entry_assist(socket: &str, direction: &str) -> bool {
+pub fn try_nvim_entry_assist(socket: &str, direction: Direction) -> bool {
     // Check if nvim has multiple windows
     let output = Command::new("nvim")
         .args(["--server", socket, "--remote-expr", "winnr('$')"])
@@ -847,18 +940,7 @@ pub fn try_nvim_entry_assist(socket: &str, direction: &str) -> bool {
         return false;
     }
 
-    // Navigate to opposite edge: when entering from a direction,
-    // jump to the far side so the user lands at the expected edge.
-    // Moving left → entering from right → go to right edge (999<C-w>l)
-    // Moving right → entering from left → go to left edge (999<C-w>h)
-    let opposite = match direction {
-        "L" => "l",
-        "R" => "h",
-        "U" => "j",
-        "D" => "k",
-        _ => return false,
-    };
-
+    let opposite = direction.nvim_entry_assist_char();
     let keys = format!("999<C-w>{}", opposite);
     let result = Command::new("nvim")
         .args(["--server", socket, "--remote-send", &keys])
@@ -872,7 +954,10 @@ pub fn try_nvim_entry_assist(socket: &str, direction: &str) -> bool {
         "lib",
         &format!(
             "try_nvim_entry_assist socket={} dir={} opposite={} -> {}",
-            socket, direction, opposite, result
+            socket,
+            direction.tmux_flag(),
+            opposite,
+            result
         ),
     );
     result
@@ -884,6 +969,31 @@ fn tmux_command(socket_path: Option<&str>) -> Command {
         command.args(["-S", path]);
     }
     command
+}
+
+pub fn tmux_capture(args: &[&str], socket_path: Option<&str>) -> Option<String> {
+    let output = tmux_command(socket_path)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub fn tmux_status(args: &[&str], socket_path: Option<&str>) -> bool {
+    tmux_command(socket_path)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// Find the tmux session for a given TTY
@@ -1090,17 +1200,15 @@ pub fn find_tmux_session_by_pane_tty(tty: &str, socket_path: Option<&str>) -> Op
 }
 
 /// Check if the active pane in the session is at the edge in the given direction
-pub fn is_pane_at_edge(session: &str, direction: &str, socket_path: Option<&str>) -> bool {
-    let flag = match direction {
-        "L" => "#{pane_at_left}",
-        "R" => "#{pane_at_right}",
-        "U" => "#{pane_at_top}",
-        "D" => "#{pane_at_bottom}",
-        _ => return false,
-    };
-
+pub fn is_pane_at_edge(session: &str, direction: Direction, socket_path: Option<&str>) -> bool {
     let output = tmux_command(socket_path)
-        .args(["display-message", "-t", session, "-p", flag])
+        .args([
+            "display-message",
+            "-t",
+            session,
+            "-p",
+            direction.tmux_edge_flag(),
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output();
@@ -1114,7 +1222,7 @@ pub fn is_pane_at_edge(session: &str, direction: &str, socket_path: Option<&str>
                 &format!(
                     "is_pane_at_edge target={} dir={} socket={} -> {}",
                     session,
-                    direction,
+                    direction.tmux_flag(),
                     socket_path.unwrap_or("<default>"),
                     at_edge
                 ),
@@ -1127,7 +1235,7 @@ pub fn is_pane_at_edge(session: &str, direction: &str, socket_path: Option<&str>
         &format!(
             "is_pane_at_edge target={} dir={} socket={} -> false (tmux error)",
             session,
-            direction,
+            direction.tmux_flag(),
             socket_path.unwrap_or("<default>")
         ),
     );
@@ -1235,6 +1343,65 @@ pub fn hypr_dispatch(socket_path: &PathBuf, dispatcher: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::net::UnixListener;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "hypr-nav-{}-{}-{}",
+            name,
+            std::process::id(),
+            nonce
+        ));
+        fs::create_dir_all(&dir).expect("test temp dir should be created");
+        dir
+    }
+
+    #[test]
+    fn direction_parse_supports_aliases() {
+        assert_eq!(Direction::parse("h"), Some(Direction::Left));
+        assert_eq!(Direction::parse("right"), Some(Direction::Right));
+        assert_eq!(Direction::parse("u"), Some(Direction::Up));
+        assert_eq!(Direction::parse("down"), Some(Direction::Down));
+        assert_eq!(Direction::parse("bogus"), None);
+    }
+
+    #[test]
+    fn find_hyprland_socket_with_uses_unique_fallback_socket() {
+        let runtime_dir = temp_test_dir("unique-socket");
+        let hypr_dir = runtime_dir.join("hypr").join("instance-a");
+        fs::create_dir_all(&hypr_dir).expect("hypr dir should exist");
+        let socket_path = hypr_dir.join(".socket.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("socket should bind");
+
+        let found = find_hyprland_socket_with(runtime_dir.to_str().unwrap(), None);
+        assert_eq!(found, Some(socket_path));
+
+        let _ = fs::remove_dir_all(runtime_dir);
+    }
+
+    #[test]
+    fn find_hyprland_socket_with_rejects_ambiguous_fallback_sockets() {
+        let runtime_dir = temp_test_dir("ambiguous-socket");
+        let socket_a_dir = runtime_dir.join("hypr").join("instance-a");
+        let socket_b_dir = runtime_dir.join("hypr").join("instance-b");
+        fs::create_dir_all(&socket_a_dir).expect("first hypr dir should exist");
+        fs::create_dir_all(&socket_b_dir).expect("second hypr dir should exist");
+        let _listener_a = UnixListener::bind(socket_a_dir.join(".socket.sock"))
+            .expect("first socket should bind");
+        let _listener_b = UnixListener::bind(socket_b_dir.join("socket.sock"))
+            .expect("second socket should bind");
+
+        let found = find_hyprland_socket_with(runtime_dir.to_str().unwrap(), None);
+        assert_eq!(found, None);
+
+        let _ = fs::remove_dir_all(runtime_dir);
+    }
 
     #[test]
     fn parse_tmux_client_pane_matches_exact_tty() {

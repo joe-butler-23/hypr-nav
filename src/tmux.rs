@@ -2,7 +2,6 @@ use hypr_nav_lib::*;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const NAV_STATE_FILE: &str = "hypr-nav-navstate";
@@ -108,44 +107,13 @@ fn should_apply_entry_assist(state: Option<&NavState>, move_dir: &str, current_t
     }
 }
 
-fn tmux_capture(args: &[&str], socket_path: Option<&str>) -> Option<String> {
-    let mut command = Command::new("tmux");
-    if let Some(path) = socket_path {
-        command.args(["-S", path]);
-    }
-
-    let output = command
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
 fn select_tmux_pane(target: &str, socket_path: Option<&str>) -> bool {
-    let mut command = Command::new("tmux");
-    if let Some(path) = socket_path {
-        command.args(["-S", path]);
-    }
-
-    command
-        .args(["select-pane", "-t", target])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    tmux_status(["select-pane", "-t", target].as_ref(), socket_path)
 }
 
 fn find_entry_assist_pane(
     target: &str,
-    direction: &str,
+    direction: Direction,
     socket_path: Option<&str>,
 ) -> Option<String> {
     let window_id = tmux_capture(
@@ -167,13 +135,12 @@ fn find_entry_assist_pane(
     choose_entry_assist_pane(&pane_rows, direction)
 }
 
-fn choose_entry_assist_pane(pane_rows: &str, direction: &str) -> Option<String> {
+fn choose_entry_assist_pane(pane_rows: &str, direction: Direction) -> Option<String> {
     let target_flag_index = match direction {
-        "L" => 2, // moving left -> prefer right-edge pane on entry
-        "R" => 1, // moving right -> prefer left-edge pane on entry
-        "U" => 4, // moving up -> prefer bottom-edge pane on entry
-        "D" => 3, // moving down -> prefer top-edge pane on entry
-        _ => return None,
+        Direction::Left => 2,  // moving left -> prefer right-edge pane on entry
+        Direction::Right => 1, // moving right -> prefer left-edge pane on entry
+        Direction::Up => 4,    // moving up -> prefer bottom-edge pane on entry
+        Direction::Down => 3,  // moving down -> prefer top-edge pane on entry
     };
 
     let mut pane_count = 0usize;
@@ -215,13 +182,12 @@ fn main() {
         std::process::exit(1);
     }
 
-    let (move_dir, tmux_dir) = match args[1].as_str() {
-        "h" | "left" => ("l", "L"),
-        "l" | "right" | "r" => ("r", "R"),
-        "k" | "up" | "u" => ("u", "U"),
-        "j" | "down" | "d" => ("d", "D"),
-        _ => std::process::exit(2),
+    let direction = match Direction::parse(&args[1]) {
+        Some(direction) => direction,
+        None => std::process::exit(2),
     };
+    let move_dir = direction.hypr_movefocus_arg();
+    let tmux_dir = direction.tmux_flag();
 
     let hypr_socket = match find_hyprland_socket() {
         Some(path) => path,
@@ -258,7 +224,7 @@ fn main() {
                 if !nvim_tty.is_empty()
                     && should_apply_entry_assist(previous_state.as_ref(), move_dir, nvim_tty)
                 {
-                    if try_nvim_entry_assist(&nvim.socket_path, tmux_dir) {
+                    if try_nvim_entry_assist(&nvim.socket_path, direction) {
                         debug_log("tmux-nav", "nvim entry assist applied");
                         save_nav_state("nvim_entry_assist", move_dir, current_tty.as_deref());
                         return;
@@ -270,8 +236,8 @@ fn main() {
                     }
                 }
 
-                if !is_nvim_at_edge(&nvim.socket_path, tmux_dir) {
-                    if try_nvim_navigate(&nvim.socket_path, tmux_dir) {
+                if !is_nvim_at_edge(&nvim.socket_path, direction) {
+                    if try_nvim_navigate(&nvim.socket_path, direction) {
                         debug_log("tmux-nav", "nvim split navigation succeeded");
                         save_nav_state("nvim_wincmd", move_dir, current_tty.as_deref());
                         return;
@@ -292,7 +258,7 @@ fn main() {
                         should_apply_entry_assist(previous_state.as_ref(), move_dir, &runtime.tty);
                     if should_entry_assist {
                         if let Some(entry_pane) =
-                            find_entry_assist_pane(&pane, tmux_dir, socket_path)
+                            find_entry_assist_pane(&pane, direction, socket_path)
                         {
                             if entry_pane == pane {
                                 debug_log(
@@ -318,8 +284,8 @@ fn main() {
                         }
                     }
 
-                    let at_edge = is_pane_at_edge(&pane, tmux_dir, socket_path);
-                    if !at_edge && try_tmux_navigate(&pane, tmux_dir, socket_path) {
+                    let at_edge = is_pane_at_edge(&pane, direction, socket_path);
+                    if !at_edge && try_tmux_navigate(&pane, direction, socket_path) {
                         debug_log("tmux-nav", "tmux pane navigation succeeded");
                         save_nav_state("tmux_select", move_dir, Some(&runtime.tty));
                         return;
@@ -335,7 +301,7 @@ fn main() {
                         should_apply_entry_assist(previous_state.as_ref(), move_dir, &runtime.tty);
                     if should_entry_assist {
                         if let Some(entry_pane) =
-                            find_entry_assist_pane(&session, tmux_dir, socket_path)
+                            find_entry_assist_pane(&session, direction, socket_path)
                         {
                             let current_pane = tmux_capture(
                                 &["display-message", "-t", &session, "-p", "#{pane_id}"],
@@ -365,8 +331,8 @@ fn main() {
                         }
                     }
 
-                    let at_edge = is_pane_at_edge(&session, tmux_dir, socket_path);
-                    if !at_edge && try_tmux_navigate(&session, tmux_dir, socket_path) {
+                    let at_edge = is_pane_at_edge(&session, direction, socket_path);
+                    if !at_edge && try_tmux_navigate(&session, direction, socket_path) {
                         debug_log("tmux-nav", "tmux session navigation succeeded");
                         save_nav_state("tmux_select", move_dir, Some(&runtime.tty));
                         return;
@@ -392,26 +358,18 @@ fn main() {
     hypr_dispatch(&hypr_socket, &format!("movefocus {}", move_dir));
 }
 
-fn try_tmux_navigate(target: &str, direction: &str, socket_path: Option<&str>) -> bool {
-    let direction_flag = format!("-{}", direction);
-    let mut command = Command::new("tmux");
-    if let Some(path) = socket_path {
-        command.args(["-S", path]);
-    }
-
-    let result = command
-        .args(["select-pane", "-t", target, &direction_flag])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+fn try_tmux_navigate(target: &str, direction: Direction, socket_path: Option<&str>) -> bool {
+    let direction_flag = format!("-{}", direction.tmux_flag());
+    let result = tmux_status(
+        ["select-pane", "-t", target, &direction_flag].as_ref(),
+        socket_path,
+    );
     debug_log(
         "tmux-nav",
         &format!(
             "tmux select-pane target={} dir={} socket={} -> {}",
             target,
-            direction,
+            direction.tmux_flag(),
             socket_path.unwrap_or("<default>"),
             result
         ),
@@ -421,6 +379,8 @@ fn try_tmux_navigate(target: &str, direction: &str, socket_path: Option<&str>) -
 
 #[cfg(test)]
 mod tests {
+    use hypr_nav_lib::Direction;
+
     use super::choose_entry_assist_pane;
 
     #[test]
@@ -429,13 +389,16 @@ mod tests {
 %0 1 0 1 1 1
 %1 0 1 1 1 0
 ";
-        assert_eq!(choose_entry_assist_pane(rows, "L"), Some("%1".to_string()));
+        assert_eq!(
+            choose_entry_assist_pane(rows, Direction::Left),
+            Some("%1".to_string())
+        );
     }
 
     #[test]
     fn choose_entry_assist_pane_requires_multiple_panes() {
         let rows = "%0 1 1 1 1 1\n";
-        assert_eq!(choose_entry_assist_pane(rows, "L"), None);
+        assert_eq!(choose_entry_assist_pane(rows, Direction::Left), None);
     }
 
     #[test]
@@ -444,7 +407,10 @@ mod tests {
 %0 0 1 1 1 1
 %1 1 0 1 1 0
 ";
-        assert_eq!(choose_entry_assist_pane(rows, "L"), Some("%0".to_string()));
+        assert_eq!(
+            choose_entry_assist_pane(rows, Direction::Left),
+            Some("%0".to_string())
+        );
     }
 
     #[test]
@@ -453,6 +419,9 @@ mod tests {
 %0 1 0 1 1 1
 %1 0 1 1 1 0
 ";
-        assert_eq!(choose_entry_assist_pane(rows, "R"), Some("%0".to_string()));
+        assert_eq!(
+            choose_entry_assist_pane(rows, Direction::Right),
+            Some("%0".to_string())
+        );
     }
 }

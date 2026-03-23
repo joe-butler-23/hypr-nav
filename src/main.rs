@@ -9,13 +9,12 @@ fn main() {
         std::process::exit(1);
     }
 
-    let (move_dir, kitty_dir) = match args[1].as_str() {
-        "h" | "left" => ("l", "left"),
-        "l" | "right" | "r" => ("r", "right"),
-        "k" | "up" | "u" => ("u", "top"),
-        "j" | "down" | "d" => ("d", "bottom"),
-        _ => std::process::exit(2),
+    let direction = match Direction::parse(&args[1]) {
+        Some(direction) => direction,
+        None => std::process::exit(2),
     };
+    let move_dir = direction.hypr_movefocus_arg();
+    let kitty_dir = direction.kitty_neighbor();
 
     let hypr_socket = match find_hyprland_socket() {
         Some(path) => path,
