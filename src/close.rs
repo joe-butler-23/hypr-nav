@@ -13,8 +13,11 @@ fn main() {
     };
     debug_log("smart-close", "invoked");
 
+    let mut try_kitty_close = false;
+
     if let Some((class, pid)) = get_active_window_info(&hypr_socket) {
         if is_terminal_window(&class, pid) {
+            try_kitty_close = is_kitty_window(&class, pid);
             debug_log(
                 "smart-close",
                 &format!("terminal active class={} pid={}", class, pid),
@@ -57,6 +60,21 @@ fn main() {
         }
     } else {
         debug_log("smart-close", "active window info unavailable");
+    }
+
+    if try_kitty_close {
+        debug_log(
+            "smart-close",
+            "trying kitty focused close before hypr fallback",
+        );
+        if try_close_focused_kitty_window() {
+            debug_log("smart-close", "kitty focused close handled");
+            return;
+        }
+        debug_log(
+            "smart-close",
+            "kitty focused close failed, fallback to hypr killactive",
+        );
     }
 
     debug_log("smart-close", "fallback to hypr killactive");

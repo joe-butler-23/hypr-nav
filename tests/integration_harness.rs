@@ -176,6 +176,12 @@ if [[ "${1-}" == "@" && "${4-}" == "ls" ]]; then
   printf '%s' "${TEST_KITTY_LS_JSON:-[]}"
   exit 0
 fi
+if [[ "${1-}" == "@" && "${4-}" == "close-window" ]]; then
+  if [[ "${TEST_KITTY_CLOSE_OK:-0}" == "1" ]]; then
+    exit 0
+  fi
+  exit 1
+fi
 if [[ "${1-}" == "@" ]]; then
   if [[ "${TEST_KITTY_FOCUS_OK:-0}" == "1" ]]; then
     exit 0
@@ -421,6 +427,57 @@ fn hypr_nav_falls_back_to_hypr_when_kitty_navigation_fails() {
             .iter()
             .any(|request| request == "dispatch movefocus r"),
         "expected Hypr fallback dispatch, got {requests:?}"
+    );
+}
+
+#[test]
+fn hypr_smart_close_closes_focused_kitty_before_hypr_fallback() {
+    let harness = Harness::new("smart-close-kitty");
+    let hypr = HyprServer::start(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        "kitty",
+        std::process::id(),
+    );
+
+    let mut envs = harness.envs();
+    envs.push(("TEST_KITTY_CLOSE_OK".to_string(), "1".to_string()));
+
+    run_binary("hypr-smart-close", &[], &envs);
+
+    wait_for_log_line(
+        &harness.log_path,
+        "kitty @ --to unix:/tmp/fake-kitty close-window --match state:focused",
+    );
+    let requests = hypr.requests();
+    assert!(requests.iter().any(|request| request == "activewindow"));
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request == "dispatch killactive"),
+        "expected no Hypr killactive fallback, got {requests:?}"
+    );
+}
+
+#[test]
+fn hypr_smart_close_falls_back_to_hypr_when_kitty_close_fails() {
+    let harness = Harness::new("smart-close-fallback");
+    let hypr = HyprServer::start(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        "kitty",
+        std::process::id(),
+    );
+
+    let envs = harness.envs();
+    run_binary("hypr-smart-close", &[], &envs);
+
+    let requests = wait_for_request(&hypr, "dispatch killactive");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request == "dispatch killactive"),
+        "expected Hypr killactive fallback, got {requests:?}"
     );
 }
 

@@ -204,6 +204,10 @@ pub fn is_terminal_window(class: &str, pid: u32) -> bool {
         .any(|terminal| process_matches_terminal_name(pid, terminal))
 }
 
+pub fn is_kitty_window(class: &str, pid: u32) -> bool {
+    class.to_ascii_lowercase().contains("kitty") || process_matches_terminal_name(pid, "kitty")
+}
+
 fn hypr_socket_names() -> [&'static str; 2] {
     [".socket.sock", "socket.sock"]
 }
@@ -551,6 +555,40 @@ fn normalize_kitty_listen_on(listen_on: &str) -> Option<String> {
     }
 
     Some(format!("unix:{}", listen_on))
+}
+
+pub fn try_close_focused_kitty_window() -> bool {
+    let kitty_uri = match kitty_control_socket_uri() {
+        Some(uri) => uri,
+        None => {
+            debug_log("lib", "kitty socket unavailable for focused close");
+            return false;
+        }
+    };
+
+    let result = Command::new("kitty")
+        .args([
+            "@",
+            "--to",
+            &kitty_uri,
+            "close-window",
+            "--match",
+            "state:focused",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+
+    debug_log(
+        "lib",
+        &format!(
+            "kitty focused close socket={} match=state:focused -> {}",
+            kitty_uri, result
+        ),
+    );
+    result
 }
 
 fn find_focused_index(items: &[Value]) -> Option<usize> {
