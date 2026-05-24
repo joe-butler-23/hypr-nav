@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -51,6 +51,17 @@ struct HyprServer {
 
 impl HyprServer {
     fn start(runtime_dir: &Path, sig: &str, active_class: &str, active_pid: u32) -> Self {
+        Self::start_with_response(
+            runtime_dir,
+            sig,
+            &format!(
+                "Window abc123 -> test window:\nclass: {}\npid: {}\n",
+                active_class, active_pid
+            ),
+        )
+    }
+
+    fn start_with_response(runtime_dir: &Path, sig: &str, active_response: &str) -> Self {
         let socket_dir = runtime_dir.join("hypr").join(sig);
         fs::create_dir_all(&socket_dir).expect("hypr runtime dir should be created");
         let socket_path = socket_dir.join(".socket.sock");
@@ -63,7 +74,7 @@ impl HyprServer {
         let stop = Arc::new(AtomicBool::new(false));
         let requests_clone = Arc::clone(&requests);
         let stop_clone = Arc::clone(&stop);
-        let active_response = format!("class: {}\npid: {}\n", active_class, active_pid);
+        let active_response = active_response.to_string();
 
         let handle = thread::spawn(move || {
             while !stop_clone.load(Ordering::Relaxed) {
@@ -363,7 +374,7 @@ fn wait_for_request(server: &HyprServer, needle: &str) -> Vec<String> {
     server.requests()
 }
 
-fn run_binary(bin_name: &str, args: &[&str], envs: &[(String, String)]) {
+fn run_binary_status(bin_name: &str, args: &[&str], envs: &[(String, String)]) -> ExitStatus {
     let bin = match bin_name {
         "hypr-nav" => env!("CARGO_BIN_EXE_hypr-nav"),
         "hypr-tmux-nav" => env!("CARGO_BIN_EXE_hypr-tmux-nav"),
@@ -375,7 +386,11 @@ fn run_binary(bin_name: &str, args: &[&str], envs: &[(String, String)]) {
     for (key, value) in envs {
         command.env(key, value);
     }
-    let status = command.status().expect("binary should run");
+    command.status().expect("binary should run")
+}
+
+fn run_binary(bin_name: &str, args: &[&str], envs: &[(String, String)]) {
+    let status = run_binary_status(bin_name, args, envs);
     assert!(status.success(), "binary exited with {status}");
 }
 
@@ -431,7 +446,7 @@ fn hypr_nav_falls_back_to_hypr_when_kitty_navigation_fails() {
 }
 
 #[test]
-fn hypr_smart_close_closes_focused_kitty_before_hypr_fallback() {
+fn hypr_smart_close_closes_captured_kitty_hypr_window_only() {
     let harness = Harness::new("smart-close-kitty");
     let hypr = HyprServer::start(
         &harness.runtime_dir,
@@ -442,26 +457,66 @@ fn hypr_smart_close_closes_focused_kitty_before_hypr_fallback() {
 
     let mut envs = harness.envs();
     envs.push(("TEST_KITTY_CLOSE_OK".to_string(), "1".to_string()));
+    envs.push((
+        "TEST_KITTY_LS_JSON".to_string(),
+        r#"[{"is_focused":true,"tabs":[{"is_focused":true,"windows":[{"is_focused":true,"pid":999}]}]}]"#
+            .to_string(),
+    ));
 
     run_binary("hypr-smart-close", &[], &envs);
 
-    wait_for_log_line(
-        &harness.log_path,
-        "kitty @ --to unix:/tmp/fake-kitty close-window --match state:focused",
+    let requests = wait_for_request(&hypr, "dispatch closewindow address:0xabc123");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request == "dispatch closewindow address:0xabc123"),
+        "expected exact Hypr closewindow dispatch, got {requests:?}"
     );
-    let requests = hypr.requests();
     assert!(requests.iter().any(|request| request == "activewindow"));
     assert!(
         !requests
             .iter()
             .any(|request| request == "dispatch killactive"),
-        "expected no Hypr killactive fallback, got {requests:?}"
+        "expected no Hypr killactive dispatch, got {requests:?}"
+    );
+    let log = harness.log_contents();
+    assert!(
+        !log.contains("kitty @"),
+        "smart-close must not use global kitty remote control, got {log}"
     );
 }
 
 #[test]
-fn hypr_smart_close_falls_back_to_hypr_when_kitty_close_fails() {
-    let harness = Harness::new("smart-close-fallback");
+fn hypr_smart_close_closes_captured_non_terminal_window() {
+    let harness = Harness::new("sc-nonterm");
+    let hypr = HyprServer::start(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        "brave-browser",
+        std::process::id(),
+    );
+
+    let envs = harness.envs();
+    run_binary("hypr-smart-close", &[], &envs);
+
+    let requests = wait_for_request(&hypr, "dispatch closewindow address:0xabc123");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request == "dispatch closewindow address:0xabc123"),
+        "expected exact Hypr closewindow dispatch, got {requests:?}"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request == "dispatch killactive"),
+        "expected no Hypr killactive dispatch, got {requests:?}"
+    );
+}
+
+#[test]
+fn hypr_smart_close_rejects_unexpected_args_without_acting() {
+    let harness = Harness::new("smart-close-args");
     let hypr = HyprServer::start(
         &harness.runtime_dir,
         &harness.hypr_sig,
@@ -470,14 +525,65 @@ fn hypr_smart_close_falls_back_to_hypr_when_kitty_close_fails() {
     );
 
     let envs = harness.envs();
-    run_binary("hypr-smart-close", &[], &envs);
+    let status = run_binary_status("hypr-smart-close", &["--dry-run"], &envs);
 
-    let requests = wait_for_request(&hypr, "dispatch killactive");
+    assert!(!status.success(), "unexpected args should fail closed");
     assert!(
-        requests
+        hypr.requests().is_empty(),
+        "unexpected args must not query or dispatch Hyprland"
+    );
+    assert!(harness.log_contents().is_empty());
+}
+
+#[test]
+fn hypr_smart_close_fails_closed_when_active_window_identity_is_incomplete() {
+    let harness = Harness::new("sc-bad-active");
+    let hypr = HyprServer::start_with_response(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        "class: kitty\npid: 123\n",
+    );
+
+    let envs = harness.envs();
+    let status = run_binary_status("hypr-smart-close", &[], &envs);
+
+    assert!(
+        !status.success(),
+        "incomplete activewindow data should fail closed"
+    );
+    let requests = hypr.requests();
+    assert!(requests.iter().any(|request| request == "activewindow"));
+    assert!(
+        !requests
             .iter()
-            .any(|request| request == "dispatch killactive"),
-        "expected Hypr killactive fallback, got {requests:?}"
+            .any(|request| request.starts_with("dispatch ")),
+        "incomplete activewindow data must not dispatch, got {requests:?}"
+    );
+}
+
+#[test]
+fn hypr_smart_close_fails_closed_when_tmux_target_is_ambiguous() {
+    let harness = Harness::new("sc-tmux-ambig");
+    let pid_file = harness.runtime_dir.join("terminal.pid");
+    let pty = PtyProcess::spawn(&pid_file, &[("TMUX", "/tmp/fake-tmux,4242,0")]);
+    let hypr = HyprServer::start(&harness.runtime_dir, &harness.hypr_sig, "termstub", pty.pid);
+
+    let mut envs = harness.envs();
+    envs.push(("TERMINAL".to_string(), "termstub".to_string()));
+
+    let status = run_binary_status("hypr-smart-close", &[], &envs);
+
+    assert!(
+        !status.success(),
+        "ambiguous tmux state should fail closed rather than close a window"
+    );
+    let requests = hypr.requests();
+    assert!(requests.iter().any(|request| request == "activewindow"));
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.starts_with("dispatch ")),
+        "ambiguous tmux state must not dispatch, got {requests:?}"
     );
 }
 

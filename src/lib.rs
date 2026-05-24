@@ -100,6 +100,12 @@ pub struct TerminalRuntime {
     pub nvim: Option<NvimRuntime>,
 }
 
+pub struct ActiveWindowInfo {
+    pub address: String,
+    pub class: String,
+    pub pid: u32,
+}
+
 struct KittyProbeResult {
     tmux: Option<TmuxRuntime>,
     nvim_socket: Option<String>,
@@ -277,8 +283,49 @@ pub fn find_hyprland_socket() -> Option<PathBuf> {
     socket
 }
 
-/// Get active window class and PID in a single Hyprland query
-pub fn get_active_window_info(socket_path: &PathBuf) -> Option<(String, u32)> {
+fn normalize_hypr_address(raw: &str) -> Option<String> {
+    let address = raw.trim();
+    let hex = address.strip_prefix("0x").unwrap_or(address);
+    if hex.is_empty() || hex == "0" || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("0x{}", hex.to_ascii_lowercase()))
+}
+
+fn parse_active_window_info(response: &str) -> Option<ActiveWindowInfo> {
+    let mut address = None;
+    let mut class = None;
+    let mut pid = None;
+
+    for line in response.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Window ") {
+            if let Some((raw_address, _)) = rest.split_once(" -> ") {
+                address = normalize_hypr_address(raw_address);
+            }
+        } else if let Some(c) = trimmed.strip_prefix("class: ") {
+            class = Some(c.trim().to_string());
+        } else if let Some(p) = trimmed.strip_prefix("pid: ") {
+            pid = p.trim().parse::<u32>().ok();
+        }
+        // Early exit once the identity needed for an exact close is complete.
+        if address.is_some() && class.is_some() && pid.is_some() {
+            break;
+        }
+    }
+
+    match (address, class, pid) {
+        (Some(a), Some(c), Some(p)) => Some(ActiveWindowInfo {
+            address: a,
+            class: c,
+            pid: p,
+        }),
+        _ => None,
+    }
+}
+
+/// Get active window address, class and PID in a single Hyprland query.
+pub fn get_active_window_snapshot(socket_path: &PathBuf) -> Option<ActiveWindowInfo> {
     let mut stream = UnixStream::connect(socket_path).ok()?;
     stream.write_all(b"activewindow").ok()?;
     stream.shutdown(std::net::Shutdown::Write).ok()?;
@@ -286,32 +333,28 @@ pub fn get_active_window_info(socket_path: &PathBuf) -> Option<(String, u32)> {
     let mut response = String::new();
     stream.read_to_string(&mut response).ok()?;
 
-    let mut class = None;
-    let mut pid = None;
-
-    for line in response.lines() {
-        let trimmed = line.trim();
-        if let Some(c) = trimmed.strip_prefix("class: ") {
-            class = Some(c.trim().to_string());
-        } else if let Some(p) = trimmed.strip_prefix("pid: ") {
-            pid = p.trim().parse::<u32>().ok();
+    match parse_active_window_info(&response) {
+        Some(info) => {
+            debug_log(
+                "lib",
+                &format!(
+                    "active window address={} class={} pid={}",
+                    info.address, info.class, info.pid
+                ),
+            );
+            Some(info)
         }
-        // Early exit if we have both
-        if class.is_some() && pid.is_some() {
-            break;
-        }
-    }
-
-    match (class, pid) {
-        (Some(c), Some(p)) => {
-            debug_log("lib", &format!("active window class={} pid={}", c, p));
-            Some((c, p))
-        }
-        _ => {
+        None => {
             debug_log("lib", "active window query returned incomplete data");
             None
         }
     }
+}
+
+/// Get active window class and PID in a single Hyprland query.
+pub fn get_active_window_info(socket_path: &PathBuf) -> Option<(String, u32)> {
+    let info = get_active_window_snapshot(socket_path)?;
+    Some((info.class, info.pid))
 }
 
 fn parse_tmux_socket_from_value(tmux_value: &str) -> Option<String> {
@@ -555,40 +598,6 @@ fn normalize_kitty_listen_on(listen_on: &str) -> Option<String> {
     }
 
     Some(format!("unix:{}", listen_on))
-}
-
-pub fn try_close_focused_kitty_window() -> bool {
-    let kitty_uri = match kitty_control_socket_uri() {
-        Some(uri) => uri,
-        None => {
-            debug_log("lib", "kitty socket unavailable for focused close");
-            return false;
-        }
-    };
-
-    let result = Command::new("kitty")
-        .args([
-            "@",
-            "--to",
-            &kitty_uri,
-            "close-window",
-            "--match",
-            "state:focused",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-
-    debug_log(
-        "lib",
-        &format!(
-            "kitty focused close socket={} match=state:focused -> {}",
-            kitty_uri, result
-        ),
-    );
-    result
 }
 
 fn find_focused_index(items: &[Value]) -> Option<usize> {
@@ -1439,6 +1448,40 @@ mod tests {
         assert_eq!(found, None);
 
         let _ = fs::remove_dir_all(runtime_dir);
+    }
+
+    #[test]
+    fn parse_active_window_info_normalizes_address() {
+        let response = "\
+Window ABC123 -> terminal:
+    class: kitty
+    pid: 4242
+";
+        let info = parse_active_window_info(response).expect("active window should parse");
+        assert_eq!(info.address, "0xabc123");
+        assert_eq!(info.class, "kitty");
+        assert_eq!(info.pid, 4242);
+    }
+
+    #[test]
+    fn parse_active_window_info_preserves_prefixed_address() {
+        let response = "\
+Window 0xABC123 -> terminal:
+    class: kitty
+    pid: 4242
+";
+        let info = parse_active_window_info(response).expect("active window should parse");
+        assert_eq!(info.address, "0xabc123");
+    }
+
+    #[test]
+    fn parse_active_window_info_rejects_missing_or_invalid_address() {
+        assert!(parse_active_window_info("class: kitty\npid: 4242\n").is_none());
+        assert!(parse_active_window_info("Window 0 -> none:\nclass: kitty\npid: 4242\n").is_none());
+        assert!(
+            parse_active_window_info("Window abc;kill -> bad:\nclass: kitty\npid: 4242\n")
+                .is_none()
+        );
     }
 
     #[test]

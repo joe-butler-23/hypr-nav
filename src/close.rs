@@ -1,4 +1,5 @@
 use hypr_nav_lib::*;
+use std::env;
 
 #[derive(Debug, PartialEq, Eq)]
 enum TmuxCloseAction {
@@ -7,22 +8,38 @@ enum TmuxCloseAction {
 }
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 1 {
+        eprintln!("usage: hypr-smart-close");
+        std::process::exit(2);
+    }
+
     let hypr_socket = match find_hyprland_socket() {
         Some(path) => path,
         None => std::process::exit(1),
     };
     debug_log("smart-close", "invoked");
 
-    let mut try_kitty_close = false;
+    let active = match get_active_window_snapshot(&hypr_socket) {
+        Some(info) => info,
+        None => std::process::exit(1),
+    };
 
-    if let Some((class, pid)) = get_active_window_info(&hypr_socket) {
-        if is_terminal_window(&class, pid) {
-            try_kitty_close = is_kitty_window(&class, pid);
+    if is_terminal_window(&active.class, active.pid) {
+        if is_kitty_window(&active.class, active.pid) {
             debug_log(
                 "smart-close",
-                &format!("terminal active class={} pid={}", class, pid),
+                &format!(
+                    "kitty active class={} pid={}; closing captured hypr address={}",
+                    active.class, active.pid, active.address
+                ),
             );
-            if let Some(runtime) = detect_tmux_runtime(pid, &class) {
+        } else {
+            debug_log(
+                "smart-close",
+                &format!("terminal active class={} pid={}", active.class, active.pid),
+            );
+            if let Some(runtime) = detect_tmux_runtime(active.pid, &active.class) {
                 let socket_path = runtime.socket_path.as_deref();
                 let pane = find_tmux_client_pane(&runtime.tty, socket_path)
                     .or_else(|| find_tmux_pane_by_tty(&runtime.tty, socket_path));
@@ -43,8 +60,15 @@ fn main() {
                     }
                     debug_log(
                         "smart-close",
-                        "tmux close handling failed, fallback to hypr killactive",
+                        "tmux close handling failed; refusing unsafe window fallback",
                     );
+                    std::process::exit(1);
+                } else {
+                    debug_log(
+                        "smart-close",
+                        "tmux runtime detected but no session target resolved; refusing unsafe window fallback",
+                    );
+                    std::process::exit(1);
                 }
             } else {
                 debug_log(
@@ -52,33 +76,22 @@ fn main() {
                     "terminal active but no tmux runtime detected",
                 );
             }
-        } else {
-            debug_log(
-                "smart-close",
-                &format!("non-terminal active class={}", class),
-            );
         }
     } else {
-        debug_log("smart-close", "active window info unavailable");
-    }
-
-    if try_kitty_close {
         debug_log(
             "smart-close",
-            "trying kitty focused close before hypr fallback",
-        );
-        if try_close_focused_kitty_window() {
-            debug_log("smart-close", "kitty focused close handled");
-            return;
-        }
-        debug_log(
-            "smart-close",
-            "kitty focused close failed, fallback to hypr killactive",
+            &format!("non-terminal active class={}", active.class),
         );
     }
 
-    debug_log("smart-close", "fallback to hypr killactive");
-    hypr_dispatch(&hypr_socket, "killactive");
+    debug_log(
+        "smart-close",
+        &format!("closing captured hypr address={}", active.address),
+    );
+    hypr_dispatch(
+        &hypr_socket,
+        &format!("closewindow address:{}", active.address),
+    );
 }
 
 fn handle_tmux_close(

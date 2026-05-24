@@ -8,14 +8,15 @@ Stop fighting with your keybinds (or memorizing different binds for different ap
 1.  **Inside** your terminal multiplexer (Tmux panes, Kitty windows)
 2.  **Between** Hyprland windows (when you hit the edge of a pane)
 
-I have also included `hypr-smart-close`, a context-aware `Super+C` that knows when to close a pane, detach a session, or kill a window:
+I have also included `hypr-smart-close`, a context-aware `Super+C` that knows when to close a pane, detach a session, or close exactly one Hyprland window:
 
 - **Seamless Context Switching**: Automatically detects if you are in a terminal running Tmux.
 - **Edge Detection**: Smart enough to know when you're at the top pane of Tmux and pass the `Up` command to Hyprland instead.
-- **Smart Close**: 
+- **Smart Close**:
     - Closing a named Tmux session? **Detaches** it.
     - Closing a generic pane? **Kills** it.
-    - Closing the last pane? **Closes** the window.
+    - Closing a Kitty OS window? **Closes the captured Hyprland window address**, never a global Kitty focus target.
+    - Ambiguous active-window or Tmux state? **Fails closed** instead of guessing.
 - **Zero Config for Apps**: Works by inspecting the process tree and IPC sockets. No plugins required for Hyprland (just binds).
 
 The tmux/kitty stuff may be useful for people in its current form. I imagine the smart-close thing will mostly be useful for me and my specific needs. But it should serve as a useful demonstration of how the approach taken with this tool could be adapted to your own specific needs. 
@@ -52,12 +53,12 @@ bind = SUPER, c, exec, hypr-smart-close
 
 The architecture is basically **Discover -> Inspect -> Act**, for example hypr-smart-close does the following:
 
-1.  **Discover**: Queries Hyprland to see if the active window is a terminal.
-2.  **Inspect**: Walks the process tree (`/proc`) to see if `tmux` is running inside that terminal.
-3.  **Act**: 
-    - If in Tmux, asks Tmux "Am I at the edge?". 
-    - If yes, tells Hyprland to move focus.
-    - If no, tells Tmux to select the next pane.
+1.  **Discover**: Queries Hyprland once for the active window address, class, and PID.
+2.  **Inspect**: Walks the process tree (`/proc`) to see if non-Kitty terminals have a resolvable Tmux client.
+3.  **Act**:
+    - If a non-Kitty Tmux target is exact, detaches the client or kills the resolved pane.
+    - If the active window is Kitty, uses `dispatch closewindow address:<captured address>`.
+    - If the identity or Tmux target is incomplete, exits without dispatching a close.
 
 ## Forking 
 
