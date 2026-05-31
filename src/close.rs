@@ -1,5 +1,11 @@
 use hypr_nav_lib::*;
+use serde_json::json;
 use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, PartialEq, Eq)]
 enum TmuxCloseAction {
@@ -14,16 +20,24 @@ fn main() {
         std::process::exit(2);
     }
 
+    log_close_event("invoked", json!({ "argv": args }));
     let hypr_socket = match find_hyprland_socket() {
         Some(path) => path,
-        None => std::process::exit(1),
+        None => {
+            log_close_event("no_hypr_socket", json!({}));
+            std::process::exit(1);
+        }
     };
     debug_log("smart-close", "invoked");
 
     let active = match get_active_window_snapshot(&hypr_socket) {
         Some(info) => info,
-        None => std::process::exit(1),
+        None => {
+            log_close_event("active_window_unavailable", json!({}));
+            std::process::exit(1);
+        }
     };
+    log_close_event("active_captured", active_window_json(&active));
 
     if is_terminal_window(&active.class, active.pid) {
         if is_kitty_window(&active.class, active.pid) {
@@ -56,17 +70,45 @@ fn main() {
                     );
                     if handle_tmux_close(&session, pane.as_deref(), &runtime.tty, socket_path) {
                         debug_log("smart-close", "tmux close handled");
+                        log_close_event(
+                            "tmux_close_handled",
+                            json!({
+                                "active": active_window_json(&active),
+                                "session": session,
+                                "pane": pane,
+                                "tty": runtime.tty,
+                                "socket": socket_path,
+                            }),
+                        );
                         return;
                     }
                     debug_log(
                         "smart-close",
                         "tmux close handling failed; refusing unsafe window fallback",
                     );
+                    log_close_event(
+                        "tmux_close_failed",
+                        json!({
+                            "active": active_window_json(&active),
+                            "session": session,
+                            "pane": pane,
+                            "tty": runtime.tty,
+                            "socket": socket_path,
+                        }),
+                    );
                     std::process::exit(1);
                 } else {
                     debug_log(
                         "smart-close",
                         "tmux runtime detected but no session target resolved; refusing unsafe window fallback",
+                    );
+                    log_close_event(
+                        "tmux_target_unresolved",
+                        json!({
+                            "active": active_window_json(&active),
+                            "tty": runtime.tty,
+                            "socket": runtime.socket_path,
+                        }),
                     );
                     std::process::exit(1);
                 }
@@ -92,6 +134,88 @@ fn main() {
         &hypr_socket,
         &format!("closewindow address:{}", active.address),
     );
+    log_close_event(
+        "dispatch_closewindow",
+        json!({
+            "active": active_window_json(&active),
+            "dispatcher": format!("closewindow address:{}", active.address),
+        }),
+    );
+}
+
+fn active_window_json(active: &ActiveWindowInfo) -> serde_json::Value {
+    json!({
+        "address": &active.address,
+        "class": &active.class,
+        "pid": active.pid,
+        "title": &active.title,
+        "focus_history_id": active.focus_history_id,
+    })
+}
+
+fn log_close_event(event: &str, detail: serde_json::Value) {
+    let Some(path) = close_log_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let payload = json!({
+        "ts_unix_ms": unix_millis(),
+        "component": "hypr-smart-close",
+        "event": event,
+        "pid": process::id(),
+        "ppid": parent_pid(),
+        "parent_comm": parent_comm(),
+        "detail": detail,
+    });
+    let _ = writeln!(file, "{payload}");
+}
+
+fn close_log_path() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("HYPR_CLOSE_LOG") {
+        return Some(PathBuf::from(path));
+    }
+    if let Some(state_home) = env::var_os("XDG_STATE_HOME") {
+        return Some(PathBuf::from(state_home).join("hypr-close/events.jsonl"));
+    }
+    env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("hypr-close")
+            .join("events.jsonl")
+    })
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn parent_pid() -> Option<u32> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("PPid:") {
+            return rest.trim().parse::<u32>().ok();
+        }
+    }
+    None
+}
+
+fn parent_comm() -> Option<String> {
+    let ppid = parent_pid()?;
+    fs::read_to_string(format!("/proc/{ppid}/comm"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn handle_tmux_close(

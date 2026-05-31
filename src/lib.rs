@@ -104,6 +104,8 @@ pub struct ActiveWindowInfo {
     pub address: String,
     pub class: String,
     pub pid: u32,
+    pub title: Option<String>,
+    pub focus_history_id: Option<i64>,
 }
 
 struct KittyProbeResult {
@@ -296,6 +298,8 @@ fn parse_active_window_info(response: &str) -> Option<ActiveWindowInfo> {
     let mut address = None;
     let mut class = None;
     let mut pid = None;
+    let mut title = None;
+    let mut focus_history_id = None;
 
     for line in response.lines() {
         let trimmed = line.trim();
@@ -305,12 +309,12 @@ fn parse_active_window_info(response: &str) -> Option<ActiveWindowInfo> {
             }
         } else if let Some(c) = trimmed.strip_prefix("class: ") {
             class = Some(c.trim().to_string());
+        } else if let Some(t) = trimmed.strip_prefix("title: ") {
+            title = Some(t.trim().to_string());
         } else if let Some(p) = trimmed.strip_prefix("pid: ") {
             pid = p.trim().parse::<u32>().ok();
-        }
-        // Early exit once the identity needed for an exact close is complete.
-        if address.is_some() && class.is_some() && pid.is_some() {
-            break;
+        } else if let Some(id) = trimmed.strip_prefix("focusHistoryID: ") {
+            focus_history_id = id.trim().parse::<i64>().ok();
         }
     }
 
@@ -319,6 +323,8 @@ fn parse_active_window_info(response: &str) -> Option<ActiveWindowInfo> {
             address: a,
             class: c,
             pid: p,
+            title,
+            focus_history_id,
         }),
         _ => None,
     }

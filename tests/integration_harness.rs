@@ -487,6 +487,43 @@ fn hypr_smart_close_closes_captured_kitty_hypr_window_only() {
 }
 
 #[test]
+fn hypr_smart_close_logs_captured_address_and_dispatch() {
+    let harness = Harness::new("smart-close-log");
+    let close_log = harness.runtime_dir.join("close-events.jsonl");
+    let hypr = HyprServer::start_with_response(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        "Window abc123 -> test window:\nclass: kitty\ntitle: work terminal\npid: 4242\nfocusHistoryID: 0\n",
+    );
+
+    let mut envs = harness.envs();
+    envs.push((
+        "HYPR_CLOSE_LOG".to_string(),
+        close_log.display().to_string(),
+    ));
+    run_binary("hypr-smart-close", &[], &envs);
+
+    let requests = wait_for_request(&hypr, "dispatch closewindow address:0xabc123");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request == "dispatch closewindow address:0xabc123"),
+        "expected exact Hypr closewindow dispatch, got {requests:?}"
+    );
+
+    let events = fs::read_to_string(&close_log).expect("close log should be written");
+    assert!(events.contains("\"event\":\"invoked\""), "{events}");
+    assert!(events.contains("\"event\":\"active_captured\""), "{events}");
+    assert!(
+        events.contains("\"event\":\"dispatch_closewindow\""),
+        "{events}"
+    );
+    assert!(events.contains("\"address\":\"0xabc123\""), "{events}");
+    assert!(events.contains("\"title\":\"work terminal\""), "{events}");
+    assert!(events.contains("\"focus_history_id\":0"), "{events}");
+}
+
+#[test]
 fn hypr_smart_close_closes_captured_non_terminal_window() {
     let harness = Harness::new("sc-nonterm");
     let hypr = HyprServer::start(
