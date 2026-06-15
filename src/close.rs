@@ -3,10 +3,12 @@ use serde_json::json;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const CLOSE_LOG_MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 enum TmuxCloseAction {
@@ -171,6 +173,15 @@ fn log_close_event(event: &str, detail: serde_json::Value) {
             return;
         }
     }
+    if close_log_exceeds_limit(&path)
+        && OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .is_err()
+    {
+        return;
+    }
     let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)
@@ -179,6 +190,7 @@ fn log_close_event(event: &str, detail: serde_json::Value) {
     else {
         return;
     };
+    let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
     let payload = json!({
         "ts_unix_ms": unix_millis(),
         "component": "hypr-smart-close",
@@ -189,6 +201,12 @@ fn log_close_event(event: &str, detail: serde_json::Value) {
         "detail": detail,
     });
     let _ = writeln!(file, "{payload}");
+}
+
+fn close_log_exceeds_limit(path: &PathBuf) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.len() > CLOSE_LOG_MAX_BYTES)
+        .unwrap_or(false)
 }
 
 fn close_log_path() -> Option<PathBuf> {

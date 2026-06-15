@@ -650,6 +650,52 @@ fn hypr_smart_close_logs_captured_address_and_dispatch() {
 }
 
 #[test]
+fn hypr_smart_close_truncates_large_explicit_close_log() {
+    let harness = Harness::new("sc-log-cap");
+    let close_log = harness.runtime_dir.join("close-events.jsonl");
+    fs::write(&close_log, vec![b'x'; 1024 * 1024 + 1]).expect("large log should be seeded");
+    let hypr = HyprServer::start(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        "kitty",
+        std::process::id(),
+    );
+
+    let mut envs = harness.envs();
+    envs.push((
+        "HYPR_CLOSE_LOG".to_string(),
+        close_log.display().to_string(),
+    ));
+
+    run_binary("hypr-smart-close", &[], &envs);
+
+    let requests = wait_for_request(&hypr, "dispatch closewindow address:0xabc123");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request == "dispatch closewindow address:0xabc123"),
+        "expected exact Hypr closewindow dispatch, got {requests:?}"
+    );
+    let metadata = fs::metadata(&close_log).expect("close log metadata should be readable");
+    assert!(
+        metadata.len() < 8192,
+        "oversized close log should be truncated before append"
+    );
+    let mode = metadata.permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let events = fs::read_to_string(&close_log).expect("close log should be readable");
+    assert!(events.contains("\"event\":\"invoked\""), "{events}");
+    assert!(
+        events.contains("\"event\":\"dispatch_closewindow\""),
+        "{events}"
+    );
+    assert!(
+        !events.starts_with('x'),
+        "old oversized log contents should be truncated"
+    );
+}
+
+#[test]
 fn hypr_smart_close_respects_disabled_close_log_value() {
     let harness = Harness::new("sc-log-off");
     let default_log = harness.runtime_dir.join("hypr-close/events.jsonl");

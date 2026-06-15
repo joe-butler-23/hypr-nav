@@ -64,7 +64,8 @@ The architecture is basically **Discover -> Inspect -> Act**, for example hypr-s
 
 Set `HYPR_NAV_DEBUG=1` to print runtime decisions to stderr. For
 `hypr-smart-close`, set `HYPR_CLOSE_LOG=/path/to/events.jsonl` to write opt-in
-JSONL close events; these events can include window titles.
+JSONL close events; these events can include window titles. Explicit close logs
+are truncated before append when they exceed 1 MiB.
 
 ## Development
 
