@@ -10,7 +10,6 @@ across Hyprland, tmux, Kitty, and Nvim.
 - `src/tmux.rs` - `hypr-tmux-nav`, layered Nvim/tmux/Hyprland navigation.
 - `src/close.rs` - `hypr-smart-close`, context-aware close behavior.
 - `tests/integration_harness.rs` - fake Hyprland, tmux, Kitty, and Nvim harness.
-- `plans/` - advisor-generated implementation plans and status index.
 
 ## Safety
 
@@ -30,6 +29,3 @@ cargo test
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
-
-If you execute a file under `plans/`, update the matching row in
-`plans/README.md`.
