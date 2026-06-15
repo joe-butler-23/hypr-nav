@@ -1053,7 +1053,7 @@ pub fn tmux_status(args: &[&str], socket_path: Option<&str>) -> bool {
 pub fn find_tmux_session(tty: &str, socket_path: Option<&str>) -> Option<String> {
     // Single tmux call to get all client info
     let output = tmux_command(socket_path)
-        .args(["list-clients", "-F", "#{client_session} #{client_tty}"])
+        .args(["list-clients", "-F", "#{client_session}\t#{client_tty}"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -1087,12 +1087,10 @@ pub fn find_tmux_session(tty: &str, socket_path: Option<&str>) -> Option<String>
 
 fn parse_tmux_client_session(clients: &str, tty: &str) -> Option<String> {
     for line in clients.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            let session = parts[0];
-            let client_tty = parts[1];
+        if let Some((session, client_tty)) = line.split_once('\t') {
+            let session = session.trim();
+            let client_tty = client_tty.trim();
 
-            // Exact TTY match
             if tty == client_tty {
                 return Some(session.to_string());
             }
@@ -1374,21 +1372,25 @@ pub fn get_tmux_session_info(session: &str, socket_path: Option<&str>) -> Option
     }
 }
 
-pub fn hypr_dispatch(socket_path: &PathBuf, dispatcher: &str) {
+pub fn hypr_dispatch(socket_path: &PathBuf, dispatcher: &str) -> bool {
     match UnixStream::connect(socket_path) {
         Ok(mut stream) => {
             let cmd = format!("dispatch {}", dispatcher);
             debug_log("lib", &format!("hypr dispatch: {}", cmd));
             if let Err(err) = stream.write_all(cmd.as_bytes()) {
                 debug_log("lib", &format!("hypr dispatch write failed: {}", err));
-                return;
+                return false;
             }
+            // The dispatch bytes are already written; a shutdown error should not
+            // make callers report a failed action.
             if let Err(err) = stream.shutdown(std::net::Shutdown::Both) {
                 debug_log("lib", &format!("hypr dispatch shutdown failed: {}", err));
             }
+            true
         }
         Err(err) => {
             debug_log("lib", &format!("hypr dispatch connect failed: {}", err));
+            false
         }
     }
 }
@@ -1516,7 +1518,7 @@ Window 0xABC123 -> terminal:
 
     #[test]
     fn parse_tmux_client_session_prefers_exact_tty_match() {
-        let data = "$0 /dev/pts/2\n$1 /dev/pts/9\n";
+        let data = "$0\t/dev/pts/2\n$1\t/dev/pts/9\n";
         assert_eq!(
             parse_tmux_client_session(data, "/dev/pts/9"),
             Some("$1".to_string())
@@ -1525,8 +1527,29 @@ Window 0xABC123 -> terminal:
 
     #[test]
     fn parse_tmux_client_session_returns_none_without_exact_tty_match() {
-        let data = "$3 /dev/pts/1\n$3 /dev/pts/5\n";
+        let data = "$3\t/dev/pts/1\n$3\t/dev/pts/5\n";
         assert_eq!(parse_tmux_client_session(data, "/dev/pts/99"), None);
+    }
+
+    #[test]
+    fn parse_tmux_client_session_preserves_names_with_spaces() {
+        let data = "work session\t/dev/pts/9\n";
+        assert_eq!(
+            parse_tmux_client_session(data, "/dev/pts/9"),
+            Some("work session".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_tmux_client_session_rejects_spaced_name_with_wrong_tty() {
+        let data = "work session\t/dev/pts/9\n";
+        assert_eq!(parse_tmux_client_session(data, "/dev/pts/4"), None);
+    }
+
+    #[test]
+    fn parse_tmux_client_session_ignores_malformed_rows_without_tab() {
+        let data = "work session /dev/pts/9\n";
+        assert_eq!(parse_tmux_client_session(data, "/dev/pts/9"), None);
     }
 
     #[test]

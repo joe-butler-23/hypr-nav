@@ -354,8 +354,11 @@ fn main() {
         "tmux-nav",
         &format!("fallback to hypr movefocus {}", move_dir),
     );
-    save_nav_state("hypr_movefocus", move_dir, current_tty.as_deref());
-    hypr_dispatch(&hypr_socket, &format!("movefocus {}", move_dir));
+    if hypr_dispatch(&hypr_socket, &format!("movefocus {}", move_dir)) {
+        save_nav_state("hypr_movefocus", move_dir, current_tty.as_deref());
+    } else {
+        std::process::exit(1);
+    }
 }
 
 fn try_tmux_navigate(target: &str, direction: Direction, socket_path: Option<&str>) -> bool {

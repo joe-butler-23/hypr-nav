@@ -3,6 +3,7 @@ use serde_json::json;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -130,17 +131,25 @@ fn main() {
         "smart-close",
         &format!("closing captured hypr address={}", active.address),
     );
-    hypr_dispatch(
-        &hypr_socket,
-        &format!("closewindow address:{}", active.address),
-    );
-    log_close_event(
-        "dispatch_closewindow",
-        json!({
-            "active": active_window_json(&active),
-            "dispatcher": format!("closewindow address:{}", active.address),
-        }),
-    );
+    let dispatcher = format!("closewindow address:{}", active.address);
+    if hypr_dispatch(&hypr_socket, &dispatcher) {
+        log_close_event(
+            "dispatch_closewindow",
+            json!({
+                "active": active_window_json(&active),
+                "dispatcher": dispatcher,
+            }),
+        );
+    } else {
+        log_close_event(
+            "dispatch_closewindow_failed",
+            json!({
+                "active": active_window_json(&active),
+                "dispatcher": dispatcher,
+            }),
+        );
+        std::process::exit(1);
+    }
 }
 
 fn active_window_json(active: &ActiveWindowInfo) -> serde_json::Value {
@@ -162,7 +171,12 @@ fn log_close_event(event: &str, detail: serde_json::Value) {
             return;
         }
     }
-    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+    else {
         return;
     };
     let payload = json!({
@@ -179,18 +193,18 @@ fn log_close_event(event: &str, detail: serde_json::Value) {
 
 fn close_log_path() -> Option<PathBuf> {
     if let Some(path) = env::var_os("HYPR_CLOSE_LOG") {
+        let normalized = path.to_string_lossy().trim().to_ascii_lowercase();
+        if normalized.is_empty()
+            || normalized == "0"
+            || normalized == "false"
+            || normalized == "off"
+            || normalized == "no"
+        {
+            return None;
+        }
         return Some(PathBuf::from(path));
     }
-    if let Some(state_home) = env::var_os("XDG_STATE_HOME") {
-        return Some(PathBuf::from(state_home).join("hypr-close/events.jsonl"));
-    }
-    env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("hypr-close")
-            .join("events.jsonl")
-    })
+    None
 }
 
 fn unix_millis() -> u128 {

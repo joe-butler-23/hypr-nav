@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
@@ -62,6 +63,19 @@ impl HyprServer {
     }
 
     fn start_with_response(runtime_dir: &Path, sig: &str, active_response: &str) -> Self {
+        Self::start_with_options(runtime_dir, sig, active_response, false)
+    }
+
+    fn start_with_response_then_stop(runtime_dir: &Path, sig: &str, active_response: &str) -> Self {
+        Self::start_with_options(runtime_dir, sig, active_response, true)
+    }
+
+    fn start_with_options(
+        runtime_dir: &Path,
+        sig: &str,
+        active_response: &str,
+        stop_after_activewindow: bool,
+    ) -> Self {
         let socket_dir = runtime_dir.join("hypr").join(sig);
         fs::create_dir_all(&socket_dir).expect("hypr runtime dir should be created");
         let socket_path = socket_dir.join(".socket.sock");
@@ -75,6 +89,7 @@ impl HyprServer {
         let requests_clone = Arc::clone(&requests);
         let stop_clone = Arc::clone(&stop);
         let active_response = active_response.to_string();
+        let socket_path_for_thread = socket_path.clone();
 
         let handle = thread::spawn(move || {
             while !stop_clone.load(Ordering::Relaxed) {
@@ -85,6 +100,10 @@ impl HyprServer {
                         let request = request.trim().to_string();
                         if request == "activewindow" {
                             let _ = stream.write_all(active_response.as_bytes());
+                            if stop_after_activewindow {
+                                let _ = fs::remove_file(&socket_path_for_thread);
+                                stop_clone.store(true, Ordering::Relaxed);
+                            }
                         }
                         requests_clone
                             .lock()
@@ -183,6 +202,9 @@ impl Harness {
             r#"#!/usr/bin/env bash
 set -euo pipefail
 echo "kitty $*" >> "$TEST_LOG"
+if [[ "${1-}" == "--sleep-forever" ]]; then
+  while :; do sleep 1; done
+fi
 if [[ "${1-}" == "@" && "${4-}" == "ls" ]]; then
   printf '%s' "${TEST_KITTY_LS_JSON:-[]}"
   exit 0
@@ -243,8 +265,8 @@ case "$cmd" in
       printf '%s %s\n' "${TEST_TTY:?}" "${TEST_TMUX_PANE_ID:-%1}"
       exit 0
     fi
-    if [[ "$joined" == *" #{client_session} #{client_tty} "* ]]; then
-      printf '%s %s\n' "${TEST_TMUX_SESSION:-$1}" "${TEST_TTY:?}"
+    if [[ "$joined" == *'#{client_session}'* && "$joined" == *'#{client_tty}'* ]]; then
+      printf '%s\t%s\n' "${TEST_TMUX_SESSION:-$1}" "${TEST_TTY:?}"
       exit 0
     fi
     ;;
@@ -374,6 +396,17 @@ fn wait_for_request(server: &HyprServer, needle: &str) -> Vec<String> {
     server.requests()
 }
 
+fn spawn_process_named(name: &str) -> Child {
+    Command::new("bash")
+        .arg0(name)
+        .args(["-c", "while :; do sleep 1; done"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("named process should spawn")
+}
+
 fn run_binary_status(bin_name: &str, args: &[&str], envs: &[(String, String)]) -> ExitStatus {
     let bin = match bin_name {
         "hypr-nav" => env!("CARGO_BIN_EXE_hypr-nav"),
@@ -383,6 +416,8 @@ fn run_binary_status(bin_name: &str, args: &[&str], envs: &[(String, String)]) -
     };
     let mut command = Command::new(bin);
     command.args(args);
+    command.env_remove("HYPR_CLOSE_LOG");
+    command.env_remove("XDG_STATE_HOME");
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -424,6 +459,39 @@ fn hypr_nav_prefers_kitty_before_hypr_fallback() {
 }
 
 #[test]
+fn hypr_nav_detects_custom_class_kitty_by_pid() {
+    let harness = Harness::new("kitty-pid-detect");
+    let mut kitty_process = spawn_process_named("kitty");
+    let hypr = HyprServer::start(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        "custom-terminal",
+        kitty_process.id(),
+    );
+
+    let mut envs = harness.envs();
+    envs.push(("TEST_KITTY_FOCUS_OK".to_string(), "1".to_string()));
+
+    run_binary("hypr-nav", &["left"], &envs);
+
+    let _ = kitty_process.kill();
+    let _ = kitty_process.wait();
+
+    wait_for_log_line(
+        &harness.log_path,
+        "kitty @ --to unix:/tmp/fake-kitty focus-window --match neighbor:left",
+    );
+    let requests = hypr.requests();
+    assert!(requests.iter().any(|request| request == "activewindow"));
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.starts_with("dispatch ")),
+        "expected no Hypr fallback dispatch, got {requests:?}"
+    );
+}
+
+#[test]
 fn hypr_nav_falls_back_to_hypr_when_kitty_navigation_fails() {
     let harness = Harness::new("kitty-fallback");
     let hypr = HyprServer::start(
@@ -443,6 +511,26 @@ fn hypr_nav_falls_back_to_hypr_when_kitty_navigation_fails() {
             .any(|request| request == "dispatch movefocus r"),
         "expected Hypr fallback dispatch, got {requests:?}"
     );
+}
+
+#[test]
+fn hypr_nav_exits_nonzero_when_hypr_fallback_dispatch_fails() {
+    let harness = Harness::new("kitty-dispatch-fail");
+    let hypr = HyprServer::start_with_response_then_stop(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        "Window abc123 -> test window:\nclass: brave-browser\npid: 4242\n",
+    );
+
+    let envs = harness.envs();
+    let status = run_binary_status("hypr-nav", &["right"], &envs);
+
+    assert!(
+        !status.success(),
+        "failed Hypr dispatch should exit non-zero"
+    );
+    let requests = hypr.requests();
+    assert_eq!(requests, vec!["activewindow".to_string()]);
 }
 
 #[test]
@@ -487,6 +575,38 @@ fn hypr_smart_close_closes_captured_kitty_hypr_window_only() {
 }
 
 #[test]
+fn hypr_smart_close_does_not_log_by_default() {
+    let harness = Harness::new("sc-nolog");
+    let default_log = harness.runtime_dir.join("hypr-close/events.jsonl");
+    let hypr = HyprServer::start(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        "kitty",
+        std::process::id(),
+    );
+
+    let mut envs = harness.envs();
+    envs.push((
+        "XDG_STATE_HOME".to_string(),
+        harness.runtime_dir.display().to_string(),
+    ));
+
+    run_binary("hypr-smart-close", &[], &envs);
+
+    let requests = wait_for_request(&hypr, "dispatch closewindow address:0xabc123");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request == "dispatch closewindow address:0xabc123"),
+        "expected exact Hypr closewindow dispatch, got {requests:?}"
+    );
+    assert!(
+        !default_log.exists(),
+        "smart-close event logging should be opt-in"
+    );
+}
+
+#[test]
 fn hypr_smart_close_logs_captured_address_and_dispatch() {
     let harness = Harness::new("smart-close-log");
     let close_log = harness.runtime_dir.join("close-events.jsonl");
@@ -512,6 +632,12 @@ fn hypr_smart_close_logs_captured_address_and_dispatch() {
     );
 
     let events = fs::read_to_string(&close_log).expect("close log should be written");
+    let mode = fs::metadata(&close_log)
+        .expect("close log metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
     assert!(events.contains("\"event\":\"invoked\""), "{events}");
     assert!(events.contains("\"event\":\"active_captured\""), "{events}");
     assert!(
@@ -521,6 +647,73 @@ fn hypr_smart_close_logs_captured_address_and_dispatch() {
     assert!(events.contains("\"address\":\"0xabc123\""), "{events}");
     assert!(events.contains("\"title\":\"work terminal\""), "{events}");
     assert!(events.contains("\"focus_history_id\":0"), "{events}");
+}
+
+#[test]
+fn hypr_smart_close_respects_disabled_close_log_value() {
+    let harness = Harness::new("sc-log-off");
+    let default_log = harness.runtime_dir.join("hypr-close/events.jsonl");
+    let hypr = HyprServer::start(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        "kitty",
+        std::process::id(),
+    );
+
+    let mut envs = harness.envs();
+    envs.push((
+        "XDG_STATE_HOME".to_string(),
+        harness.runtime_dir.display().to_string(),
+    ));
+    envs.push(("HYPR_CLOSE_LOG".to_string(), "off".to_string()));
+
+    run_binary("hypr-smart-close", &[], &envs);
+
+    let requests = wait_for_request(&hypr, "dispatch closewindow address:0xabc123");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request == "dispatch closewindow address:0xabc123"),
+        "expected exact Hypr closewindow dispatch, got {requests:?}"
+    );
+    assert!(
+        !default_log.exists(),
+        "disabled logging should not fall back"
+    );
+}
+
+#[test]
+fn hypr_smart_close_logs_failed_hypr_dispatch_and_exits_nonzero() {
+    let harness = Harness::new("sc-dfail");
+    let close_log = harness.runtime_dir.join("close-events.jsonl");
+    let hypr = HyprServer::start_with_response_then_stop(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        "Window abc123 -> test window:\nclass: brave-browser\npid: 4242\n",
+    );
+
+    let mut envs = harness.envs();
+    envs.push((
+        "HYPR_CLOSE_LOG".to_string(),
+        close_log.display().to_string(),
+    ));
+
+    let status = run_binary_status("hypr-smart-close", &[], &envs);
+
+    assert!(
+        !status.success(),
+        "failed Hypr dispatch should exit non-zero"
+    );
+    assert_eq!(hypr.requests(), vec!["activewindow".to_string()]);
+    let events = fs::read_to_string(&close_log).expect("close log should be written");
+    assert!(
+        events.contains("\"event\":\"dispatch_closewindow_failed\""),
+        "{events}"
+    );
+    assert!(
+        !events.contains("\"event\":\"dispatch_closewindow\","),
+        "{events}"
+    );
 }
 
 #[test]
@@ -743,5 +936,51 @@ fn hypr_tmux_nav_falls_back_to_hypr_when_tmux_cannot_move() {
             .iter()
             .any(|request| request == "dispatch movefocus d"),
         "expected Hypr fallback dispatch, got {requests:?}"
+    );
+}
+
+#[test]
+fn hypr_tmux_nav_exits_nonzero_when_hypr_fallback_dispatch_fails() {
+    let harness = Harness::new("tmux-dispatch-fail");
+    let pid_file = harness.runtime_dir.join("terminal.pid");
+    let pty = PtyProcess::spawn(&pid_file, &[("TMUX", "/tmp/fake-tmux,4242,0")]);
+    let hypr = HyprServer::start_with_response_then_stop(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        &format!(
+            "Window abc123 -> test window:\nclass: termstub\npid: {}\n",
+            pty.pid
+        ),
+    );
+
+    let tty = fs::read_link(format!("/proc/{}/fd/0", pty.pid))
+        .expect("pty tty should be readable")
+        .display()
+        .to_string();
+
+    let mut envs = harness.envs();
+    envs.push(("TERMINAL".to_string(), "termstub".to_string()));
+    envs.push(("TEST_TTY".to_string(), tty));
+    envs.push(("TEST_TMUX_AT_EDGE".to_string(), "1".to_string()));
+
+    let status = run_binary_status("hypr-tmux-nav", &["down"], &envs);
+
+    assert!(
+        !status.success(),
+        "failed Hypr dispatch should exit non-zero"
+    );
+    assert_eq!(hypr.requests(), vec!["activewindow".to_string()]);
+    let nav_state_exists = fs::read_dir(&harness.runtime_dir)
+        .expect("runtime dir should be readable")
+        .flatten()
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("hypr-nav-navstate")
+        });
+    assert!(
+        !nav_state_exists,
+        "failed Hypr fallback should not record successful navigation state"
     );
 }

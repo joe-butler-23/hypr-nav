@@ -67,16 +67,20 @@ fn main() {
         "kitty-nav",
         &format!("fallback to hypr movefocus {}", move_dir),
     );
-    hypr_dispatch(&hypr_socket, &format!("movefocus {}", move_dir));
+    if !hypr_dispatch(&hypr_socket, &format!("movefocus {}", move_dir)) {
+        std::process::exit(1);
+    }
 }
 
 fn is_kitty_active(socket_path: &std::path::PathBuf) -> bool {
-    if let Some((class, _pid)) = get_active_window_info(socket_path) {
-        let class = class.to_ascii_lowercase();
-        let is_kitty = class.contains("kitty");
+    if let Some((class, pid)) = get_active_window_info(socket_path) {
+        let is_kitty = is_kitty_window(&class, pid);
         debug_log(
             "kitty-nav",
-            &format!("activewindow class={} kitty={}", class, is_kitty),
+            &format!(
+                "activewindow class={} pid={} kitty={}",
+                class, pid, is_kitty
+            ),
         );
         return is_kitty;
     }

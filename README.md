@@ -60,6 +60,20 @@ The architecture is basically **Discover -> Inspect -> Act**, for example hypr-s
     - If the active window is Kitty, uses `dispatch closewindow address:<captured address>`.
     - If the identity or Tmux target is incomplete, exits without dispatching a close.
 
+## Debugging
+
+Set `HYPR_NAV_DEBUG=1` to print runtime decisions to stderr. For
+`hypr-smart-close`, set `HYPR_CLOSE_LOG=/path/to/events.jsonl` to write opt-in
+JSONL close events; these events can include window titles.
+
+## Development
+
+```bash
+cargo test
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+```
+
 ## Forking 
 
 The core logic is modularized in `src/lib.rs`. I am pretty confident you could easily extend this to support other multiplexers (Zellij?) or editors (Neovim?) by adding new detection logic.
