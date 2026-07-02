@@ -1326,6 +1326,43 @@ pub fn get_tmux_session_info(session: &str, socket_path: Option<&str>) -> Option
     }
 }
 
+/// Hyprland dispatcher action for Lua-IPC compatibility
+pub enum HyprDispatch {
+    /// Move focus in the given direction
+    MoveFocus(Direction),
+    /// Close a window at the given normalized address (e.g., "0xdeadbeef")
+    CloseWindow(String),
+}
+
+impl HyprDispatch {
+    /// Generate the Lua dispatcher payload for this action
+    pub fn lua_payload(&self) -> String {
+        match self {
+            Self::MoveFocus(dir) => {
+                format!(
+                    "hl.dsp.focus({{direction = \"{}\"}})",
+                    dir.hypr_movefocus_arg()
+                )
+            }
+            Self::CloseWindow(address) => {
+                format!("hl.dsp.window.close({{address = \"{}\"}})", address)
+            }
+        }
+    }
+
+    /// Generate the legacy (pre-Lua) dispatcher payload for this action
+    pub fn legacy_payload(&self) -> String {
+        match self {
+            Self::MoveFocus(dir) => {
+                format!("movefocus {}", dir.hypr_movefocus_arg())
+            }
+            Self::CloseWindow(address) => {
+                format!("closewindow address:{}", address)
+            }
+        }
+    }
+}
+
 pub fn hypr_dispatch(socket_path: &PathBuf, dispatcher: &str) -> bool {
     match UnixStream::connect(socket_path) {
         Ok(mut stream) => {
@@ -1359,6 +1396,20 @@ pub fn hypr_dispatch(socket_path: &PathBuf, dispatcher: &str) -> bool {
             false
         }
     }
+}
+
+/// Send a dispatcher action via Lua-IPC, with automatic fallback to legacy syntax.
+/// Attempts the Lua payload first; if that fails, retries with the legacy payload.
+/// Returns true if either attempt succeeded, false if both failed.
+pub fn hypr_dispatch_action(socket_path: &PathBuf, action: &HyprDispatch) -> bool {
+    let lua_payload = action.lua_payload();
+    if hypr_dispatch(socket_path, &lua_payload) {
+        return true;
+    }
+
+    let legacy_payload = action.legacy_payload();
+    debug_log!("lib", "lua dispatch failed, falling back to legacy syntax");
+    hypr_dispatch(socket_path, &legacy_payload)
 }
 
 #[cfg(test)]
@@ -1738,5 +1789,50 @@ Window 0xABC123 -> terminal:
         // relationship only runs the other way.
         let me = std::process::id();
         assert!(!pid_has_ancestor(1, me, KITTY_PROBE_ANCESTRY_MAX_HOPS));
+    }
+
+    #[test]
+    fn hypr_dispatch_lua_payload_movefocus_left() {
+        let action = HyprDispatch::MoveFocus(Direction::Left);
+        assert_eq!(action.lua_payload(), "hl.dsp.focus({direction = \"l\"})");
+    }
+
+    #[test]
+    fn hypr_dispatch_lua_payload_movefocus_right() {
+        let action = HyprDispatch::MoveFocus(Direction::Right);
+        assert_eq!(action.lua_payload(), "hl.dsp.focus({direction = \"r\"})");
+    }
+
+    #[test]
+    fn hypr_dispatch_lua_payload_movefocus_up() {
+        let action = HyprDispatch::MoveFocus(Direction::Up);
+        assert_eq!(action.lua_payload(), "hl.dsp.focus({direction = \"u\"})");
+    }
+
+    #[test]
+    fn hypr_dispatch_lua_payload_movefocus_down() {
+        let action = HyprDispatch::MoveFocus(Direction::Down);
+        assert_eq!(action.lua_payload(), "hl.dsp.focus({direction = \"d\"})");
+    }
+
+    #[test]
+    fn hypr_dispatch_legacy_payload_movefocus() {
+        let action = HyprDispatch::MoveFocus(Direction::Left);
+        assert_eq!(action.legacy_payload(), "movefocus l");
+    }
+
+    #[test]
+    fn hypr_dispatch_lua_payload_closewindow() {
+        let action = HyprDispatch::CloseWindow("0xdeadbeef".to_string());
+        assert_eq!(
+            action.lua_payload(),
+            "hl.dsp.window.close({address = \"0xdeadbeef\"})"
+        );
+    }
+
+    #[test]
+    fn hypr_dispatch_legacy_payload_closewindow() {
+        let action = HyprDispatch::CloseWindow("0xdeadbeef".to_string());
+        assert_eq!(action.legacy_payload(), "closewindow address:0xdeadbeef");
     }
 }

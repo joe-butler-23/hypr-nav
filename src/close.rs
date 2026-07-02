@@ -129,8 +129,9 @@ fn main() {
         "closing captured hypr address={}",
         active.address
     );
-    let dispatcher = format!("closewindow address:{}", active.address);
-    if hypr_dispatch(&hypr_socket, &dispatcher) {
+    let action = HyprDispatch::CloseWindow(active.address.clone());
+    let dispatcher = action.lua_payload();
+    if hypr_dispatch_action(&hypr_socket, &action) {
         log_close_event(
             "dispatch_closewindow",
             json!({

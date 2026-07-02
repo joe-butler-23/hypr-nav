@@ -82,6 +82,81 @@ impl HyprServer {
         Self::start_with_options(runtime_dir, sig, active_response, dispatch_response, false)
     }
 
+    /// Start a fake Hyprland server that rejects Lua-form dispatches and
+    /// accepts legacy-form dispatches, simulating a pre-Lua Hyprland.
+    fn start_with_lua_fallback_required(
+        runtime_dir: &Path,
+        sig: &str,
+        active_response: &str,
+    ) -> Self {
+        Self::start_with_lua_fallback(runtime_dir, sig, active_response, false)
+    }
+
+    fn start_with_lua_fallback(
+        runtime_dir: &Path,
+        sig: &str,
+        active_response: &str,
+        stop_after_activewindow: bool,
+    ) -> Self {
+        let socket_dir = runtime_dir.join("hypr").join(sig);
+        fs::create_dir_all(&socket_dir).expect("hypr runtime dir should be created");
+        let socket_path = socket_dir.join(".socket.sock");
+        let listener = UnixListener::bind(&socket_path).expect("hypr socket should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("hypr socket should be nonblocking");
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let requests_clone = Arc::clone(&requests);
+        let stop_clone = Arc::clone(&stop);
+        let active_response = active_response.to_string();
+        let socket_path_for_thread = socket_path.clone();
+
+        let handle = thread::spawn(move || {
+            while !stop_clone.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        let mut request = String::new();
+                        let _ = stream.read_to_string(&mut request);
+                        let request = request.trim().to_string();
+                        if request == "activewindow" {
+                            let _ = stream.write_all(active_response.as_bytes());
+                            if stop_after_activewindow {
+                                let _ = fs::remove_file(&socket_path_for_thread);
+                                stop_clone.store(true, Ordering::Relaxed);
+                            }
+                        } else if request.starts_with("dispatch ") {
+                            // Reject Lua-form dispatches (contain "hl.dsp."), accept legacy
+                            let is_lua_form = request.contains("hl.dsp.");
+                            let response = if is_lua_form {
+                                "error: lua form not supported"
+                            } else {
+                                "ok"
+                            };
+                            let _ = stream.write_all(response.as_bytes());
+                        }
+                        requests_clone
+                            .lock()
+                            .expect("requests lock should succeed")
+                            .push(request);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            socket_path,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
     fn start_with_options(
         runtime_dir: &Path,
         sig: &str,
@@ -524,12 +599,12 @@ fn hypr_nav_falls_back_to_hypr_when_kitty_navigation_fails() {
     let envs = harness.envs();
     run_binary("hypr-nav", &["right"], &envs);
 
-    let requests = wait_for_request(&hypr, "dispatch movefocus r");
+    let requests = wait_for_request(&hypr, "dispatch hl.dsp.focus({direction = \"r\"})");
     assert!(
         requests
             .iter()
-            .any(|request| request == "dispatch movefocus r"),
-        "expected Hypr fallback dispatch, got {requests:?}"
+            .any(|request| request == "dispatch hl.dsp.focus({direction = \"r\"})"),
+        "expected Hypr fallback dispatch with Lua form, got {requests:?}"
     );
 }
 
@@ -573,12 +648,15 @@ fn hypr_smart_close_closes_captured_kitty_hypr_window_only() {
 
     run_binary("hypr-smart-close", &[], &envs);
 
-    let requests = wait_for_request(&hypr, "dispatch closewindow address:0xabc123");
+    let requests = wait_for_request(
+        &hypr,
+        "dispatch hl.dsp.window.close({address = \"0xabc123\"})",
+    );
     assert!(
         requests
             .iter()
-            .any(|request| request == "dispatch closewindow address:0xabc123"),
-        "expected exact Hypr closewindow dispatch, got {requests:?}"
+            .any(|request| request == "dispatch hl.dsp.window.close({address = \"0xabc123\"})"),
+        "expected exact Hypr closewindow dispatch with Lua form, got {requests:?}"
     );
     assert!(requests.iter().any(|request| request == "activewindow"));
     assert!(
@@ -613,12 +691,15 @@ fn hypr_smart_close_does_not_log_by_default() {
 
     run_binary("hypr-smart-close", &[], &envs);
 
-    let requests = wait_for_request(&hypr, "dispatch closewindow address:0xabc123");
+    let requests = wait_for_request(
+        &hypr,
+        "dispatch hl.dsp.window.close({address = \"0xabc123\"})",
+    );
     assert!(
         requests
             .iter()
-            .any(|request| request == "dispatch closewindow address:0xabc123"),
-        "expected exact Hypr closewindow dispatch, got {requests:?}"
+            .any(|request| request == "dispatch hl.dsp.window.close({address = \"0xabc123\"})"),
+        "expected exact Hypr closewindow dispatch with Lua form, got {requests:?}"
     );
     assert!(
         !default_log.exists(),
@@ -643,12 +724,15 @@ fn hypr_smart_close_logs_captured_address_and_dispatch() {
     ));
     run_binary("hypr-smart-close", &[], &envs);
 
-    let requests = wait_for_request(&hypr, "dispatch closewindow address:0xabc123");
+    let requests = wait_for_request(
+        &hypr,
+        "dispatch hl.dsp.window.close({address = \"0xabc123\"})",
+    );
     assert!(
         requests
             .iter()
-            .any(|request| request == "dispatch closewindow address:0xabc123"),
-        "expected exact Hypr closewindow dispatch, got {requests:?}"
+            .any(|request| request == "dispatch hl.dsp.window.close({address = \"0xabc123\"})"),
+        "expected exact Hypr closewindow dispatch with Lua form, got {requests:?}"
     );
 
     let events = fs::read_to_string(&close_log).expect("close log should be written");
@@ -689,12 +773,15 @@ fn hypr_smart_close_truncates_large_explicit_close_log() {
 
     run_binary("hypr-smart-close", &[], &envs);
 
-    let requests = wait_for_request(&hypr, "dispatch closewindow address:0xabc123");
+    let requests = wait_for_request(
+        &hypr,
+        "dispatch hl.dsp.window.close({address = \"0xabc123\"})",
+    );
     assert!(
         requests
             .iter()
-            .any(|request| request == "dispatch closewindow address:0xabc123"),
-        "expected exact Hypr closewindow dispatch, got {requests:?}"
+            .any(|request| request == "dispatch hl.dsp.window.close({address = \"0xabc123\"})"),
+        "expected exact Hypr closewindow dispatch with Lua form, got {requests:?}"
     );
     let metadata = fs::metadata(&close_log).expect("close log metadata should be readable");
     assert!(
@@ -735,12 +822,15 @@ fn hypr_smart_close_respects_disabled_close_log_value() {
 
     run_binary("hypr-smart-close", &[], &envs);
 
-    let requests = wait_for_request(&hypr, "dispatch closewindow address:0xabc123");
+    let requests = wait_for_request(
+        &hypr,
+        "dispatch hl.dsp.window.close({address = \"0xabc123\"})",
+    );
     assert!(
         requests
             .iter()
-            .any(|request| request == "dispatch closewindow address:0xabc123"),
-        "expected exact Hypr closewindow dispatch, got {requests:?}"
+            .any(|request| request == "dispatch hl.dsp.window.close({address = \"0xabc123\"})"),
+        "expected exact Hypr closewindow dispatch with Lua form, got {requests:?}"
     );
     assert!(
         !default_log.exists(),
@@ -770,7 +860,9 @@ fn hypr_smart_close_logs_failed_hypr_dispatch_and_exits_nonzero() {
         !status.success(),
         "failed Hypr dispatch should exit non-zero"
     );
-    assert_eq!(hypr.requests(), vec!["activewindow".to_string()]);
+    // Server stops after activewindow, so both Lua and legacy dispatch attempts will fail
+    let requests = hypr.requests();
+    assert!(requests.iter().any(|request| request == "activewindow"));
     let events = fs::read_to_string(&close_log).expect("close log should be written");
     assert!(
         events.contains("\"event\":\"dispatch_closewindow_failed\""),
@@ -795,12 +887,15 @@ fn hypr_smart_close_closes_captured_non_terminal_window() {
     let envs = harness.envs();
     run_binary("hypr-smart-close", &[], &envs);
 
-    let requests = wait_for_request(&hypr, "dispatch closewindow address:0xabc123");
+    let requests = wait_for_request(
+        &hypr,
+        "dispatch hl.dsp.window.close({address = \"0xabc123\"})",
+    );
     assert!(
         requests
             .iter()
-            .any(|request| request == "dispatch closewindow address:0xabc123"),
-        "expected exact Hypr closewindow dispatch, got {requests:?}"
+            .any(|request| request == "dispatch hl.dsp.window.close({address = \"0xabc123\"})"),
+        "expected exact Hypr closewindow dispatch with Lua form, got {requests:?}"
     );
     assert!(
         !requests
@@ -1000,12 +1095,12 @@ fn hypr_tmux_nav_falls_back_to_hypr_when_tmux_cannot_move() {
 
     run_binary("hypr-tmux-nav", &["down"], &envs);
 
-    let requests = wait_for_request(&hypr, "dispatch movefocus d");
+    let requests = wait_for_request(&hypr, "dispatch hl.dsp.focus({direction = \"d\"})");
     assert!(
         requests
             .iter()
-            .any(|request| request == "dispatch movefocus d"),
-        "expected Hypr fallback dispatch, got {requests:?}"
+            .any(|request| request == "dispatch hl.dsp.focus({direction = \"d\"})"),
+        "expected Hypr fallback dispatch with Lua form, got {requests:?}"
     );
 }
 
@@ -1078,12 +1173,15 @@ fn hypr_smart_close_logs_failed_hypr_dispatch_reply_and_exits_nonzero() {
         !status.success(),
         "rejected Hypr dispatch reply should exit non-zero"
     );
-    let requests = wait_for_request(&hypr, "dispatch closewindow address:0xabc123");
+    // With this server, all dispatch requests get the same error response
+    let requests = hypr.requests();
+    let has_lua = requests.iter().any(|r| r.contains("hl.dsp.window.close"));
+    let has_legacy = requests
+        .iter()
+        .any(|r| r == "dispatch closewindow address:0xabc123");
     assert!(
-        requests
-            .iter()
-            .any(|request| request == "dispatch closewindow address:0xabc123"),
-        "expected exact Hypr closewindow dispatch, got {requests:?}"
+        has_lua || has_legacy,
+        "expected either Lua or legacy closewindow dispatch, got {requests:?}"
     );
     let events = fs::read_to_string(&close_log).expect("close log should be written");
     assert!(
@@ -1127,12 +1225,13 @@ fn hypr_tmux_nav_exits_nonzero_when_hypr_fallback_dispatch_reply_is_rejected() {
         !status.success(),
         "rejected Hypr dispatch reply should exit non-zero"
     );
-    let requests = wait_for_request(&hypr, "dispatch movefocus d");
+    // With this server, all dispatch requests get the same error response
+    let requests = hypr.requests();
+    let has_lua = requests.iter().any(|r| r.contains("hl.dsp.focus"));
+    let has_legacy = requests.iter().any(|r| r == "dispatch movefocus d");
     assert!(
-        requests
-            .iter()
-            .any(|request| request == "dispatch movefocus d"),
-        "expected Hypr fallback dispatch, got {requests:?}"
+        has_lua || has_legacy,
+        "expected either Lua or legacy movefocus dispatch, got {requests:?}"
     );
     let nav_state_exists = fs::read_dir(&harness.runtime_dir)
         .expect("runtime dir should be readable")
@@ -1188,12 +1287,12 @@ fn hypr_tmux_nav_ignores_kitty_probe_pid_from_unrelated_process_tree() {
     let status = run_binary_status("hypr-tmux-nav", &["down"], &envs);
     assert!(status.success(), "expected hypr-tmux-nav to exit cleanly");
 
-    let requests = wait_for_request(&hypr, "dispatch movefocus d");
+    let requests = wait_for_request(&hypr, "dispatch hl.dsp.focus({direction = \"d\"})");
     assert!(
         requests
             .iter()
-            .any(|request| request == "dispatch movefocus d"),
-        "expected Hypr fallback dispatch since the kitty-probe pid belongs to \
+            .any(|request| request == "dispatch hl.dsp.focus({direction = \"d\"})"),
+        "expected Hypr fallback dispatch with Lua form since the kitty-probe pid belongs to \
          an unrelated process tree, got {requests:?}"
     );
     let log = harness.log_contents();
@@ -1255,5 +1354,138 @@ fn hypr_tmux_nav_uses_kitty_probe_pid_that_is_descendant_of_active_window() {
             .any(|request| request.starts_with("dispatch ")),
         "expected no Hypr fallback dispatch once the kitty probe's \
          descendant pid resolved the terminal runtime, got {requests:?}"
+    );
+}
+
+#[test]
+fn hypr_nav_falls_back_to_legacy_when_lua_dispatch_fails() {
+    let harness = Harness::new("lua-fallback-nav");
+    let hypr = HyprServer::start_with_lua_fallback_required(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        "Window abc123 -> test window:\nclass: brave-browser\npid: 4242\n",
+    );
+
+    let envs = harness.envs();
+    run_binary("hypr-nav", &["left"], &envs);
+
+    let requests = hypr.requests();
+    // Should have both Lua attempt (rejected) and legacy attempt (accepted)
+    assert!(
+        requests
+            .iter()
+            .any(|r| r == "dispatch hl.dsp.focus({direction = \"l\"})"),
+        "expected Lua dispatch attempt first, got {requests:?}"
+    );
+    assert!(
+        requests.iter().any(|r| r == "dispatch movefocus l"),
+        "expected legacy dispatch fallback, got {requests:?}"
+    );
+    // Lua should come before legacy
+    let lua_idx = requests
+        .iter()
+        .position(|r| r == "dispatch hl.dsp.focus({direction = \"l\"})")
+        .unwrap();
+    let legacy_idx = requests
+        .iter()
+        .position(|r| r == "dispatch movefocus l")
+        .unwrap();
+    assert!(
+        lua_idx < legacy_idx,
+        "Lua attempt should come before legacy fallback"
+    );
+}
+
+#[test]
+fn hypr_smart_close_falls_back_to_legacy_when_lua_dispatch_fails() {
+    let harness = Harness::new("lua-fallback-close");
+    let hypr = HyprServer::start_with_lua_fallback_required(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        "Window abc123 -> test window:\nclass: brave-browser\npid: 4242\n",
+    );
+
+    let envs = harness.envs();
+    run_binary("hypr-smart-close", &[], &envs);
+
+    let requests = hypr.requests();
+    // Should have both Lua attempt (rejected) and legacy attempt (accepted)
+    assert!(
+        requests
+            .iter()
+            .any(|r| r == "dispatch hl.dsp.window.close({address = \"0xabc123\"})"),
+        "expected Lua dispatch attempt first, got {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|r| r == "dispatch closewindow address:0xabc123"),
+        "expected legacy dispatch fallback, got {requests:?}"
+    );
+    // Lua should come before legacy
+    let lua_idx = requests
+        .iter()
+        .position(|r| r == "dispatch hl.dsp.window.close({address = \"0xabc123\"})")
+        .unwrap();
+    let legacy_idx = requests
+        .iter()
+        .position(|r| r == "dispatch closewindow address:0xabc123")
+        .unwrap();
+    assert!(
+        lua_idx < legacy_idx,
+        "Lua attempt should come before legacy fallback"
+    );
+}
+
+#[test]
+fn hypr_tmux_nav_falls_back_to_legacy_when_lua_dispatch_fails() {
+    let harness = Harness::new("lua-fallback-tmux");
+    let pid_file = harness.runtime_dir.join("terminal.pid");
+    let pty = PtyProcess::spawn(&pid_file, &[("TMUX", "/tmp/fake-tmux,4242,0")]);
+    let hypr = HyprServer::start_with_lua_fallback_required(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        &format!(
+            "Window abc123 -> test window:\nclass: termstub\npid: {}\n",
+            pty.pid
+        ),
+    );
+
+    let tty = fs::read_link(format!("/proc/{}/fd/0", pty.pid))
+        .expect("pty tty should be readable")
+        .display()
+        .to_string();
+
+    let mut envs = harness.envs();
+    envs.push(("TERMINAL".to_string(), "termstub".to_string()));
+    envs.push(("TEST_TTY".to_string(), tty));
+    envs.push(("TEST_TMUX_AT_EDGE".to_string(), "1".to_string()));
+
+    run_binary("hypr-tmux-nav", &["right"], &envs);
+
+    let requests = hypr.requests();
+    // Should have both Lua attempt (rejected) and legacy attempt (accepted)
+    assert!(
+        requests
+            .iter()
+            .any(|r| r == "dispatch hl.dsp.focus({direction = \"r\"})"),
+        "expected Lua dispatch attempt first, got {requests:?}"
+    );
+    assert!(
+        requests.iter().any(|r| r == "dispatch movefocus r"),
+        "expected legacy dispatch fallback, got {requests:?}"
+    );
+    // Lua should come before legacy
+    let lua_idx = requests
+        .iter()
+        .position(|r| r == "dispatch hl.dsp.focus({direction = \"r\"})")
+        .unwrap();
+    let legacy_idx = requests
+        .iter()
+        .position(|r| r == "dispatch movefocus r")
+        .unwrap();
+    assert!(
+        lua_idx < legacy_idx,
+        "Lua attempt should come before legacy fallback"
     );
 }

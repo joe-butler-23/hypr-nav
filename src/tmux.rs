@@ -340,7 +340,8 @@ fn main() {
     }
 
     debug_log!("tmux-nav", "fallback to hypr movefocus {}", move_dir);
-    if hypr_dispatch(&hypr_socket, &format!("movefocus {}", move_dir)) {
+    let action = HyprDispatch::MoveFocus(direction);
+    if hypr_dispatch_action(&hypr_socket, &action) {
         save_nav_state("hypr_movefocus", move_dir, current_tty.as_deref());
     } else {
         std::process::exit(1);

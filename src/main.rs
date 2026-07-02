@@ -65,7 +65,8 @@ fn main() {
     }
 
     debug_log!("kitty-nav", "fallback to hypr movefocus {}", move_dir);
-    if !hypr_dispatch(&hypr_socket, &format!("movefocus {}", move_dir)) {
+    let action = HyprDispatch::MoveFocus(direction);
+    if !hypr_dispatch_action(&hypr_socket, &action) {
         std::process::exit(1);
     }
 }
