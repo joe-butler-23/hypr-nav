@@ -773,7 +773,7 @@ fn detect_terminal_runtime_from_kitty(active_pid: u32) -> KittyRuntimeProbe {
         .collect();
 
     if verified_pids.is_empty() {
-        debug_log!("lib", 
+        debug_log!("lib",
                 "kitty ls focused window does not belong to active window pid={}; ignoring probe (candidates={:?})",
                 active_pid, candidate_pids
             );

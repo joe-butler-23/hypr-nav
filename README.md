@@ -19,7 +19,7 @@ I have also included `hypr-smart-close`, a context-aware `Super+C` that knows wh
     - Ambiguous active-window or Tmux state? **Fails closed** instead of guessing.
 - **Zero Config for Apps**: Works by inspecting the process tree and IPC sockets. No plugins required for Hyprland (just binds).
 
-The tmux/kitty stuff may be useful for people in its current form. I imagine the smart-close thing will mostly be useful for me and my specific needs. But it should serve as a useful demonstration of how the approach taken with this tool could be adapted to your own specific needs. 
+The tmux/kitty stuff may be useful for people in its current form. I imagine the smart-close thing will mostly be useful for me and my specific needs. But it should serve as a useful demonstration of how the approach taken with this tool could be adapted to your own specific needs.
 
 ## Installation
 
@@ -75,7 +75,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-## Forking 
+## Forking
 
 The core logic is modularized in `src/lib.rs`. I am pretty confident you could easily extend this to support other multiplexers (Zellij?) or editors (Neovim?) by adding new detection logic.
 
