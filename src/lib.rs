@@ -120,7 +120,8 @@ enum KittyRuntimeProbe {
 }
 
 pub fn debug_enabled() -> bool {
-    match env::var("HYPR_NAV_DEBUG") {
+    static DEBUG_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEBUG_ENABLED.get_or_init(|| match env::var("HYPR_NAV_DEBUG") {
         Ok(value) => {
             let normalized = value.trim().to_ascii_lowercase();
             !normalized.is_empty()
@@ -130,13 +131,19 @@ pub fn debug_enabled() -> bool {
                 && normalized != "no"
         }
         Err(_) => false,
-    }
+    })
 }
 
-pub fn debug_log(component: &str, message: &str) {
-    if debug_enabled() {
-        eprintln!("[hypr-nav][{}] {}", component, message);
-    }
+/// Log a debug message when `HYPR_NAV_DEBUG` is enabled. Formatting is
+/// skipped entirely when debugging is off, avoiding per-callsite allocations
+/// on the hot keypress path.
+#[macro_export]
+macro_rules! debug_log {
+    ($component:expr, $($arg:tt)*) => {
+        if $crate::debug_enabled() {
+            eprintln!("[hypr-nav][{}] {}", $component, format!($($arg)*));
+        }
+    };
 }
 
 /// Check if the window class represents a terminal emulator
@@ -149,7 +156,7 @@ pub fn is_terminal_class(class: &str) -> bool {
             .next()
             .unwrap_or(&terminal)
             .to_lowercase();
-        if class.to_lowercase().contains(&terminal_name) {
+        if class.eq_ignore_ascii_case(&terminal_name) {
             return true;
         }
     }
@@ -258,12 +265,10 @@ fn find_hyprland_socket_with(
     }
 
     if candidates.len() > 1 {
-        debug_log(
+        debug_log!(
             "lib",
-            &format!(
-                "multiple hypr sockets found under {}; refusing ambiguous fallback",
-                hypr_root.display()
-            ),
+            "multiple hypr sockets found under {}; refusing ambiguous fallback",
+            hypr_root.display()
         );
     }
 
@@ -277,9 +282,9 @@ pub fn find_hyprland_socket() -> Option<PathBuf> {
     let socket = find_hyprland_socket_with(&xdg, sig.as_deref());
 
     if let Some(ref path) = socket {
-        debug_log("lib", &format!("hypr socket selected: {}", path.display()));
+        debug_log!("lib", "hypr socket selected: {}", path.display());
     } else {
-        debug_log("lib", "no usable hypr socket found");
+        debug_log!("lib", "no usable hypr socket found");
     }
 
     socket
@@ -341,17 +346,17 @@ pub fn get_active_window_snapshot(socket_path: &PathBuf) -> Option<ActiveWindowI
 
     match parse_active_window_info(&response) {
         Some(info) => {
-            debug_log(
+            debug_log!(
                 "lib",
-                &format!(
-                    "active window address={} class={} pid={}",
-                    info.address, info.class, info.pid
-                ),
+                "active window address={} class={} pid={}",
+                info.address,
+                info.class,
+                info.pid
             );
             Some(info)
         }
         None => {
-            debug_log("lib", "active window query returned incomplete data");
+            debug_log!("lib", "active window query returned incomplete data");
             None
         }
     }
@@ -466,79 +471,83 @@ fn find_nvim_listen_socket(pid: u32) -> Option<String> {
     None
 }
 
+fn looks_like_host_port(socket: &str) -> bool {
+    // Check if socket looks like "host:port" format by splitting on the last colon
+    if let Some((host, port_str)) = socket.rsplit_once(':') {
+        // Host must be non-empty
+        if host.is_empty() {
+            return false;
+        }
+        // Port must be a valid u16
+        port_str.parse::<u16>().is_ok()
+    } else {
+        false
+    }
+}
+
 fn nvim_socket_is_live(socket: &str) -> bool {
     if std::path::Path::new(socket).exists() {
         return UnixStream::connect(socket).is_ok();
     }
 
     // Some setups expose nvim remote endpoints as host:port.
-    // Let command execution decide in that case.
-    socket.contains(':')
+    // Only accept strings that parse as valid host:port endpoints.
+    looks_like_host_port(socket)
 }
 
-/// Check if the nvim window is at the edge in the given direction.
-/// Returns true when at edge (no neighbor), or on error (fail-open to fall through).
-pub fn is_nvim_at_edge(socket: &str, direction: Direction) -> bool {
-    // winnr() == winnr('h') is true when there's no neighbor to the left
-    let expr = format!("winnr()==winnr('{}')", direction.nvim_wincmd_char());
+/// Outcome of a mode-safe nvim split navigation attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NvimNavOutcome {
+    /// The window command executed and moved focus to a neighboring split.
+    Moved,
+    /// There is no neighbor in that direction; nvim reported the edge sentinel.
+    AtEdge,
+    /// The nvim RPC call failed to spawn or exited non-zero.
+    Error,
+}
+
+const NVIM_EDGE_SENTINEL: &str = "HYPRNAV_EDGE";
+const NVIM_SINGLE_WINDOW_SENTINEL: &str = "HYPRNAV_SINGLE";
+
+/// Navigate to the nvim split in the given direction using a single mode-safe
+/// `--remote-expr` call. The expression uses `execute()` to run the `wincmd`
+/// ex command, which works regardless of nvim's current mode (normal,
+/// insert, visual, ...) and never types into the buffer the way
+/// `--remote-send`-ing `<C-w>{dir}` keys would. Callers should treat `Error`
+/// the same as `AtEdge` (fail-open, fall through to the next nav layer).
+pub fn nvim_navigate_or_edge(socket: &str, direction: Direction) -> NvimNavOutcome {
+    let wincmd = direction.nvim_wincmd_char();
+    let expr = format!(
+        "winnr() == winnr('{wincmd}') ? '{sentinel}' : execute('wincmd {wincmd}')",
+        wincmd = wincmd,
+        sentinel = NVIM_EDGE_SENTINEL,
+    );
     let output = Command::new("nvim")
         .args(["--server", socket, "--remote-expr", &expr])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output();
 
-    match output {
+    let outcome = match output {
         Ok(out) if out.status.success() => {
             let result = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let at_edge = result == "1";
-            debug_log(
-                "lib",
-                &format!(
-                    "is_nvim_at_edge socket={} dir={} -> {}",
-                    socket,
-                    direction.tmux_flag(),
-                    at_edge
-                ),
-            );
-            at_edge
+            if result == NVIM_EDGE_SENTINEL {
+                NvimNavOutcome::AtEdge
+            } else {
+                NvimNavOutcome::Moved
+            }
         }
-        _ => {
-            debug_log(
-                "lib",
-                &format!(
-                    "is_nvim_at_edge socket={} dir={} -> true (error, fail-open)",
-                    socket,
-                    direction.tmux_flag()
-                ),
-            );
-            true
-        }
-    }
-}
+        _ => NvimNavOutcome::Error,
+    };
 
-/// Navigate to the nvim split in the given direction.
-/// Returns true if the command was sent successfully.
-pub fn try_nvim_navigate(socket: &str, direction: Direction) -> bool {
-    // Send <C-w>{dir} keysequence
-    let keys = format!("<C-w>{}", direction.nvim_wincmd_char());
-    let result = Command::new("nvim")
-        .args(["--server", socket, "--remote-send", &keys])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    debug_log(
+    debug_log!(
         "lib",
-        &format!(
-            "try_nvim_navigate socket={} dir={} -> {}",
-            socket,
-            direction.tmux_flag(),
-            result
-        ),
+        "nvim_navigate_or_edge socket={} dir={} -> {:?}",
+        socket,
+        direction.tmux_flag(),
+        outcome
     );
-    result
+    outcome
 }
 
 fn read_process_tty(pid: u32) -> Option<String> {
@@ -668,7 +677,48 @@ fn parse_focused_kitty_pids(json: &str) -> Option<Vec<u32>> {
     Some(read_pids_from_kitty_window(window))
 }
 
-fn detect_terminal_runtime_from_kitty() -> KittyRuntimeProbe {
+/// Walk `/proc/<pid>/status` `PPid:` lines to determine whether `ancestor` is
+/// `pid` itself or one of its ancestors, within `max_hops` hops. Stops at
+/// pid 1/0 (init/kthreadd) and treats unreadable `/proc` entries as a
+/// negative result (fail closed: an unverifiable ancestry claim is not
+/// trusted).
+fn pid_has_ancestor(pid: u32, ancestor: u32, max_hops: usize) -> bool {
+    if pid == ancestor {
+        return true;
+    }
+
+    let mut current = pid;
+    for _ in 0..max_hops {
+        let status = match fs::read_to_string(format!("/proc/{}/status", current)) {
+            Ok(status) => status,
+            Err(_) => return false,
+        };
+        let ppid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:"))
+            .and_then(|rest| rest.trim().parse::<u32>().ok());
+        let ppid = match ppid {
+            Some(ppid) => ppid,
+            None => return false,
+        };
+        if ppid == ancestor {
+            return true;
+        }
+        if ppid == 0 || ppid == 1 {
+            return false;
+        }
+        current = ppid;
+    }
+
+    false
+}
+
+/// Hop cap for `pid_has_ancestor` when validating that a kitty-reported
+/// focused-window pid genuinely belongs to the Hyprland-active window's
+/// process tree.
+const KITTY_PROBE_ANCESTRY_MAX_HOPS: usize = 15;
+
+fn detect_terminal_runtime_from_kitty(active_pid: u32) -> KittyRuntimeProbe {
     let kitty_uri = match kitty_control_socket_uri() {
         Some(uri) => uri,
         None => return KittyRuntimeProbe::Unavailable,
@@ -684,18 +734,18 @@ fn detect_terminal_runtime_from_kitty() -> KittyRuntimeProbe {
     let output = match output {
         Some(out) => out,
         None => {
-            debug_log(
+            debug_log!(
                 "lib",
-                "kitty ls failed while resolving focused kitty context",
+                "kitty ls failed while resolving focused kitty context"
             );
             return KittyRuntimeProbe::Unavailable;
         }
     };
 
     if !output.status.success() {
-        debug_log(
+        debug_log!(
             "lib",
-            "kitty ls failed while resolving focused kitty context",
+            "kitty ls failed while resolving focused kitty context"
         );
         return KittyRuntimeProbe::Unavailable;
     }
@@ -703,29 +753,47 @@ fn detect_terminal_runtime_from_kitty() -> KittyRuntimeProbe {
     let parsed = String::from_utf8_lossy(&output.stdout);
     let candidate_pids = parse_focused_kitty_pids(&parsed).unwrap_or_default();
     if candidate_pids.is_empty() {
-        debug_log(
+        debug_log!(
             "lib",
-            "kitty ls returned no focused foreground pid candidates",
+            "kitty ls returned no focused foreground pid candidates"
         );
+        return KittyRuntimeProbe::Unavailable;
+    }
+
+    // With more than one kitty instance running, `kitty ls`'s notion of the
+    // "focused" window belongs to whichever kitty process answered on the
+    // resolved control socket, which may not be the Hyprland-active window
+    // at all. Only trust candidate pids that are (or descend from) the
+    // active window's pid; otherwise this probe result is meaningless and we
+    // fall back to the process-tree BFS in the caller.
+    let verified_pids: Vec<u32> = candidate_pids
+        .iter()
+        .copied()
+        .filter(|&pid| pid_has_ancestor(pid, active_pid, KITTY_PROBE_ANCESTRY_MAX_HOPS))
+        .collect();
+
+    if verified_pids.is_empty() {
+        debug_log!("lib", 
+                "kitty ls focused window does not belong to active window pid={}; ignoring probe (candidates={:?})",
+                active_pid, candidate_pids
+            );
         return KittyRuntimeProbe::Unavailable;
     }
 
     let mut tmux_runtime: Option<TmuxRuntime> = None;
     let mut nvim_socket: Option<String> = None;
 
-    for pid in candidate_pids {
+    for pid in verified_pids {
         let tty = read_process_tty(pid);
         let tmux_sock = read_tmux_socket_from_environ(pid);
         let has_tmux = tmux_sock.is_some() || process_has_tmux(pid);
-        debug_log(
+        debug_log!(
             "lib",
-            &format!(
-                "kitty-focused candidate pid={} tty={} tmux_socket={} has_tmux={}",
-                pid,
-                tty.as_deref().unwrap_or("<none>"),
-                tmux_sock.as_deref().unwrap_or("<none>"),
-                has_tmux
-            ),
+            "kitty-focused candidate pid={} tty={} tmux_socket={} has_tmux={}",
+            pid,
+            tty.as_deref().unwrap_or("<none>"),
+            tmux_sock.as_deref().unwrap_or("<none>"),
+            has_tmux
         );
 
         if tmux_runtime.is_none() && has_tmux {
@@ -740,13 +808,11 @@ fn detect_terminal_runtime_from_kitty() -> KittyRuntimeProbe {
         // Check for nvim: is this process nvim itself?
         if nvim_socket.is_none() && process_is_nvim(pid) {
             nvim_socket = find_nvim_listen_socket(pid);
-            debug_log(
+            debug_log!(
                 "lib",
-                &format!(
-                    "kitty-focused nvim process pid={} socket={}",
-                    pid,
-                    nvim_socket.as_deref().unwrap_or("<none>")
-                ),
+                "kitty-focused nvim process pid={} socket={}",
+                pid,
+                nvim_socket.as_deref().unwrap_or("<none>")
             );
         }
 
@@ -754,13 +820,11 @@ fn detect_terminal_runtime_from_kitty() -> KittyRuntimeProbe {
         if nvim_socket.is_none() {
             nvim_socket = read_nvim_socket_from_environ(pid);
             if nvim_socket.is_some() {
-                debug_log(
+                debug_log!(
                     "lib",
-                    &format!(
-                        "kitty-focused nvim socket from environ pid={} socket={}",
-                        pid,
-                        nvim_socket.as_deref().unwrap_or("<none>")
-                    ),
+                    "kitty-focused nvim socket from environ pid={} socket={}",
+                    pid,
+                    nvim_socket.as_deref().unwrap_or("<none>")
                 );
             }
         }
@@ -776,9 +840,9 @@ fn detect_terminal_runtime_from_kitty() -> KittyRuntimeProbe {
             nvim_socket,
         })
     } else {
-        debug_log(
+        debug_log!(
             "lib",
-            "kitty-focused context found but no tmux or nvim in focused window",
+            "kitty-focused context found but no tmux or nvim in focused window"
         );
         KittyRuntimeProbe::NothingFound
     }
@@ -797,40 +861,37 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
     if kitty_by_class || kitty_by_pid {
         let probe_authoritative = kitty_by_class;
         if kitty_by_pid && !kitty_by_class {
-            debug_log(
+            debug_log!(
                 "lib",
-                &format!(
-                    "active pid={} is kitty with custom class={} ; using kitty-focused probe",
-                    pid, class
-                ),
+                "active pid={} is kitty with custom class={} ; using kitty-focused probe",
+                pid,
+                class
             );
         }
-        match detect_terminal_runtime_from_kitty() {
+        match detect_terminal_runtime_from_kitty(pid) {
             KittyRuntimeProbe::Found(result) => {
                 if let Some(ref tmux) = result.tmux {
-                    debug_log(
+                    debug_log!(
                         "lib",
-                        &format!(
-                            "tmux runtime from kitty tty={} socket={}",
-                            tmux.tty,
-                            tmux.socket_path.as_deref().unwrap_or("<default>")
-                        ),
+                        "tmux runtime from kitty tty={} socket={}",
+                        tmux.tty,
+                        tmux.socket_path.as_deref().unwrap_or("<default>")
                     );
                 }
                 if let Some(ref socket) = result.nvim_socket {
-                    debug_log("lib", &format!("nvim socket from kitty: {}", socket));
+                    debug_log!("lib", "nvim socket from kitty: {}", socket);
                 }
                 tmux_result = result.tmux;
                 kitty_nvim_socket = result.nvim_socket;
             }
             KittyRuntimeProbe::NothingFound => {
                 if probe_authoritative {
-                    debug_log("lib", "kitty-focused probe confirms no tmux or nvim");
+                    debug_log!("lib", "kitty-focused probe confirms no tmux or nvim");
                     kitty_authoritative_nothing = true;
                 } else {
-                    debug_log(
+                    debug_log!(
                         "lib",
-                        "kitty-focused probe found nothing for custom class; trying process tree",
+                        "kitty-focused probe found nothing for custom class; trying process tree"
                     );
                 }
             }
@@ -861,46 +922,64 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
             tty = current_tty.clone();
         }
 
-        // Check if this process is tmux
-        if !has_tmux {
-            has_tmux = process_has_tmux(current_pid);
-        }
+        if kitty_authoritative_nothing {
+            // The kitty-focused probe already confirmed there is no tmux or
+            // nvim in the focused window, so the tmux/nvim results this BFS
+            // would otherwise compute are discarded below (guarded by
+            // `!kitty_authoritative_nothing`). Only `tty` is still used in
+            // this path, so skip the tmux/nvim probing work entirely and
+            // stop as soon as `tty` resolves.
+            if tty.is_some() {
+                break;
+            }
+        } else {
+            // Check if this process is tmux
+            if !has_tmux {
+                has_tmux = process_has_tmux(current_pid);
+            }
 
-        if tmux_socket_path.is_none() {
-            tmux_socket_path = read_tmux_socket_from_environ(current_pid);
-            if tmux_socket_path.is_some() {
-                has_tmux = true;
-                if current_tty.is_some() {
-                    tty = current_tty.clone();
+            if tmux_socket_path.is_none() {
+                tmux_socket_path = read_tmux_socket_from_environ(current_pid);
+                if tmux_socket_path.is_some() {
+                    has_tmux = true;
+                    if current_tty.is_some() {
+                        tty = current_tty.clone();
+                    }
                 }
             }
-        }
 
-        // Check for nvim: is this process nvim itself?
-        if nvim_socket.is_none() && process_is_nvim(current_pid) {
-            nvim_socket = find_nvim_listen_socket(current_pid);
-            debug_log(
-                "lib",
-                &format!(
+            // Check for nvim: is this process nvim itself?
+            if nvim_socket.is_none() && process_is_nvim(current_pid) {
+                nvim_socket = find_nvim_listen_socket(current_pid);
+                debug_log!(
+                    "lib",
                     "found nvim process pid={} socket={}",
                     current_pid,
                     nvim_socket.as_deref().unwrap_or("<none>")
-                ),
-            );
-        }
+                );
+            }
 
-        // Check for nvim: is this a child of nvim (has $NVIM in environ)?
-        if nvim_socket.is_none() {
-            if let Some(s) = read_nvim_socket_from_environ(current_pid) {
-                nvim_socket = Some(s);
-                debug_log(
-                    "lib",
-                    &format!(
+            // Check for nvim: is this a child of nvim (has $NVIM in environ)?
+            if nvim_socket.is_none() {
+                if let Some(s) = read_nvim_socket_from_environ(current_pid) {
+                    nvim_socket = Some(s);
+                    debug_log!(
+                        "lib",
                         "found nvim socket from environ of pid={} socket={}",
                         current_pid,
                         nvim_socket.as_deref().unwrap_or("<none>")
-                    ),
-                );
+                    );
+                }
+            }
+
+            // Nothing left that can change the outcome: `tty` only changes
+            // above while it is `None` or when `tmux_socket_path` is first
+            // discovered (which only happens once, guarded by
+            // `tmux_socket_path.is_none()`); `nvim_socket` only changes
+            // while `None`. Once all four are resolved, no further pid can
+            // alter any of them, so it's safe to stop walking.
+            if tty.is_some() && has_tmux && tmux_socket_path.is_some() && nvim_socket.is_some() {
+                break;
             }
         }
 
@@ -923,20 +1002,18 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
                 socket_path: tmux_socket_path,
             });
             if let Some(r) = runtime.as_ref() {
-                debug_log(
+                debug_log!(
                     "lib",
-                    &format!(
-                        "tmux runtime tty={} socket={}",
-                        r.tty,
-                        r.socket_path.as_deref().unwrap_or("<default>")
-                    ),
+                    "tmux runtime tty={} socket={}",
+                    r.tty,
+                    r.socket_path.as_deref().unwrap_or("<default>")
                 );
             } else {
-                debug_log("lib", "tmux detected but tty missing");
+                debug_log!("lib", "tmux detected but tty missing");
             }
             tmux_result = runtime;
         } else {
-            debug_log("lib", &format!("no tmux runtime under pid {}", pid));
+            debug_log!("lib", "no tmux runtime under pid {}", pid);
         }
     }
 
@@ -944,12 +1021,12 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
     if !kitty_authoritative_nothing {
         if let Some(socket) = nvim_socket {
             if nvim_socket_is_live(&socket) {
-                debug_log("lib", &format!("nvim runtime socket={} (live)", socket));
+                debug_log!("lib", "nvim runtime socket={} (live)", socket);
                 nvim_result = Some(NvimRuntime {
                     socket_path: socket,
                 });
             } else {
-                debug_log("lib", &format!("nvim socket={} is stale, ignoring", socket));
+                debug_log!("lib", "nvim socket={} is stale, ignoring", socket);
             }
         }
     }
@@ -969,49 +1046,38 @@ pub fn detect_tmux_runtime(pid: u32, class: &str) -> Option<TmuxRuntime> {
 
 /// Attempt nvim entry assist: navigate to opposite-edge window on cross-window entry.
 /// Returns true if entry assist was applied (multiple windows and navigation succeeded).
+///
+/// Mode-safe and single-spawn: one `--remote-expr` call checks the window count
+/// and, when there is more than one window, runs `999wincmd {opposite}` via
+/// `execute()` so it works regardless of nvim's current mode.
 pub fn try_nvim_entry_assist(socket: &str, direction: Direction) -> bool {
-    // Check if nvim has multiple windows
+    let opposite = direction.nvim_entry_assist_char();
+    let expr = format!(
+        "winnr('$') <= 1 ? '{sentinel}' : execute('999wincmd {opposite}')",
+        sentinel = NVIM_SINGLE_WINDOW_SENTINEL,
+        opposite = opposite,
+    );
     let output = Command::new("nvim")
-        .args(["--server", socket, "--remote-expr", "winnr('$')"])
+        .args(["--server", socket, "--remote-expr", &expr])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output();
 
-    let win_count: usize = match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(1),
-        _ => return false,
+    let result = match output {
+        Ok(out) if out.status.success() => {
+            let result = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            result != NVIM_SINGLE_WINDOW_SENTINEL
+        }
+        _ => false,
     };
 
-    if win_count <= 1 {
-        debug_log(
-            "lib",
-            &format!("nvim entry assist skip: single window socket={}", socket),
-        );
-        return false;
-    }
-
-    let opposite = direction.nvim_entry_assist_char();
-    let keys = format!("999<C-w>{}", opposite);
-    let result = Command::new("nvim")
-        .args(["--server", socket, "--remote-send", &keys])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    debug_log(
+    debug_log!(
         "lib",
-        &format!(
-            "try_nvim_entry_assist socket={} dir={} opposite={} -> {}",
-            socket,
-            direction.tmux_flag(),
-            opposite,
-            result
-        ),
+        "try_nvim_entry_assist socket={} dir={} opposite={} -> {}",
+        socket,
+        direction.tmux_flag(),
+        opposite,
+        result
     );
     result
 }
@@ -1049,205 +1115,103 @@ pub fn tmux_status(args: &[&str], socket_path: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-/// Find the tmux session for a given TTY
-pub fn find_tmux_session(tty: &str, socket_path: Option<&str>) -> Option<String> {
-    // Single tmux call to get all client info
+/// Run a tmux `list-*` command whose `-F` format emits `<tty>\t<value>` rows,
+/// and return the value for the row whose tty matches exactly.
+///
+/// `label` is used only for diagnostic logging, so each thin wrapper below
+/// keeps its own name in `debug_log` output.
+fn tmux_lookup_by_tty(
+    label: &str,
+    list_args: &[&str],
+    tty: &str,
+    socket_path: Option<&str>,
+) -> Option<String> {
     let output = tmux_command(socket_path)
-        .args(["list-clients", "-F", "#{client_session}\t#{client_tty}"])
+        .args(list_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
         .ok()?;
 
     if !output.status.success() {
-        debug_log(
+        debug_log!(
             "lib",
-            &format!(
-                "find_tmux_session tty={} socket={} -> <none> (tmux error)",
-                tty,
-                socket_path.unwrap_or("<default>")
-            ),
+            "{} tty={} socket={} -> <none> (tmux error)",
+            label,
+            tty,
+            socket_path.unwrap_or("<default>")
         );
         return None;
     }
 
-    let clients = String::from_utf8_lossy(&output.stdout);
-    let session = parse_tmux_client_session(&clients, tty);
-    debug_log(
+    let rows = String::from_utf8_lossy(&output.stdout);
+    let value = parse_tmux_tty_keyed_value(&rows, tty);
+    debug_log!(
         "lib",
-        &format!(
-            "find_tmux_session tty={} socket={} -> {}",
-            tty,
-            socket_path.unwrap_or("<default>"),
-            session.as_deref().unwrap_or("<none>")
-        ),
+        "{} tty={} socket={} -> {}",
+        label,
+        tty,
+        socket_path.unwrap_or("<default>"),
+        value.as_deref().unwrap_or("<none>")
     );
-    session
+    value
 }
 
-fn parse_tmux_client_session(clients: &str, tty: &str) -> Option<String> {
-    for line in clients.lines() {
-        if let Some((session, client_tty)) = line.split_once('\t') {
-            let session = session.trim();
-            let client_tty = client_tty.trim();
-
-            if tty == client_tty {
-                return Some(session.to_string());
+/// Parse TAB-delimited `<tty>\t<value>` rows (tty first) and return the value
+/// for the row whose tty matches exactly. Rows without a tab are malformed
+/// and skipped; the value is returned verbatim (including internal spaces,
+/// e.g. tmux session names) since only the tab is a field separator.
+fn parse_tmux_tty_keyed_value(rows: &str, tty: &str) -> Option<String> {
+    for line in rows.lines() {
+        if let Some((key, value)) = line.split_once('\t') {
+            let key = key.trim();
+            let value = value.trim();
+            if tty == key {
+                return Some(value.to_string());
             }
         }
     }
-
     None
 }
 
-fn parse_tmux_client_pane(clients: &str, tty: &str) -> Option<String> {
-    for line in clients.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 2 {
-            continue;
-        }
-        let client_tty = parts[0];
-        let pane_id = parts[1];
-        if client_tty == tty {
-            return Some(pane_id.to_string());
-        }
-    }
-    None
-}
-
-fn parse_tmux_pane_by_tty(panes: &str, tty: &str) -> Option<String> {
-    for line in panes.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 2 {
-            continue;
-        }
-        let pane_tty = parts[0];
-        let pane_id = parts[1];
-        if pane_tty == tty {
-            return Some(pane_id.to_string());
-        }
-    }
-    None
-}
-
-fn parse_tmux_session_by_pane_tty(panes: &str, tty: &str) -> Option<String> {
-    for line in panes.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 2 {
-            continue;
-        }
-        let pane_tty = parts[0];
-        let session_id = parts[1];
-        if pane_tty == tty {
-            return Some(session_id.to_string());
-        }
-    }
-    None
+/// Find the tmux session for a given TTY
+pub fn find_tmux_session(tty: &str, socket_path: Option<&str>) -> Option<String> {
+    tmux_lookup_by_tty(
+        "find_tmux_session",
+        &["list-clients", "-F", "#{client_tty}\t#{client_session}"],
+        tty,
+        socket_path,
+    )
 }
 
 /// Find the active tmux pane for a given client TTY
 pub fn find_tmux_client_pane(tty: &str, socket_path: Option<&str>) -> Option<String> {
-    let output = tmux_command(socket_path)
-        .args(["list-clients", "-F", "#{client_tty} #{pane_id}"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        debug_log(
-            "lib",
-            &format!(
-                "find_tmux_client_pane tty={} socket={} -> <none> (tmux error)",
-                tty,
-                socket_path.unwrap_or("<default>")
-            ),
-        );
-        return None;
-    }
-
-    let clients = String::from_utf8_lossy(&output.stdout);
-    let pane = parse_tmux_client_pane(&clients, tty);
-    debug_log(
-        "lib",
-        &format!(
-            "find_tmux_client_pane tty={} socket={} -> {}",
-            tty,
-            socket_path.unwrap_or("<default>"),
-            pane.as_deref().unwrap_or("<none>")
-        ),
-    );
-    pane
+    tmux_lookup_by_tty(
+        "find_tmux_client_pane",
+        &["list-clients", "-F", "#{client_tty}\t#{pane_id}"],
+        tty,
+        socket_path,
+    )
 }
 
 /// Find pane by pane tty when we discovered a pane PTY rather than client TTY.
 pub fn find_tmux_pane_by_tty(tty: &str, socket_path: Option<&str>) -> Option<String> {
-    let output = tmux_command(socket_path)
-        .args(["list-panes", "-a", "-F", "#{pane_tty} #{pane_id}"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        debug_log(
-            "lib",
-            &format!(
-                "find_tmux_pane_by_tty tty={} socket={} -> <none> (tmux error)",
-                tty,
-                socket_path.unwrap_or("<default>")
-            ),
-        );
-        return None;
-    }
-
-    let panes = String::from_utf8_lossy(&output.stdout);
-    let pane = parse_tmux_pane_by_tty(&panes, tty);
-    debug_log(
-        "lib",
-        &format!(
-            "find_tmux_pane_by_tty tty={} socket={} -> {}",
-            tty,
-            socket_path.unwrap_or("<default>"),
-            pane.as_deref().unwrap_or("<none>")
-        ),
-    );
-    pane
+    tmux_lookup_by_tty(
+        "find_tmux_pane_by_tty",
+        &["list-panes", "-a", "-F", "#{pane_tty}\t#{pane_id}"],
+        tty,
+        socket_path,
+    )
 }
 
 /// Find session by pane tty when we discovered a pane PTY rather than client TTY.
 pub fn find_tmux_session_by_pane_tty(tty: &str, socket_path: Option<&str>) -> Option<String> {
-    let output = tmux_command(socket_path)
-        .args(["list-panes", "-a", "-F", "#{pane_tty} #{session_id}"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        debug_log(
-            "lib",
-            &format!(
-                "find_tmux_session_by_pane_tty tty={} socket={} -> <none> (tmux error)",
-                tty,
-                socket_path.unwrap_or("<default>")
-            ),
-        );
-        return None;
-    }
-
-    let panes = String::from_utf8_lossy(&output.stdout);
-    let session = parse_tmux_session_by_pane_tty(&panes, tty);
-    debug_log(
-        "lib",
-        &format!(
-            "find_tmux_session_by_pane_tty tty={} socket={} -> {}",
-            tty,
-            socket_path.unwrap_or("<default>"),
-            session.as_deref().unwrap_or("<none>")
-        ),
-    );
-    session
+    tmux_lookup_by_tty(
+        "find_tmux_session_by_pane_tty",
+        &["list-panes", "-a", "-F", "#{pane_tty}\t#{session_id}"],
+        tty,
+        socket_path,
+    )
 }
 
 /// Check if the active pane in the session is at the edge in the given direction
@@ -1268,27 +1232,23 @@ pub fn is_pane_at_edge(session: &str, direction: Direction, socket_path: Option<
         if out.status.success() {
             let result = String::from_utf8_lossy(&out.stdout).trim().to_string();
             let at_edge = result == "1";
-            debug_log(
+            debug_log!(
                 "lib",
-                &format!(
-                    "is_pane_at_edge target={} dir={} socket={} -> {}",
-                    session,
-                    direction.tmux_flag(),
-                    socket_path.unwrap_or("<default>"),
-                    at_edge
-                ),
+                "is_pane_at_edge target={} dir={} socket={} -> {}",
+                session,
+                direction.tmux_flag(),
+                socket_path.unwrap_or("<default>"),
+                at_edge
             );
             return at_edge;
         }
     }
-    debug_log(
+    debug_log!(
         "lib",
-        &format!(
-            "is_pane_at_edge target={} dir={} socket={} -> false (tmux error)",
-            session,
-            direction.tmux_flag(),
-            socket_path.unwrap_or("<default>")
-        ),
+        "is_pane_at_edge target={} dir={} socket={} -> false (tmux error)",
+        session,
+        direction.tmux_flag(),
+        socket_path.unwrap_or("<default>")
     );
     false
 }
@@ -1333,40 +1293,34 @@ pub fn get_tmux_session_info(session: &str, socket_path: Option<&str>) -> Option
         .ok()?;
 
     if !output.status.success() {
-        debug_log(
+        debug_log!(
             "lib",
-            &format!(
-                "get_tmux_session_info target={} socket={} -> <none> (tmux error)",
-                session,
-                socket_path.unwrap_or("<default>")
-            ),
+            "get_tmux_session_info target={} socket={} -> <none> (tmux error)",
+            session,
+            socket_path.unwrap_or("<default>")
         );
         return None;
     }
 
     let result = String::from_utf8_lossy(&output.stdout);
     if let Some(info) = parse_tmux_session_info_output(&result) {
-        debug_log(
+        debug_log!(
             "lib",
-            &format!(
-                "session_info target={} socket={} name={} named={} panes={} windows={}",
-                session,
-                socket_path.unwrap_or("<default>"),
-                info.name,
-                info.is_named,
-                info.pane_count,
-                info.window_count
-            ),
+            "session_info target={} socket={} name={} named={} panes={} windows={}",
+            session,
+            socket_path.unwrap_or("<default>"),
+            info.name,
+            info.is_named,
+            info.pane_count,
+            info.window_count
         );
         Some(info)
     } else {
-        debug_log(
+        debug_log!(
             "lib",
-            &format!(
-                "get_tmux_session_info target={} socket={} -> <none> (parse error)",
-                session,
-                socket_path.unwrap_or("<default>")
-            ),
+            "get_tmux_session_info target={} socket={} -> <none> (parse error)",
+            session,
+            socket_path.unwrap_or("<default>")
         );
         None
     }
@@ -1376,20 +1330,32 @@ pub fn hypr_dispatch(socket_path: &PathBuf, dispatcher: &str) -> bool {
     match UnixStream::connect(socket_path) {
         Ok(mut stream) => {
             let cmd = format!("dispatch {}", dispatcher);
-            debug_log("lib", &format!("hypr dispatch: {}", cmd));
+            debug_log!("lib", "hypr dispatch: {}", cmd);
             if let Err(err) = stream.write_all(cmd.as_bytes()) {
-                debug_log("lib", &format!("hypr dispatch write failed: {}", err));
+                debug_log!("lib", "hypr dispatch write failed: {}", err);
                 return false;
             }
-            // The dispatch bytes are already written; a shutdown error should not
-            // make callers report a failed action.
-            if let Err(err) = stream.shutdown(std::net::Shutdown::Both) {
-                debug_log("lib", &format!("hypr dispatch shutdown failed: {}", err));
+            // The dispatch bytes are already written; a write-side shutdown
+            // error should not make callers report a failed action, but we
+            // still need to read Hyprland's reply to know whether it worked.
+            if let Err(err) = stream.shutdown(std::net::Shutdown::Write) {
+                debug_log!("lib", "hypr dispatch shutdown failed: {}", err);
             }
-            true
+            let mut reply = String::new();
+            if let Err(err) = stream.read_to_string(&mut reply) {
+                debug_log!("lib", "hypr dispatch read failed: {}", err);
+                return false;
+            }
+            let trimmed = reply.trim();
+            if trimmed.to_lowercase().starts_with("ok") {
+                true
+            } else {
+                debug_log!("lib", "hypr dispatch failed reply: {}", trimmed);
+                false
+            }
         }
         Err(err) => {
-            debug_log("lib", &format!("hypr dispatch connect failed: {}", err));
+            debug_log!("lib", "hypr dispatch connect failed: {}", err);
             false
         }
     }
@@ -1493,63 +1459,42 @@ Window 0xABC123 -> terminal:
     }
 
     #[test]
-    fn parse_tmux_client_pane_matches_exact_tty() {
-        let data = "/dev/pts/2 %11\n/dev/pts/9 %42\n";
+    fn parse_tmux_tty_keyed_value_matches_exact_tty() {
+        let data = "/dev/pts/2\t%11\n/dev/pts/9\t%42\n";
         assert_eq!(
-            parse_tmux_client_pane(data, "/dev/pts/9"),
+            parse_tmux_tty_keyed_value(data, "/dev/pts/9"),
             Some("%42".to_string())
         );
     }
 
     #[test]
-    fn parse_tmux_client_pane_ignores_malformed_lines() {
-        let data = "invalid-line\n/dev/pts/5 %7\n";
+    fn parse_tmux_tty_keyed_value_ignores_malformed_rows_without_tab() {
+        let data = "invalid-line\n/dev/pts/5\t%7\n";
         assert_eq!(
-            parse_tmux_client_pane(data, "/dev/pts/5"),
+            parse_tmux_tty_keyed_value(data, "/dev/pts/5"),
             Some("%7".to_string())
         );
     }
 
     #[test]
-    fn parse_tmux_client_pane_returns_none_when_tty_missing() {
-        let data = "/dev/pts/2 %11\n/dev/pts/9 %42\n";
-        assert_eq!(parse_tmux_client_pane(data, "/dev/pts/4"), None);
+    fn parse_tmux_tty_keyed_value_returns_none_when_tty_missing() {
+        let data = "/dev/pts/2\t%11\n/dev/pts/9\t%42\n";
+        assert_eq!(parse_tmux_tty_keyed_value(data, "/dev/pts/4"), None);
     }
 
     #[test]
-    fn parse_tmux_client_session_prefers_exact_tty_match() {
-        let data = "$0\t/dev/pts/2\n$1\t/dev/pts/9\n";
+    fn parse_tmux_tty_keyed_value_preserves_names_with_spaces() {
+        let data = "/dev/pts/9\twork session\n";
         assert_eq!(
-            parse_tmux_client_session(data, "/dev/pts/9"),
-            Some("$1".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_tmux_client_session_returns_none_without_exact_tty_match() {
-        let data = "$3\t/dev/pts/1\n$3\t/dev/pts/5\n";
-        assert_eq!(parse_tmux_client_session(data, "/dev/pts/99"), None);
-    }
-
-    #[test]
-    fn parse_tmux_client_session_preserves_names_with_spaces() {
-        let data = "work session\t/dev/pts/9\n";
-        assert_eq!(
-            parse_tmux_client_session(data, "/dev/pts/9"),
+            parse_tmux_tty_keyed_value(data, "/dev/pts/9"),
             Some("work session".to_string())
         );
     }
 
     #[test]
-    fn parse_tmux_client_session_rejects_spaced_name_with_wrong_tty() {
-        let data = "work session\t/dev/pts/9\n";
-        assert_eq!(parse_tmux_client_session(data, "/dev/pts/4"), None);
-    }
-
-    #[test]
-    fn parse_tmux_client_session_ignores_malformed_rows_without_tab() {
-        let data = "work session /dev/pts/9\n";
-        assert_eq!(parse_tmux_client_session(data, "/dev/pts/9"), None);
+    fn parse_tmux_tty_keyed_value_rejects_spaced_value_with_wrong_tty() {
+        let data = "/dev/pts/9\twork session\n";
+        assert_eq!(parse_tmux_tty_keyed_value(data, "/dev/pts/4"), None);
     }
 
     #[test]
@@ -1574,24 +1519,6 @@ Window 0xABC123 -> terminal:
     fn parse_tmux_socket_from_environ_ignores_missing_tmux_entry() {
         let env = b"SHELL=/bin/zsh\0PATH=/usr/bin\0";
         assert_eq!(parse_tmux_socket_from_environ(env), None);
-    }
-
-    #[test]
-    fn parse_tmux_pane_by_tty_matches_exact_tty() {
-        let data = "/dev/pts/12 %3\n/dev/pts/13 %4\n";
-        assert_eq!(
-            parse_tmux_pane_by_tty(data, "/dev/pts/13"),
-            Some("%4".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_tmux_session_by_pane_tty_matches_exact_tty() {
-        let data = "/dev/pts/12 $3\n/dev/pts/13 $4\n";
-        assert_eq!(
-            parse_tmux_session_by_pane_tty(data, "/dev/pts/12"),
-            Some("$3".to_string())
-        );
     }
 
     #[test]
@@ -1723,5 +1650,93 @@ Window 0xABC123 -> terminal:
             normalize_kitty_listen_on("/tmp/kitty"),
             Some("unix:/tmp/kitty".to_string())
         );
+    }
+
+    #[test]
+    fn looks_like_host_port_accepts_valid_ipv4_with_port() {
+        assert!(looks_like_host_port("127.0.0.1:6666"));
+    }
+
+    #[test]
+    fn looks_like_host_port_accepts_valid_hostname_with_port() {
+        assert!(looks_like_host_port("localhost:8000"));
+    }
+
+    #[test]
+    fn looks_like_host_port_rejects_empty_host() {
+        assert!(!looks_like_host_port(":123"));
+    }
+
+    #[test]
+    fn looks_like_host_port_rejects_empty_port() {
+        assert!(!looks_like_host_port("foo:"));
+    }
+
+    #[test]
+    fn looks_like_host_port_rejects_non_numeric_port() {
+        assert!(!looks_like_host_port("foo:notaport"));
+    }
+
+    #[test]
+    fn looks_like_host_port_rejects_port_out_of_range() {
+        assert!(!looks_like_host_port("foo:99999"));
+    }
+
+    #[test]
+    fn looks_like_host_port_rejects_socket_path() {
+        assert!(!looks_like_host_port("/tmp/nvim.sock"));
+    }
+
+    #[test]
+    fn pid_has_ancestor_true_for_identical_pid() {
+        let me = std::process::id();
+        assert!(pid_has_ancestor(me, me, KITTY_PROBE_ANCESTRY_MAX_HOPS));
+    }
+
+    #[test]
+    fn pid_has_ancestor_true_for_real_parent() {
+        // The current test process's real PPid is a genuine ancestor one
+        // hop up; this mirrors the real-world case of a kitty ls foreground
+        // pid (child) reporting Hyprland's active window pid (parent, kitty
+        // itself) as an ancestor.
+        let me = std::process::id();
+        let status = fs::read_to_string("/proc/self/status")
+            .expect("own /proc/self/status should be readable");
+        let parent = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:"))
+            .and_then(|rest| rest.trim().parse::<u32>().ok())
+            .expect("own PPid should be parseable");
+
+        assert!(pid_has_ancestor(me, parent, KITTY_PROBE_ANCESTRY_MAX_HOPS));
+    }
+
+    #[test]
+    fn pid_has_ancestor_true_for_spawned_child() {
+        // A freshly spawned child process should report this test process
+        // as its ancestor.
+        let mut child = Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("sleep should spawn");
+        let child_pid = child.id();
+        let me = std::process::id();
+
+        assert!(pid_has_ancestor(
+            child_pid,
+            me,
+            KITTY_PROBE_ANCESTRY_MAX_HOPS
+        ));
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn pid_has_ancestor_false_for_unrelated_pid() {
+        // pid 1 (init) does not have this test process as an ancestor: the
+        // relationship only runs the other way.
+        let me = std::process::id();
+        assert!(!pid_has_ancestor(1, me, KITTY_PROBE_ANCESTRY_MAX_HOPS));
     }
 }

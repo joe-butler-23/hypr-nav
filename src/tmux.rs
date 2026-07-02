@@ -1,3 +1,4 @@
+use hypr_nav_lib::debug_log;
 use hypr_nav_lib::*;
 use std::env;
 use std::fs;
@@ -175,6 +176,57 @@ fn choose_entry_assist_pane(pane_rows: &str, direction: Direction) -> Option<Str
     inactive_candidate.or(active_candidate)
 }
 
+/// Try to navigate within a resolved tmux pane/session `target`: apply entry
+/// assist when appropriate, then fall through to edge-checked pane
+/// navigation. Returns true when navigation was handled (nav state saved),
+/// so the caller can `return` immediately.
+fn navigate_tmux_target(
+    target: &str,
+    direction: Direction,
+    move_dir: &str,
+    tty: &str,
+    socket_path: Option<&str>,
+    previous_state: Option<&NavState>,
+) -> bool {
+    debug_log!("tmux-nav", "resolved tmux navigation target={}", target);
+
+    let should_entry_assist = should_apply_entry_assist(previous_state, move_dir, tty);
+    if should_entry_assist {
+        if let Some(entry_pane) = find_entry_assist_pane(target, direction, socket_path) {
+            let current_pane = tmux_capture(
+                &["display-message", "-t", target, "-p", "#{pane_id}"],
+                socket_path,
+            );
+            if current_pane.as_deref() == Some(entry_pane.as_str()) {
+                debug_log!(
+                    "tmux-nav",
+                    "entry assist target {} already active; continuing",
+                    entry_pane
+                );
+            } else if select_tmux_pane(&entry_pane, socket_path) {
+                debug_log!(
+                    "tmux-nav",
+                    "entry assist selected opposite-edge pane target={}",
+                    entry_pane
+                );
+                save_nav_state("tmux_entry_assist", move_dir, Some(tty));
+                return true;
+            }
+        } else {
+            debug_log!("tmux-nav", "entry assist active but no edge pane found");
+        }
+    }
+
+    let at_edge = is_pane_at_edge(target, direction, socket_path);
+    if !at_edge && try_tmux_navigate(target, direction, socket_path) {
+        debug_log!("tmux-nav", "tmux navigation succeeded");
+        save_nav_state("tmux_select", move_dir, Some(tty));
+        return true;
+    }
+
+    false
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -193,31 +245,25 @@ fn main() {
         Some(path) => path,
         None => std::process::exit(1),
     };
-    debug_log(
+    debug_log!(
         "tmux-nav",
-        &format!(
-            "input={} move_dir={} tmux_dir={}",
-            args[1], move_dir, tmux_dir
-        ),
+        "input={} move_dir={} tmux_dir={}",
+        args[1],
+        move_dir,
+        tmux_dir
     );
     let previous_state = load_nav_state();
     let mut current_tty: Option<String> = None;
 
     if let Some((class, pid)) = get_active_window_info(&hypr_socket) {
         if is_terminal_window(&class, pid) {
-            debug_log(
-                "tmux-nav",
-                &format!("terminal active class={} pid={}", class, pid),
-            );
+            debug_log!("tmux-nav", "terminal active class={} pid={}", class, pid);
             let terminal = detect_terminal_runtime(pid, &class);
             current_tty = terminal.tty.clone();
 
             // Layer 1: Try nvim split navigation first
             if let Some(ref nvim) = terminal.nvim {
-                debug_log(
-                    "tmux-nav",
-                    &format!("nvim detected socket={}", nvim.socket_path),
-                );
+                debug_log!("tmux-nav", "nvim detected socket={}", nvim.socket_path);
 
                 // Nvim entry assist: on cross-window entry, jump to opposite edge
                 let nvim_tty = current_tty.as_deref().unwrap_or("");
@@ -225,25 +271,29 @@ fn main() {
                     && should_apply_entry_assist(previous_state.as_ref(), move_dir, nvim_tty)
                 {
                     if try_nvim_entry_assist(&nvim.socket_path, direction) {
-                        debug_log("tmux-nav", "nvim entry assist applied");
+                        debug_log!("tmux-nav", "nvim entry assist applied");
                         save_nav_state("nvim_entry_assist", move_dir, current_tty.as_deref());
                         return;
                     } else {
-                        debug_log(
+                        debug_log!(
                             "tmux-nav",
-                            "nvim entry assist not applicable (single window or failed)",
+                            "nvim entry assist not applicable (single window or failed)"
                         );
                     }
                 }
 
-                if !is_nvim_at_edge(&nvim.socket_path, direction) {
-                    if try_nvim_navigate(&nvim.socket_path, direction) {
-                        debug_log("tmux-nav", "nvim split navigation succeeded");
+                match nvim_navigate_or_edge(&nvim.socket_path, direction) {
+                    NvimNavOutcome::Moved => {
+                        debug_log!("tmux-nav", "nvim split navigation succeeded");
                         save_nav_state("nvim_wincmd", move_dir, current_tty.as_deref());
                         return;
                     }
-                } else {
-                    debug_log("tmux-nav", "nvim at edge, falling through");
+                    NvimNavOutcome::AtEdge => {
+                        debug_log!("tmux-nav", "nvim at edge, falling through");
+                    }
+                    NvimNavOutcome::Error => {
+                        debug_log!("tmux-nav", "nvim navigate error, falling through");
+                    }
                 }
             }
 
@@ -253,107 +303,43 @@ fn main() {
                 if let Some(pane) = find_tmux_client_pane(&runtime.tty, socket_path)
                     .or_else(|| find_tmux_pane_by_tty(&runtime.tty, socket_path))
                 {
-                    debug_log("tmux-nav", &format!("resolved tmux pane target={}", pane));
-                    let should_entry_assist =
-                        should_apply_entry_assist(previous_state.as_ref(), move_dir, &runtime.tty);
-                    if should_entry_assist {
-                        if let Some(entry_pane) =
-                            find_entry_assist_pane(&pane, direction, socket_path)
-                        {
-                            if entry_pane == pane {
-                                debug_log(
-                                    "tmux-nav",
-                                    &format!(
-                                        "entry assist target {} already active; continuing",
-                                        entry_pane
-                                    ),
-                                );
-                            } else if select_tmux_pane(&entry_pane, socket_path) {
-                                debug_log(
-                                    "tmux-nav",
-                                    &format!(
-                                        "entry assist selected opposite-edge pane target={}",
-                                        entry_pane
-                                    ),
-                                );
-                                save_nav_state("tmux_entry_assist", move_dir, Some(&runtime.tty));
-                                return;
-                            }
-                        } else {
-                            debug_log("tmux-nav", "entry assist active but no edge pane found");
-                        }
-                    }
-
-                    let at_edge = is_pane_at_edge(&pane, direction, socket_path);
-                    if !at_edge && try_tmux_navigate(&pane, direction, socket_path) {
-                        debug_log("tmux-nav", "tmux pane navigation succeeded");
-                        save_nav_state("tmux_select", move_dir, Some(&runtime.tty));
+                    if navigate_tmux_target(
+                        &pane,
+                        direction,
+                        move_dir,
+                        &runtime.tty,
+                        socket_path,
+                        previous_state.as_ref(),
+                    ) {
                         return;
                     }
                 } else if let Some(session) = find_tmux_session(&runtime.tty, socket_path)
                     .or_else(|| find_tmux_session_by_pane_tty(&runtime.tty, socket_path))
                 {
-                    debug_log(
-                        "tmux-nav",
-                        &format!("resolved tmux session fallback target={}", session),
-                    );
-                    let should_entry_assist =
-                        should_apply_entry_assist(previous_state.as_ref(), move_dir, &runtime.tty);
-                    if should_entry_assist {
-                        if let Some(entry_pane) =
-                            find_entry_assist_pane(&session, direction, socket_path)
-                        {
-                            let current_pane = tmux_capture(
-                                &["display-message", "-t", &session, "-p", "#{pane_id}"],
-                                socket_path,
-                            );
-                            if current_pane.as_deref() == Some(entry_pane.as_str()) {
-                                debug_log(
-                                    "tmux-nav",
-                                    &format!(
-                                        "entry assist target {} already active; continuing",
-                                        entry_pane
-                                    ),
-                                );
-                            } else if select_tmux_pane(&entry_pane, socket_path) {
-                                debug_log(
-                                    "tmux-nav",
-                                    &format!(
-                                        "entry assist selected opposite-edge pane target={}",
-                                        entry_pane
-                                    ),
-                                );
-                                save_nav_state("tmux_entry_assist", move_dir, Some(&runtime.tty));
-                                return;
-                            }
-                        } else {
-                            debug_log("tmux-nav", "entry assist active but no edge pane found");
-                        }
-                    }
-
-                    let at_edge = is_pane_at_edge(&session, direction, socket_path);
-                    if !at_edge && try_tmux_navigate(&session, direction, socket_path) {
-                        debug_log("tmux-nav", "tmux session navigation succeeded");
-                        save_nav_state("tmux_select", move_dir, Some(&runtime.tty));
+                    if navigate_tmux_target(
+                        &session,
+                        direction,
+                        move_dir,
+                        &runtime.tty,
+                        socket_path,
+                        previous_state.as_ref(),
+                    ) {
                         return;
                     }
                 } else {
-                    debug_log("tmux-nav", "no tmux pane/session target resolved");
+                    debug_log!("tmux-nav", "no tmux pane/session target resolved");
                 }
             } else {
-                debug_log("tmux-nav", "terminal active but no tmux runtime detected");
+                debug_log!("tmux-nav", "terminal active but no tmux runtime detected");
             }
         } else {
-            debug_log("tmux-nav", &format!("non-terminal active class={}", class));
+            debug_log!("tmux-nav", "non-terminal active class={}", class);
         }
     } else {
-        debug_log("tmux-nav", "active window info unavailable");
+        debug_log!("tmux-nav", "active window info unavailable");
     }
 
-    debug_log(
-        "tmux-nav",
-        &format!("fallback to hypr movefocus {}", move_dir),
-    );
+    debug_log!("tmux-nav", "fallback to hypr movefocus {}", move_dir);
     if hypr_dispatch(&hypr_socket, &format!("movefocus {}", move_dir)) {
         save_nav_state("hypr_movefocus", move_dir, current_tty.as_deref());
     } else {
@@ -367,15 +353,13 @@ fn try_tmux_navigate(target: &str, direction: Direction, socket_path: Option<&st
         ["select-pane", "-t", target, &direction_flag].as_ref(),
         socket_path,
     );
-    debug_log(
+    debug_log!(
         "tmux-nav",
-        &format!(
-            "tmux select-pane target={} dir={} socket={} -> {}",
-            target,
-            direction.tmux_flag(),
-            socket_path.unwrap_or("<default>"),
-            result
-        ),
+        "tmux select-pane target={} dir={} socket={} -> {}",
+        target,
+        direction.tmux_flag(),
+        socket_path.unwrap_or("<default>"),
+        result
     );
     result
 }

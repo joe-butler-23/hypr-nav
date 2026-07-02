@@ -63,17 +63,30 @@ impl HyprServer {
     }
 
     fn start_with_response(runtime_dir: &Path, sig: &str, active_response: &str) -> Self {
-        Self::start_with_options(runtime_dir, sig, active_response, false)
+        Self::start_with_options(runtime_dir, sig, active_response, "ok", false)
     }
 
     fn start_with_response_then_stop(runtime_dir: &Path, sig: &str, active_response: &str) -> Self {
-        Self::start_with_options(runtime_dir, sig, active_response, true)
+        Self::start_with_options(runtime_dir, sig, active_response, "ok", true)
+    }
+
+    /// Start a fake Hyprland server whose `dispatch ...` requests are
+    /// answered with `dispatch_response` instead of the default "ok" reply,
+    /// so tests can exercise a dispatch that Hyprland rejects.
+    fn start_with_dispatch_response(
+        runtime_dir: &Path,
+        sig: &str,
+        active_response: &str,
+        dispatch_response: &str,
+    ) -> Self {
+        Self::start_with_options(runtime_dir, sig, active_response, dispatch_response, false)
     }
 
     fn start_with_options(
         runtime_dir: &Path,
         sig: &str,
         active_response: &str,
+        dispatch_response: &str,
         stop_after_activewindow: bool,
     ) -> Self {
         let socket_dir = runtime_dir.join("hypr").join(sig);
@@ -89,6 +102,7 @@ impl HyprServer {
         let requests_clone = Arc::clone(&requests);
         let stop_clone = Arc::clone(&stop);
         let active_response = active_response.to_string();
+        let dispatch_response = dispatch_response.to_string();
         let socket_path_for_thread = socket_path.clone();
 
         let handle = thread::spawn(move || {
@@ -104,6 +118,8 @@ impl HyprServer {
                                 let _ = fs::remove_file(&socket_path_for_thread);
                                 stop_clone.store(true, Ordering::Relaxed);
                             }
+                        } else if request.starts_with("dispatch ") {
+                            let _ = stream.write_all(dispatch_response.as_bytes());
                         }
                         requests_clone
                             .lock()
@@ -230,15 +246,19 @@ exit 1
 set -euo pipefail
 echo "nvim $*" >> "$TEST_LOG"
 case " $* " in
-  *" --remote-expr winnr('\$') "*)
-    printf '%s\n' "${TEST_NVIM_WIN_COUNT:-2}"
-    exit 0
+  *"999wincmd"*)
+    if [[ "${TEST_NVIM_WIN_COUNT:-2}" -le 1 ]]; then
+      printf 'HYPRNAV_SINGLE\n'
+    fi
+    if [[ "${TEST_NVIM_SEND_OK:-1}" == "1" ]]; then
+      exit 0
+    fi
+    exit 1
     ;;
   *" --remote-expr "*)
-    printf '%s\n' "${TEST_NVIM_AT_EDGE:-0}"
-    exit 0
-    ;;
-  *" --remote-send "*)
+    if [[ "${TEST_NVIM_AT_EDGE:-0}" == "1" ]]; then
+      printf 'HYPRNAV_EDGE\n'
+    fi
     if [[ "${TEST_NVIM_SEND_OK:-1}" == "1" ]]; then
       exit 0
     fi
@@ -261,22 +281,22 @@ joined=" ${args[*]} "
 cmd="${args[0]-}"
 case "$cmd" in
   list-clients)
-    if [[ "$joined" == *" #{client_tty} #{pane_id} "* ]]; then
-      printf '%s %s\n' "${TEST_TTY:?}" "${TEST_TMUX_PANE_ID:-%1}"
+    if [[ "$joined" == *$'#{client_tty}\t#{pane_id}'* ]]; then
+      printf '%s\t%s\n' "${TEST_TTY:?}" "${TEST_TMUX_PANE_ID:-%1}"
       exit 0
     fi
-    if [[ "$joined" == *'#{client_session}'* && "$joined" == *'#{client_tty}'* ]]; then
-      printf '%s\t%s\n' "${TEST_TMUX_SESSION:-$1}" "${TEST_TTY:?}"
+    if [[ "$joined" == *$'#{client_tty}\t#{client_session}'* ]]; then
+      printf '%s\t%s\n' "${TEST_TTY:?}" "${TEST_TMUX_SESSION:-$1}"
       exit 0
     fi
     ;;
   list-panes)
-    if [[ "$joined" == *" #{pane_tty} #{pane_id} "* ]]; then
-      printf '%s %s\n' "${TEST_TTY:?}" "${TEST_TMUX_PANE_ID:-%1}"
+    if [[ "$joined" == *$'#{pane_tty}\t#{pane_id}'* ]]; then
+      printf '%s\t%s\n' "${TEST_TTY:?}" "${TEST_TMUX_PANE_ID:-%1}"
       exit 0
     fi
-    if [[ "$joined" == *" #{pane_tty} #{session_id} "* ]]; then
-      printf '%s %s\n' "${TEST_TTY:?}" "${TEST_TMUX_SESSION:-$1}"
+    if [[ "$joined" == *$'#{pane_tty}\t#{session_id}'* ]]; then
+      printf '%s\t%s\n' "${TEST_TTY:?}" "${TEST_TMUX_SESSION:-$1}"
       exit 0
     fi
     if [[ "$joined" == *" #{pane_id} #{pane_at_left} #{pane_at_right} #{pane_at_top} #{pane_at_bottom} #{pane_active} "* ]]; then
@@ -896,8 +916,12 @@ fn hypr_tmux_nav_prefers_nvim_before_tmux_and_hypr() {
     wait_for_log_line(&harness.log_path, "nvim --server");
     let log = harness.log_contents();
     assert!(
-        log.contains("--remote-send <C-w>h"),
-        "expected nvim navigation, got {log}"
+        log.contains("execute('wincmd h')"),
+        "expected mode-safe nvim navigation via execute(), got {log}"
+    );
+    assert!(
+        !log.contains("--remote-send"),
+        "nvim navigation must not use --remote-send (mode-unsafe), got {log}"
     );
     assert!(
         !log.contains("tmux select-pane"),
@@ -1028,5 +1052,208 @@ fn hypr_tmux_nav_exits_nonzero_when_hypr_fallback_dispatch_fails() {
     assert!(
         !nav_state_exists,
         "failed Hypr fallback should not record successful navigation state"
+    );
+}
+
+#[test]
+fn hypr_smart_close_logs_failed_hypr_dispatch_reply_and_exits_nonzero() {
+    let harness = Harness::new("sc-dfail-reply");
+    let close_log = harness.runtime_dir.join("close-events.jsonl");
+    let hypr = HyprServer::start_with_dispatch_response(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        "Window abc123 -> test window:\nclass: brave-browser\npid: 4242\n",
+        "Invalid dispatcher",
+    );
+
+    let mut envs = harness.envs();
+    envs.push((
+        "HYPR_CLOSE_LOG".to_string(),
+        close_log.display().to_string(),
+    ));
+
+    let status = run_binary_status("hypr-smart-close", &[], &envs);
+
+    assert!(
+        !status.success(),
+        "rejected Hypr dispatch reply should exit non-zero"
+    );
+    let requests = wait_for_request(&hypr, "dispatch closewindow address:0xabc123");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request == "dispatch closewindow address:0xabc123"),
+        "expected exact Hypr closewindow dispatch, got {requests:?}"
+    );
+    let events = fs::read_to_string(&close_log).expect("close log should be written");
+    assert!(
+        events.contains("\"event\":\"dispatch_closewindow_failed\""),
+        "{events}"
+    );
+    assert!(
+        !events.contains("\"event\":\"dispatch_closewindow\""),
+        "rejected dispatch reply must not be logged as a success, got {events}"
+    );
+}
+
+#[test]
+fn hypr_tmux_nav_exits_nonzero_when_hypr_fallback_dispatch_reply_is_rejected() {
+    let harness = Harness::new("tmux-dfail-reply");
+    let pid_file = harness.runtime_dir.join("terminal.pid");
+    let pty = PtyProcess::spawn(&pid_file, &[("TMUX", "/tmp/fake-tmux,4242,0")]);
+    let hypr = HyprServer::start_with_dispatch_response(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        &format!(
+            "Window abc123 -> test window:\nclass: termstub\npid: {}\n",
+            pty.pid
+        ),
+        "Invalid dispatcher",
+    );
+
+    let tty = fs::read_link(format!("/proc/{}/fd/0", pty.pid))
+        .expect("pty tty should be readable")
+        .display()
+        .to_string();
+
+    let mut envs = harness.envs();
+    envs.push(("TERMINAL".to_string(), "termstub".to_string()));
+    envs.push(("TEST_TTY".to_string(), tty));
+    envs.push(("TEST_TMUX_AT_EDGE".to_string(), "1".to_string()));
+
+    let status = run_binary_status("hypr-tmux-nav", &["down"], &envs);
+
+    assert!(
+        !status.success(),
+        "rejected Hypr dispatch reply should exit non-zero"
+    );
+    let requests = wait_for_request(&hypr, "dispatch movefocus d");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request == "dispatch movefocus d"),
+        "expected Hypr fallback dispatch, got {requests:?}"
+    );
+    let nav_state_exists = fs::read_dir(&harness.runtime_dir)
+        .expect("runtime dir should be readable")
+        .flatten()
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("hypr-nav-navstate")
+        });
+    assert!(
+        !nav_state_exists,
+        "rejected Hypr fallback dispatch reply should not record successful navigation state"
+    );
+}
+
+/// Regression test for the two-kitty-instance bug: `kitty @ ls`'s notion of
+/// the "focused" window belongs to whichever kitty process answered on the
+/// resolved control socket, which is not necessarily the Hyprland-active
+/// window. Here the kitty `ls` fixture reports a foreground pid that
+/// belongs to a *different*, unrelated process tree (simulating a second
+/// kitty instance's tmux client) than the Hyprland-active window pid. The
+/// ancestry check must reject that candidate and fall back to the real
+/// process-tree BFS rooted at the active pid, which has no tmux of its own,
+/// so navigation must fall through to the Hypr dispatch rather than
+/// operating on the unrelated instance's tmux session.
+#[test]
+fn hypr_tmux_nav_ignores_kitty_probe_pid_from_unrelated_process_tree() {
+    let harness = Harness::new("kitty-ancestry-reject");
+
+    let active_pid_file = harness.runtime_dir.join("active.pid");
+    let active_pty = PtyProcess::spawn(&active_pid_file, &[]);
+
+    let other_pid_file = harness.runtime_dir.join("other.pid");
+    let other_pty = PtyProcess::spawn(&other_pid_file, &[("TMUX", "/tmp/fake-tmux,4242,0")]);
+
+    let hypr = HyprServer::start(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        "kitty",
+        active_pty.pid,
+    );
+
+    let mut envs = harness.envs();
+    envs.push((
+        "TEST_KITTY_LS_JSON".to_string(),
+        format!(
+            r#"[{{"is_focused":true,"tabs":[{{"is_focused":true,"windows":[{{"is_focused":true,"pid":{}}}]}}]}}]"#,
+            other_pty.pid
+        ),
+    ));
+
+    let status = run_binary_status("hypr-tmux-nav", &["down"], &envs);
+    assert!(status.success(), "expected hypr-tmux-nav to exit cleanly");
+
+    let requests = wait_for_request(&hypr, "dispatch movefocus d");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request == "dispatch movefocus d"),
+        "expected Hypr fallback dispatch since the kitty-probe pid belongs to \
+         an unrelated process tree, got {requests:?}"
+    );
+    let log = harness.log_contents();
+    assert!(
+        !log.contains("tmux "),
+        "tmux must never be invoked once the ancestry check rejects the \
+         cross-instance kitty ls candidate, got {log}"
+    );
+}
+
+/// Companion positive case: the kitty `ls` fixture reports a foreground pid
+/// that genuinely descends from the Hyprland-active window's pid (mirroring
+/// the real relationship between a kitty window's own pid and the pid of
+/// the foreground process kitty reports inside it). The ancestry check must
+/// accept this candidate rather than over-rejecting legitimate multi-hop
+/// ancestry.
+#[test]
+fn hypr_tmux_nav_uses_kitty_probe_pid_that_is_descendant_of_active_window() {
+    let harness = Harness::new("kitty-ancestry-accept");
+
+    let pid_file = harness.runtime_dir.join("terminal.pid");
+    let pty = PtyProcess::spawn(&pid_file, &[("TMUX", "/tmp/fake-tmux,4242,0")]);
+    // `pty.pid` is the real tmux-client leaf process; its real parent is the
+    // `script` wrapper process, which stands in for the kitty window pid
+    // Hyprland reports as active.
+    let active_pid = pty.script_child.id();
+
+    let hypr = HyprServer::start(&harness.runtime_dir, &harness.hypr_sig, "kitty", active_pid);
+
+    let tty = fs::read_link(format!("/proc/{}/fd/0", pty.pid))
+        .expect("pty tty should be readable")
+        .display()
+        .to_string();
+
+    let mut envs = harness.envs();
+    envs.push(("TEST_TTY".to_string(), tty));
+    envs.push(("TEST_TMUX_AT_EDGE".to_string(), "0".to_string()));
+    envs.push(("TEST_TMUX_SELECT_OK".to_string(), "1".to_string()));
+    envs.push((
+        "TEST_KITTY_LS_JSON".to_string(),
+        format!(
+            r#"[{{"is_focused":true,"tabs":[{{"is_focused":true,"windows":[{{"is_focused":true,"pid":{}}}]}}]}}]"#,
+            pty.pid
+        ),
+    ));
+
+    run_binary("hypr-tmux-nav", &["down"], &envs);
+
+    let log = harness.log_contents();
+    assert!(
+        log.contains("tmux select-pane -t %1 -D"),
+        "expected tmux navigation via the accepted kitty-probe descendant \
+         pid, got {log}"
+    );
+    let requests = hypr.requests();
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.starts_with("dispatch ")),
+        "expected no Hypr fallback dispatch once the kitty probe's \
+         descendant pid resolved the terminal runtime, got {requests:?}"
     );
 }

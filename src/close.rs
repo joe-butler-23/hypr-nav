@@ -1,3 +1,4 @@
+use hypr_nav_lib::debug_log;
 use hypr_nav_lib::*;
 use serde_json::json;
 use std::env;
@@ -31,7 +32,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    debug_log("smart-close", "invoked");
+    debug_log!("smart-close", "invoked");
 
     let active = match get_active_window_snapshot(&hypr_socket) {
         Some(info) => info,
@@ -44,17 +45,19 @@ fn main() {
 
     if is_terminal_window(&active.class, active.pid) {
         if is_kitty_window(&active.class, active.pid) {
-            debug_log(
+            debug_log!(
                 "smart-close",
-                &format!(
-                    "kitty active class={} pid={}; closing captured hypr address={}",
-                    active.class, active.pid, active.address
-                ),
+                "kitty active class={} pid={}; closing captured hypr address={}",
+                active.class,
+                active.pid,
+                active.address
             );
         } else {
-            debug_log(
+            debug_log!(
                 "smart-close",
-                &format!("terminal active class={} pid={}", active.class, active.pid),
+                "terminal active class={} pid={}",
+                active.class,
+                active.pid
             );
             if let Some(runtime) = detect_tmux_runtime(active.pid, &active.class) {
                 let socket_path = runtime.socket_path.as_deref();
@@ -63,16 +66,14 @@ fn main() {
                 if let Some(session) = find_tmux_session(&runtime.tty, socket_path)
                     .or_else(|| find_tmux_session_by_pane_tty(&runtime.tty, socket_path))
                 {
-                    debug_log(
+                    debug_log!(
                         "smart-close",
-                        &format!(
-                            "resolved tmux session target={} pane={}",
-                            session,
-                            pane.as_deref().unwrap_or("<none>")
-                        ),
+                        "resolved tmux session target={} pane={}",
+                        session,
+                        pane.as_deref().unwrap_or("<none>")
                     );
                     if handle_tmux_close(&session, pane.as_deref(), &runtime.tty, socket_path) {
-                        debug_log("smart-close", "tmux close handled");
+                        debug_log!("smart-close", "tmux close handled");
                         log_close_event(
                             "tmux_close_handled",
                             json!({
@@ -85,9 +86,9 @@ fn main() {
                         );
                         return;
                     }
-                    debug_log(
+                    debug_log!(
                         "smart-close",
-                        "tmux close handling failed; refusing unsafe window fallback",
+                        "tmux close handling failed; refusing unsafe window fallback"
                     );
                     log_close_event(
                         "tmux_close_failed",
@@ -101,10 +102,7 @@ fn main() {
                     );
                     std::process::exit(1);
                 } else {
-                    debug_log(
-                        "smart-close",
-                        "tmux runtime detected but no session target resolved; refusing unsafe window fallback",
-                    );
+                    debug_log!("smart-close", "tmux runtime detected but no session target resolved; refusing unsafe window fallback");
                     log_close_event(
                         "tmux_target_unresolved",
                         json!({
@@ -116,22 +114,20 @@ fn main() {
                     std::process::exit(1);
                 }
             } else {
-                debug_log(
+                debug_log!(
                     "smart-close",
-                    "terminal active but no tmux runtime detected",
+                    "terminal active but no tmux runtime detected"
                 );
             }
         }
     } else {
-        debug_log(
-            "smart-close",
-            &format!("non-terminal active class={}", active.class),
-        );
+        debug_log!("smart-close", "non-terminal active class={}", active.class);
     }
 
-    debug_log(
+    debug_log!(
         "smart-close",
-        &format!("closing captured hypr address={}", active.address),
+        "closing captured hypr address={}",
+        active.address
     );
     let dispatcher = format!("closewindow address:{}", active.address);
     if hypr_dispatch(&hypr_socket, &dispatcher) {
@@ -261,15 +257,13 @@ fn handle_tmux_close(
             Some(TmuxCloseAction::DetachClient(target_tty)) => {
                 let detached =
                     tmux_status(["detach-client", "-t", &target_tty].as_ref(), socket_path);
-                debug_log(
+                debug_log!(
                     "smart-close",
-                    &format!(
-                        "tmux detach client_tty={} session={} socket={} -> {}",
-                        target_tty,
-                        session,
-                        socket_path.unwrap_or("<default>"),
-                        detached
-                    ),
+                    "tmux detach client_tty={} session={} socket={} -> {}",
+                    target_tty,
+                    session,
+                    socket_path.unwrap_or("<default>"),
+                    detached
                 );
                 return detached;
             }
@@ -277,9 +271,9 @@ fn handle_tmux_close(
                 return try_tmux_close_pane(&target_pane, socket_path);
             }
             None => {
-                debug_log(
+                debug_log!(
                     "smart-close",
-                    "tmux pane target unavailable; cannot safely kill pane",
+                    "tmux pane target unavailable; cannot safely kill pane"
                 );
             }
         }
@@ -289,14 +283,12 @@ fn handle_tmux_close(
 
 fn try_tmux_close_pane(pane: &str, socket_path: Option<&str>) -> bool {
     let killed = tmux_status(["kill-pane", "-t", pane].as_ref(), socket_path);
-    debug_log(
+    debug_log!(
         "smart-close",
-        &format!(
-            "tmux kill-pane target={} socket={} -> {}",
-            pane,
-            socket_path.unwrap_or("<default>"),
-            killed
-        ),
+        "tmux kill-pane target={} socket={} -> {}",
+        pane,
+        socket_path.unwrap_or("<default>"),
+        killed
     );
     killed
 }
