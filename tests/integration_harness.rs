@@ -275,6 +275,8 @@ struct Harness {
     runtime_dir: PathBuf,
     fake_bin_dir: PathBuf,
     log_path: PathBuf,
+    kitty_socket_uri: String,
+    _kitty_listener: UnixListener,
     hypr_sig: String,
 }
 
@@ -286,6 +288,10 @@ impl Harness {
         fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
         fs::create_dir_all(&fake_bin_dir).expect("bin dir should exist");
         let log_path = dir.path().join("commands.log");
+        let kitty_socket = runtime_dir.join("fake-kitty");
+        let kitty_socket_uri = format!("unix:{}", kitty_socket.display());
+        let kitty_listener =
+            UnixListener::bind(&kitty_socket).expect("fake kitty socket should bind");
         let hypr_sig = "test-instance".to_string();
 
         write_script(
@@ -416,6 +422,8 @@ exit 1
             runtime_dir,
             fake_bin_dir,
             log_path,
+            kitty_socket_uri,
+            _kitty_listener: kitty_listener,
             hypr_sig,
         }
     }
@@ -434,13 +442,17 @@ exit 1
                 "HYPRLAND_INSTANCE_SIGNATURE".to_string(),
                 self.hypr_sig.clone(),
             ),
-            (
-                "KITTY_LISTEN_ON".to_string(),
-                "unix:/tmp/fake-kitty".to_string(),
-            ),
+            ("KITTY_LISTEN_ON".to_string(), self.kitty_socket_uri.clone()),
             ("TEST_LOG".to_string(), self.log_path.display().to_string()),
             ("PATH".to_string(), path),
         ]
+    }
+
+    fn kitty_focus_log_line(&self, neighbor: &str) -> String {
+        format!(
+            "kitty @ --to {} focus-window --match neighbor:{}",
+            self.kitty_socket_uri, neighbor
+        )
     }
 
     fn log_contents(&self) -> String {
@@ -539,10 +551,7 @@ fn hypr_nav_prefers_kitty_before_hypr_fallback() {
 
     run_binary("hypr-nav", &["left"], &envs);
 
-    wait_for_log_line(
-        &harness.log_path,
-        "kitty @ --to unix:/tmp/fake-kitty focus-window --match neighbor:left",
-    );
+    wait_for_log_line(&harness.log_path, &harness.kitty_focus_log_line("left"));
     let requests = hypr.requests();
     assert!(requests.iter().any(|request| request == "activewindow"));
     assert!(
@@ -572,10 +581,7 @@ fn hypr_nav_detects_custom_class_kitty_by_pid() {
     let _ = kitty_process.kill();
     let _ = kitty_process.wait();
 
-    wait_for_log_line(
-        &harness.log_path,
-        "kitty @ --to unix:/tmp/fake-kitty focus-window --match neighbor:left",
-    );
+    wait_for_log_line(&harness.log_path, &harness.kitty_focus_log_line("left"));
     let requests = hypr.requests();
     assert!(requests.iter().any(|request| request == "activewindow"));
     assert!(

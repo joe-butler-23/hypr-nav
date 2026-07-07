@@ -83,6 +83,15 @@ impl Direction {
             Self::Down => "#{pane_at_bottom}",
         }
     }
+
+    pub fn herdr_direction(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Up => "up",
+            Self::Down => "down",
+        }
+    }
 }
 
 pub struct TmuxRuntime {
@@ -94,10 +103,17 @@ pub struct NvimRuntime {
     pub socket_path: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HerdrRuntime {
+    pub socket_path: Option<String>,
+    pub session: Option<String>,
+}
+
 pub struct TerminalRuntime {
     pub tty: Option<String>,
     pub tmux: Option<TmuxRuntime>,
     pub nvim: Option<NvimRuntime>,
+    pub herdr: Option<HerdrRuntime>,
 }
 
 pub struct ActiveWindowInfo {
@@ -111,6 +127,7 @@ pub struct ActiveWindowInfo {
 struct KittyProbeResult {
     tmux: Option<TmuxRuntime>,
     nvim_socket: Option<String>,
+    herdr: Option<HerdrRuntime>,
 }
 
 enum KittyRuntimeProbe {
@@ -223,8 +240,19 @@ pub fn is_kitty_window(class: &str, pid: u32) -> bool {
     class.to_ascii_lowercase().contains("kitty") || process_matches_terminal_name(pid, "kitty")
 }
 
+pub fn is_herdr_window(class: &str, pid: u32) -> bool {
+    class.to_ascii_lowercase().contains("herdr") || process_matches_terminal_name(pid, "herdr")
+}
+
 fn hypr_socket_names() -> [&'static str; 2] {
     [".socket.sock", "socket.sock"]
+}
+
+fn runtime_dir() -> String {
+    env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
+        let uid = env::var("UID").unwrap_or_else(|_| "unknown".to_string());
+        format!("/run/user/{uid}")
+    })
 }
 
 fn valid_hypr_socket_paths(dir: &Path) -> Vec<PathBuf> {
@@ -277,7 +305,7 @@ fn find_hyprland_socket_with(
 
 /// Find the Hyprland socket path
 pub fn find_hyprland_socket() -> Option<PathBuf> {
-    let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let xdg = runtime_dir();
     let sig = env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
     let socket = find_hyprland_socket_with(&xdg, sig.as_deref());
 
@@ -426,11 +454,212 @@ fn read_nvim_socket_from_environ(pid: u32) -> Option<String> {
     parse_nvim_socket_from_environ(&environ)
 }
 
+fn command_name(arg0: &str) -> &str {
+    Path::new(arg0)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(arg0)
+}
+
+fn parse_herdr_client_runtime_from_args(args: &[String]) -> Option<HerdrRuntime> {
+    let program = args.first()?;
+    let name = command_name(program);
+    if name != "herdr" {
+        return None;
+    }
+
+    match args.get(1).map(String::as_str) {
+        None | Some("client") => Some(HerdrRuntime::default()),
+        Some("session") if args.get(2).map(String::as_str) == Some("attach") => {
+            let session = args.get(3).filter(|value| !value.trim().is_empty())?;
+            Some(HerdrRuntime {
+                socket_path: None,
+                session: Some(session.to_string()),
+            })
+        }
+        _ => None,
+    }
+}
+
+pub fn parse_herdr_runtime_environ(environ: &[u8]) -> Option<HerdrRuntime> {
+    let mut runtime = HerdrRuntime::default();
+
+    for entry in environ.split(|b| *b == 0) {
+        if let Some(value) = entry.strip_prefix(b"HERDR_SOCKET_PATH=") {
+            if let Ok(raw) = std::str::from_utf8(value) {
+                let value = raw.trim();
+                if !value.is_empty() {
+                    runtime.socket_path = Some(value.to_string());
+                }
+            }
+        } else if let Some(value) = entry.strip_prefix(b"HERDR_SESSION=") {
+            if let Ok(raw) = std::str::from_utf8(value) {
+                let value = raw.trim();
+                if !value.is_empty() {
+                    runtime.session = Some(value.to_string());
+                }
+            }
+        }
+    }
+
+    if runtime.socket_path.is_none() && runtime.session.is_none() {
+        None
+    } else {
+        Some(runtime)
+    }
+}
+
+fn read_herdr_runtime_from_environ(pid: u32) -> Option<HerdrRuntime> {
+    let environ = fs::read(format!("/proc/{}/environ", pid)).ok()?;
+    parse_herdr_runtime_environ(&environ)
+}
+
+fn read_herdr_client_runtime_from_process(pid: u32) -> Option<HerdrRuntime> {
+    let cmdline = fs::read(format!("/proc/{}/cmdline", pid)).ok()?;
+    let args: Vec<String> = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .filter_map(|arg| std::str::from_utf8(arg).ok().map(ToOwned::to_owned))
+        .collect();
+    parse_herdr_client_runtime_from_args(&args)
+}
+
+fn merge_herdr_runtime(target: &mut HerdrRuntime, source: HerdrRuntime) {
+    if target.socket_path.is_none() {
+        target.socket_path = source.socket_path;
+    }
+    if target.session.is_none() {
+        target.session = source.session;
+    }
+}
+
 fn process_is_nvim(pid: u32) -> bool {
     if let Some(comm) = read_process_comm(pid) {
         return comm == "nvim";
     }
     false
+}
+
+pub fn parse_herdr_focus_changed(raw: &str) -> Option<bool> {
+    let parsed: Value = serde_json::from_str(raw.trim()).ok()?;
+    let changed = parsed
+        .get("changed")
+        .or_else(|| parsed.pointer("/result/navigate/changed"))
+        .or_else(|| parsed.pointer("/result/focus/changed"))?;
+    parse_json_boolish(changed)
+}
+
+pub fn herdr_config_dir() -> Option<PathBuf> {
+    if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
+        let trimmed = config_home.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed).join("herdr"));
+        }
+    }
+
+    let home = env::var("HOME").ok()?;
+    let trimmed = home.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed).join(".config").join("herdr"))
+    }
+}
+
+pub fn herdr_socket_path(runtime: &HerdrRuntime) -> Option<PathBuf> {
+    if let Some(socket_path) = runtime.socket_path.as_deref() {
+        return Some(PathBuf::from(socket_path));
+    }
+
+    let config_dir = herdr_config_dir()?;
+    match runtime.session.as_deref() {
+        Some(session) => Some(config_dir.join("sessions").join(session).join("herdr.sock")),
+        None => Some(config_dir.join("herdr.sock")),
+    }
+}
+
+pub fn herdr_request(
+    runtime: &HerdrRuntime,
+    id: &str,
+    method: &str,
+    params: Value,
+) -> Option<Value> {
+    let socket_path = herdr_socket_path(runtime)?;
+    let mut stream = match UnixStream::connect(&socket_path) {
+        Ok(stream) => stream,
+        Err(err) => {
+            debug_log!(
+                "herdr-rpc",
+                "socket connect failed path={} error={}",
+                socket_path.display(),
+                err
+            );
+            return None;
+        }
+    };
+
+    let request = serde_json::json!({
+        "id": id,
+        "method": method,
+        "params": params,
+    });
+    let encoded = match serde_json::to_string(&request) {
+        Ok(encoded) => encoded,
+        Err(err) => {
+            debug_log!("herdr-rpc", "request encoding failed: {}", err);
+            return None;
+        }
+    };
+
+    if stream.write_all(encoded.as_bytes()).is_err() || stream.write_all(b"\n").is_err() {
+        debug_log!("herdr-rpc", "request write failed");
+        return None;
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+
+    let mut response = String::new();
+    if let Err(err) = stream.read_to_string(&mut response) {
+        debug_log!("herdr-rpc", "response read failed: {}", err);
+        return None;
+    }
+
+    match serde_json::from_str::<Value>(response.trim()) {
+        Ok(value) if value.get("error").is_none() => Some(value),
+        Ok(value) => {
+            debug_log!("herdr-rpc", "request returned error: {}", value);
+            None
+        }
+        Err(err) => {
+            debug_log!("herdr-rpc", "response parse failed: {}", err);
+            None
+        }
+    }
+}
+
+fn parse_json_boolish(changed: &Value) -> Option<bool> {
+    if let Some(value) = changed.as_bool() {
+        Some(value)
+    } else if let Some(value) = changed.as_str() {
+        match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => Some(true),
+            "0" | "false" | "no" => Some(false),
+            _ => None,
+        }
+    } else if let Some(value) = changed.as_i64() {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    } else if let Some(value) = changed.as_u64() {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    } else {
+        None
+    }
 }
 
 fn find_nvim_listen_socket(pid: u32) -> Option<String> {
@@ -581,24 +810,94 @@ fn process_has_tmux(pid: u32) -> bool {
     false
 }
 
-fn kitty_socket_path() -> PathBuf {
-    let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(xdg).join("kitty")
+fn kitty_socket_path_for_pid(xdg_runtime_dir: &Path, pid: u32) -> PathBuf {
+    xdg_runtime_dir.join(format!("kitty-{pid}"))
 }
 
-pub fn kitty_control_socket_uri() -> Option<String> {
-    if let Ok(listen_on) = env::var("KITTY_LISTEN_ON") {
-        if let Some(uri) = normalize_kitty_listen_on(&listen_on) {
+fn unix_socket_uri_if_live(path: &Path) -> Option<String> {
+    let meta = fs::metadata(path).ok()?;
+    if meta.file_type().is_socket() {
+        Some(format!("unix:{}", path.display()))
+    } else {
+        None
+    }
+}
+
+fn kitty_endpoint_is_live(uri: &str) -> bool {
+    let Some(path) = uri.strip_prefix("unix:") else {
+        return true;
+    };
+    unix_socket_uri_if_live(Path::new(path)).is_some()
+}
+
+fn single_kitty_socket_uri(xdg_runtime_dir: &Path) -> Option<String> {
+    let entries = fs::read_dir(xdg_runtime_dir).ok()?;
+    let mut candidates = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("kitty-") {
+            if let Some(uri) = unix_socket_uri_if_live(&path) {
+                candidates.push(uri);
+            }
+        }
+    }
+
+    match candidates.len() {
+        1 => candidates.pop(),
+        0 => None,
+        _ => {
+            debug_log!(
+                "lib",
+                "multiple kitty sockets found under {}; refusing ambiguous fallback",
+                xdg_runtime_dir.display()
+            );
+            None
+        }
+    }
+}
+
+fn kitty_control_socket_uri_from(
+    active_pid: Option<u32>,
+    xdg_runtime_dir: &Path,
+    listen_on: Option<&str>,
+) -> Option<String> {
+    if let Some(pid) = active_pid {
+        if let Some(uri) = unix_socket_uri_if_live(&kitty_socket_path_for_pid(xdg_runtime_dir, pid))
+        {
             return Some(uri);
         }
     }
 
-    let kitty_socket = kitty_socket_path();
-    if kitty_socket.exists() {
-        Some(format!("unix:{}", kitty_socket.display()))
-    } else {
-        None
+    if let Some(listen_on) = listen_on {
+        if let Some(uri) = normalize_kitty_listen_on(listen_on) {
+            if kitty_endpoint_is_live(&uri) {
+                return Some(uri);
+            }
+            debug_log!("lib", "ignoring stale kitty endpoint {}", uri);
+        }
     }
+
+    if let Some(uri) = unix_socket_uri_if_live(&xdg_runtime_dir.join("kitty")) {
+        return Some(uri);
+    }
+
+    single_kitty_socket_uri(xdg_runtime_dir)
+}
+
+pub fn kitty_control_socket_uri() -> Option<String> {
+    let xdg = runtime_dir();
+    let listen_on = env::var("KITTY_LISTEN_ON").ok();
+    kitty_control_socket_uri_from(None, Path::new(&xdg), listen_on.as_deref())
+}
+
+pub fn kitty_control_socket_uri_for_pid(pid: u32) -> Option<String> {
+    let xdg = runtime_dir();
+    let listen_on = env::var("KITTY_LISTEN_ON").ok();
+    kitty_control_socket_uri_from(Some(pid), Path::new(&xdg), listen_on.as_deref())
 }
 
 fn normalize_kitty_listen_on(listen_on: &str) -> Option<String> {
@@ -719,7 +1018,7 @@ fn pid_has_ancestor(pid: u32, ancestor: u32, max_hops: usize) -> bool {
 const KITTY_PROBE_ANCESTRY_MAX_HOPS: usize = 15;
 
 fn detect_terminal_runtime_from_kitty(active_pid: u32) -> KittyRuntimeProbe {
-    let kitty_uri = match kitty_control_socket_uri() {
+    let kitty_uri = match kitty_control_socket_uri_for_pid(active_pid) {
         Some(uri) => uri,
         None => return KittyRuntimeProbe::Unavailable,
     };
@@ -782,6 +1081,7 @@ fn detect_terminal_runtime_from_kitty(active_pid: u32) -> KittyRuntimeProbe {
 
     let mut tmux_runtime: Option<TmuxRuntime> = None;
     let mut nvim_socket: Option<String> = None;
+    let mut herdr_runtime: Option<HerdrRuntime> = None;
 
     for pid in verified_pids {
         let tty = read_process_tty(pid);
@@ -829,30 +1129,46 @@ fn detect_terminal_runtime_from_kitty(active_pid: u32) -> KittyRuntimeProbe {
             }
         }
 
-        if tmux_runtime.is_some() && nvim_socket.is_some() {
+        if herdr_runtime.is_none() {
+            herdr_runtime = read_herdr_runtime_from_environ(pid)
+                .or_else(|| read_herdr_client_runtime_from_process(pid));
+            if let Some(ref runtime) = herdr_runtime {
+                debug_log!(
+                    "lib",
+                    "kitty-focused herdr runtime pid={} socket={:?} session={:?}",
+                    pid,
+                    runtime.socket_path,
+                    runtime.session
+                );
+            }
+        }
+
+        if tmux_runtime.is_some() && nvim_socket.is_some() && herdr_runtime.is_some() {
             break;
         }
     }
 
-    if tmux_runtime.is_some() || nvim_socket.is_some() {
+    if tmux_runtime.is_some() || nvim_socket.is_some() || herdr_runtime.is_some() {
         KittyRuntimeProbe::Found(KittyProbeResult {
             tmux: tmux_runtime,
             nvim_socket,
+            herdr: herdr_runtime,
         })
     } else {
         debug_log!(
             "lib",
-            "kitty-focused context found but no tmux or nvim in focused window"
+            "kitty-focused context found but no tmux, nvim, or herdr in focused window"
         );
         KittyRuntimeProbe::NothingFound
     }
 }
 
-/// Combined detection: find TTY, tmux presence, tmux socket, and nvim socket from process tree.
+/// Combined detection: find TTY plus nested runtime metadata from process tree.
 pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
     let mut tmux_result: Option<TmuxRuntime> = None;
     let mut nvim_result: Option<NvimRuntime> = None;
     let mut kitty_nvim_socket: Option<String> = None;
+    let mut herdr_result: Option<HerdrRuntime> = None;
 
     // Kitty fast-path: check focused PIDs for both tmux and nvim
     let kitty_by_class = class.to_ascii_lowercase().contains("kitty");
@@ -881,12 +1197,24 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
                 if let Some(ref socket) = result.nvim_socket {
                     debug_log!("lib", "nvim socket from kitty: {}", socket);
                 }
+                if let Some(ref runtime) = result.herdr {
+                    debug_log!(
+                        "lib",
+                        "herdr runtime from kitty socket={:?} session={:?}",
+                        runtime.socket_path,
+                        runtime.session
+                    );
+                }
                 tmux_result = result.tmux;
                 kitty_nvim_socket = result.nvim_socket;
+                herdr_result = result.herdr;
             }
             KittyRuntimeProbe::NothingFound => {
                 if probe_authoritative {
-                    debug_log!("lib", "kitty-focused probe confirms no tmux or nvim");
+                    debug_log!(
+                        "lib",
+                        "kitty-focused probe confirms no tmux, nvim, or herdr"
+                    );
                     kitty_authoritative_nothing = true;
                 } else {
                     debug_log!(
@@ -923,12 +1251,9 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
         }
 
         if kitty_authoritative_nothing {
-            // The kitty-focused probe already confirmed there is no tmux or
-            // nvim in the focused window, so the tmux/nvim results this BFS
-            // would otherwise compute are discarded below (guarded by
-            // `!kitty_authoritative_nothing`). Only `tty` is still used in
-            // this path, so skip the tmux/nvim probing work entirely and
-            // stop as soon as `tty` resolves.
+            // The kitty-focused probe already confirmed there is no nested
+            // runtime in the focused window. Only `tty` is still used in this
+            // path, so skip runtime probing and stop as soon as `tty` resolves.
             if tty.is_some() {
                 break;
             }
@@ -972,13 +1297,32 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
                 }
             }
 
+            if herdr_result.is_none() {
+                herdr_result = read_herdr_runtime_from_environ(current_pid)
+                    .or_else(|| read_herdr_client_runtime_from_process(current_pid));
+                if let Some(ref runtime) = herdr_result {
+                    debug_log!(
+                        "lib",
+                        "found herdr runtime from environ pid={} socket={:?} session={:?}",
+                        current_pid,
+                        runtime.socket_path,
+                        runtime.session
+                    );
+                }
+            }
+
             // Nothing left that can change the outcome: `tty` only changes
             // above while it is `None` or when `tmux_socket_path` is first
             // discovered (which only happens once, guarded by
             // `tmux_socket_path.is_none()`); `nvim_socket` only changes
             // while `None`. Once all four are resolved, no further pid can
             // alter any of them, so it's safe to stop walking.
-            if tty.is_some() && has_tmux && tmux_socket_path.is_some() && nvim_socket.is_some() {
+            if tty.is_some()
+                && has_tmux
+                && tmux_socket_path.is_some()
+                && nvim_socket.is_some()
+                && herdr_result.is_some()
+            {
                 break;
             }
         }
@@ -1035,6 +1379,59 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
         tty,
         tmux: tmux_result,
         nvim: nvim_result,
+        herdr: herdr_result,
+    }
+}
+
+pub fn detect_herdr_runtime(pid: u32, class: &str) -> Option<HerdrRuntime> {
+    const MAX_DEPTH: usize = 10;
+    let mut to_check: Vec<(u32, usize)> = vec![(pid, 0)];
+    let mut checked: HashSet<u32> = HashSet::new();
+    let mut result = HerdrRuntime::default();
+    let mut has_herdr_signal = is_herdr_window(class, pid);
+
+    while let Some((current_pid, depth)) = to_check.pop() {
+        if checked.contains(&current_pid) || depth > MAX_DEPTH {
+            continue;
+        }
+        checked.insert(current_pid);
+
+        if let Some(runtime) = read_herdr_runtime_from_environ(current_pid) {
+            has_herdr_signal = true;
+            merge_herdr_runtime(&mut result, runtime);
+            if result.socket_path.is_some() && result.session.is_some() {
+                break;
+            }
+        }
+
+        if let Some(runtime) = read_herdr_client_runtime_from_process(current_pid) {
+            has_herdr_signal = true;
+            merge_herdr_runtime(&mut result, runtime);
+            if result.socket_path.is_some() && result.session.is_some() {
+                break;
+            }
+        }
+
+        let children_path = format!("/proc/{}/task/{}/children", current_pid, current_pid);
+        if let Ok(children) = fs::read_to_string(&children_path) {
+            for child_str in children.split_whitespace() {
+                if let Ok(child_pid) = child_str.parse::<u32>() {
+                    to_check.push((child_pid, depth + 1));
+                }
+            }
+        }
+    }
+
+    if !has_herdr_signal || (result.socket_path.is_none() && result.session.is_none()) {
+        None
+    } else {
+        debug_log!(
+            "lib",
+            "herdr runtime socket={:?} session={:?}",
+            result.socket_path,
+            result.session
+        );
+        Some(result)
     }
 }
 
@@ -1444,6 +1841,14 @@ mod tests {
     }
 
     #[test]
+    fn direction_maps_to_herdr_direction() {
+        assert_eq!(Direction::Left.herdr_direction(), "left");
+        assert_eq!(Direction::Right.herdr_direction(), "right");
+        assert_eq!(Direction::Up.herdr_direction(), "up");
+        assert_eq!(Direction::Down.herdr_direction(), "down");
+    }
+
+    #[test]
     fn find_hyprland_socket_with_uses_unique_fallback_socket() {
         let runtime_dir = temp_test_dir("unique-socket");
         let hypr_dir = runtime_dir.join("hypr").join("instance-a");
@@ -1573,6 +1978,69 @@ Window 0xABC123 -> terminal:
     }
 
     #[test]
+    fn parse_herdr_runtime_environ_detects_socket_path() {
+        let env = b"SHELL=/bin/zsh\0HERDR_SOCKET_PATH=/tmp/herdr.sock\0";
+        assert_eq!(
+            parse_herdr_runtime_environ(env),
+            Some(HerdrRuntime {
+                socket_path: Some("/tmp/herdr.sock".to_string()),
+                session: None
+            })
+        );
+    }
+
+    #[test]
+    fn parse_herdr_runtime_environ_detects_session() {
+        let env = b"SHELL=/bin/zsh\0HERDR_SESSION=main\0";
+        assert_eq!(
+            parse_herdr_runtime_environ(env),
+            Some(HerdrRuntime {
+                socket_path: None,
+                session: Some("main".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn parse_herdr_client_runtime_from_args_detects_default_client() {
+        let args = vec!["/nix/store/example/bin/herdr".to_string()];
+        assert_eq!(
+            parse_herdr_client_runtime_from_args(&args),
+            Some(HerdrRuntime::default())
+        );
+    }
+
+    #[test]
+    fn parse_herdr_client_runtime_from_args_detects_named_session_attach() {
+        let args = vec![
+            "herdr".to_string(),
+            "session".to_string(),
+            "attach".to_string(),
+            "work".to_string(),
+        ];
+        assert_eq!(
+            parse_herdr_client_runtime_from_args(&args),
+            Some(HerdrRuntime {
+                socket_path: None,
+                session: Some("work".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn parse_herdr_client_runtime_from_args_rejects_non_client_commands() {
+        let status_args = vec![
+            "herdr".to_string(),
+            "status".to_string(),
+            "server".to_string(),
+        ];
+        let pane_args = vec!["herdr".to_string(), "pane".to_string(), "list".to_string()];
+
+        assert_eq!(parse_herdr_client_runtime_from_args(&status_args), None);
+        assert_eq!(parse_herdr_client_runtime_from_args(&pane_args), None);
+    }
+
+    #[test]
     fn parse_focused_kitty_pids_prefers_focused_os_window_tab_and_window() {
         let data = r#"
 [
@@ -1628,6 +2096,43 @@ Window 0xABC123 -> terminal:
 ]
 "#;
         assert_eq!(parse_focused_kitty_pids(data), None);
+    }
+
+    #[test]
+    fn parse_herdr_focus_changed_returns_true() {
+        assert_eq!(
+            parse_herdr_focus_changed(r#"{"changed": true}"#),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn parse_herdr_focus_changed_no_neighbor_is_false() {
+        assert_eq!(
+            parse_herdr_focus_changed(r#"{"changed": false}"#),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn parse_herdr_focus_changed_reads_cli_result_shape() {
+        let output = r#"{
+            "id": "cli:pane:focus",
+            "result": {
+                "focus": {
+                    "changed": true,
+                    "focused_pane_id": "w3:p9"
+                },
+                "type": "pane_focus_direction"
+            }
+        }"#;
+
+        assert_eq!(parse_herdr_focus_changed(output), Some(true));
+    }
+
+    #[test]
+    fn parse_herdr_focus_changed_invalid_output_is_none() {
+        assert_eq!(parse_herdr_focus_changed("not-json"), None);
     }
 
     #[test]
@@ -1700,6 +2205,65 @@ Window 0xABC123 -> terminal:
         assert_eq!(
             normalize_kitty_listen_on("/tmp/kitty"),
             Some("unix:/tmp/kitty".to_string())
+        );
+    }
+
+    #[test]
+    fn kitty_control_socket_uri_prefers_active_pid_socket_over_stale_env() {
+        let runtime_dir = temp_test_dir("kitty-active-pid");
+        let stale_socket = runtime_dir.join("kitty-1111");
+        let active_socket = runtime_dir.join("kitty-4242");
+        let _listener =
+            UnixListener::bind(&active_socket).expect("active kitty socket should bind");
+
+        assert_eq!(
+            kitty_control_socket_uri_from(
+                Some(4242),
+                &runtime_dir,
+                Some(&format!("unix:{}", stale_socket.display()))
+            ),
+            Some(format!("unix:{}", active_socket.display()))
+        );
+    }
+
+    #[test]
+    fn kitty_control_socket_uri_ignores_stale_env_and_uses_single_live_socket() {
+        let runtime_dir = temp_test_dir("kitty-stale-env");
+        let stale_socket = runtime_dir.join("kitty-stale");
+        let live_socket = runtime_dir.join("kitty-4242");
+        let _listener = UnixListener::bind(&live_socket).expect("kitty socket should bind");
+
+        assert_eq!(
+            kitty_control_socket_uri_from(
+                None,
+                &runtime_dir,
+                Some(&format!("unix:{}", stale_socket.display()))
+            ),
+            Some(format!("unix:{}", live_socket.display()))
+        );
+    }
+
+    #[test]
+    fn kitty_control_socket_uri_rejects_ambiguous_generic_sockets() {
+        let runtime_dir = temp_test_dir("kitty-ambiguous");
+        let first = runtime_dir.join("kitty-1111");
+        let second = runtime_dir.join("kitty-2222");
+        let _first_listener = UnixListener::bind(&first).expect("first socket should bind");
+        let _second_listener = UnixListener::bind(&second).expect("second socket should bind");
+
+        assert_eq!(
+            kitty_control_socket_uri_from(None, &runtime_dir, None),
+            None
+        );
+    }
+
+    #[test]
+    fn kitty_control_socket_uri_preserves_tcp_env() {
+        let runtime_dir = temp_test_dir("kitty-tcp-env");
+
+        assert_eq!(
+            kitty_control_socket_uri_from(None, &runtime_dir, Some("tcp:127.0.0.1:5000")),
+            Some("tcp:127.0.0.1:5000".to_string())
         );
     }
 

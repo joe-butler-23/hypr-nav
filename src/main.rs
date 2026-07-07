@@ -30,12 +30,12 @@ fn main() {
     );
 
     // Check if active window is Kitty
-    if is_kitty_active(&hypr_socket) {
+    if let Some(active_pid) = active_kitty_pid(&hypr_socket) {
         debug_log!(
             "kitty-nav",
             "kitty is active, trying kitty neighbor navigation"
         );
-        if let Some(kitty_socket_uri) = kitty_control_socket_uri() {
+        if let Some(kitty_socket_uri) = kitty_control_socket_uri_for_pid(active_pid) {
             let neighbor_match = format!("neighbor:{}", kitty_dir);
             let status = Command::new("kitty")
                 .args([
@@ -71,7 +71,7 @@ fn main() {
     }
 }
 
-fn is_kitty_active(socket_path: &std::path::PathBuf) -> bool {
+fn active_kitty_pid(socket_path: &std::path::PathBuf) -> Option<u32> {
     if let Some((class, pid)) = get_active_window_info(socket_path) {
         let is_kitty = is_kitty_window(&class, pid);
         debug_log!(
@@ -81,7 +81,7 @@ fn is_kitty_active(socket_path: &std::path::PathBuf) -> bool {
             pid,
             is_kitty
         );
-        return is_kitty;
+        return is_kitty.then_some(pid);
     }
-    false
+    None
 }

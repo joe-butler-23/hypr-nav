@@ -1,5 +1,6 @@
 use hypr_nav_lib::debug_log;
 use hypr_nav_lib::*;
+use serde_json::{json, Value};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -23,7 +24,10 @@ fn now_millis() -> u128 {
 }
 
 fn nav_state_path() -> PathBuf {
-    let base = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let base = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
+        let uid = current_uid_string();
+        format!("/run/user/{uid}")
+    });
     let uid = current_uid_string();
     PathBuf::from(base).join(format!("{}-{}", NAV_STATE_FILE, uid))
 }
@@ -227,6 +231,74 @@ fn navigate_tmux_target(
     false
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HerdrNavigateOutcome {
+    Moved,
+    AtEdge,
+}
+
+fn parse_herdr_host_navigate_response(value: &Value) -> Option<HerdrNavigateOutcome> {
+    let navigate = value.pointer("/result/navigate")?;
+    if navigate
+        .get("at_edge")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Some(HerdrNavigateOutcome::AtEdge);
+    }
+    if navigate
+        .get("changed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Some(HerdrNavigateOutcome::Moved);
+    }
+    None
+}
+
+fn herdr_host_navigate(
+    direction: Direction,
+    runtime: &HerdrRuntime,
+) -> Option<HerdrNavigateOutcome> {
+    let response = herdr_request(
+        runtime,
+        "hypr-nav:host:navigate",
+        "host.navigate",
+        json!({ "direction": direction.herdr_direction() }),
+    )?;
+    let outcome = parse_herdr_host_navigate_response(&response)?;
+    debug_log!(
+        "tmux-nav",
+        "herdr host.navigate direction={} outcome={:?}",
+        direction.herdr_direction(),
+        outcome
+    );
+    Some(outcome)
+}
+
+fn prepare_herdr_entry(direction: Direction, runtime: &HerdrRuntime) -> bool {
+    let prepared = herdr_request(
+        runtime,
+        "hypr-nav:host:prepare-entry",
+        "host.prepare_entry",
+        json!({ "direction": direction.herdr_direction() }),
+    )
+    .and_then(|response| {
+        response
+            .pointer("/result/entry/armed")
+            .and_then(Value::as_bool)
+    })
+    .unwrap_or(false);
+    if prepared {
+        debug_log!(
+            "tmux-nav",
+            "herdr host.prepare_entry armed direction={}",
+            direction.herdr_direction()
+        );
+    }
+    prepared
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -254,6 +326,7 @@ fn main() {
     );
     let previous_state = load_nav_state();
     let mut current_tty: Option<String> = None;
+    let mut herdr_entry_runtime: Option<HerdrRuntime> = None;
 
     if let Some((class, pid)) = get_active_window_info(&hypr_socket) {
         if is_terminal_window(&class, pid) {
@@ -297,7 +370,31 @@ fn main() {
                 }
             }
 
-            // Layer 2: Try tmux pane navigation
+            // Layer 2: Try Herdr pane navigation for a Herdr client running in the terminal
+            if let Some(ref runtime) = terminal.herdr {
+                herdr_entry_runtime = Some(runtime.clone());
+                debug_log!(
+                    "tmux-nav",
+                    "herdr runtime socket={:?} session={:?} detected in terminal class={}",
+                    runtime.socket_path,
+                    runtime.session,
+                    class
+                );
+                match herdr_host_navigate(direction, runtime) {
+                    Some(HerdrNavigateOutcome::Moved) => {
+                        debug_log!("tmux-nav", "herdr host navigation applied");
+                        return;
+                    }
+                    Some(HerdrNavigateOutcome::AtEdge) => {
+                        debug_log!("tmux-nav", "herdr host at edge; falling through");
+                    }
+                    None => {
+                        debug_log!("tmux-nav", "herdr host navigation failed; falling through");
+                    }
+                }
+            }
+
+            // Layer 3: Try tmux pane navigation
             if let Some(runtime) = terminal.tmux {
                 let socket_path = runtime.socket_path.as_deref();
                 if let Some(pane) = find_tmux_client_pane(&runtime.tty, socket_path)
@@ -332,6 +429,27 @@ fn main() {
             } else {
                 debug_log!("tmux-nav", "terminal active but no tmux runtime detected");
             }
+        } else if let Some(runtime) = detect_herdr_runtime(pid, &class) {
+            herdr_entry_runtime = Some(runtime.clone());
+            debug_log!(
+                "tmux-nav",
+                "herdr runtime socket={:?} session={:?} detected for class={}",
+                runtime.socket_path,
+                runtime.session,
+                class
+            );
+            match herdr_host_navigate(direction, &runtime) {
+                Some(HerdrNavigateOutcome::Moved) => {
+                    debug_log!("tmux-nav", "herdr host navigation applied");
+                    return;
+                }
+                Some(HerdrNavigateOutcome::AtEdge) => {
+                    debug_log!("tmux-nav", "herdr host at edge; falling through");
+                }
+                None => {
+                    debug_log!("tmux-nav", "herdr host navigation failed; falling through");
+                }
+            }
         } else {
             debug_log!("tmux-nav", "non-terminal active class={}", class);
         }
@@ -340,9 +458,18 @@ fn main() {
     }
 
     debug_log!("tmux-nav", "fallback to hypr movefocus {}", move_dir);
+    let default_runtime = HerdrRuntime::default();
+    let herdr_prepared = prepare_herdr_entry(
+        direction,
+        herdr_entry_runtime.as_ref().unwrap_or(&default_runtime),
+    );
     let action = HyprDispatch::MoveFocus(direction);
     if hypr_dispatch_action(&hypr_socket, &action) {
-        save_nav_state("hypr_movefocus", move_dir, current_tty.as_deref());
+        if herdr_prepared {
+            save_nav_state("herdr_prepare_entry", move_dir, current_tty.as_deref());
+        } else {
+            save_nav_state("hypr_movefocus", move_dir, current_tty.as_deref());
+        }
     } else {
         std::process::exit(1);
     }
@@ -369,7 +496,9 @@ fn try_tmux_navigate(target: &str, direction: Direction, socket_path: Option<&st
 mod tests {
     use hypr_nav_lib::Direction;
 
-    use super::choose_entry_assist_pane;
+    use super::{
+        choose_entry_assist_pane, parse_herdr_host_navigate_response, HerdrNavigateOutcome,
+    };
 
     #[test]
     fn choose_entry_assist_pane_prefers_inactive_opposite_edge() {
@@ -411,5 +540,54 @@ mod tests {
             choose_entry_assist_pane(rows, Direction::Right),
             Some("%0".to_string())
         );
+    }
+
+    #[test]
+    fn herdr_host_navigate_response_reports_moved() {
+        let response = serde_json::json!({
+            "result": {
+                "type": "host_navigate",
+                "navigate": {
+                    "changed": true,
+                    "at_edge": false,
+                    "focused_pane_id": "w1:p2"
+                }
+            }
+        });
+
+        assert_eq!(
+            parse_herdr_host_navigate_response(&response),
+            Some(HerdrNavigateOutcome::Moved)
+        );
+    }
+
+    #[test]
+    fn herdr_host_navigate_response_reports_at_edge() {
+        let response = serde_json::json!({
+            "result": {
+                "type": "host_navigate",
+                "navigate": {
+                    "changed": false,
+                    "at_edge": true,
+                    "focused_pane_id": "w1:p1"
+                }
+            }
+        });
+
+        assert_eq!(
+            parse_herdr_host_navigate_response(&response),
+            Some(HerdrNavigateOutcome::AtEdge)
+        );
+    }
+
+    #[test]
+    fn herdr_host_navigate_response_rejects_missing_contract() {
+        let response = serde_json::json!({
+            "result": {
+                "type": "ok"
+            }
+        });
+
+        assert_eq!(parse_herdr_host_navigate_response(&response), None);
     }
 }

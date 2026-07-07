@@ -1,6 +1,6 @@
 use hypr_nav_lib::debug_log;
 use hypr_nav_lib::*;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -42,6 +42,61 @@ fn main() {
         }
     };
     log_close_event("active_captured", active_window_json(&active));
+
+    if let Some(runtime) = active_herdr_runtime(&active) {
+        match herdr_host_close(&runtime) {
+            Some(HerdrCloseOutcome::ClosePane | HerdrCloseOutcome::CloseTab) => {
+                debug_log!("smart-close", "herdr host close handled");
+                log_close_event(
+                    "herdr_close_handled",
+                    json!({
+                        "active": active_window_json(&active),
+                        "socket": runtime.socket_path,
+                        "session": runtime.session,
+                    }),
+                );
+                return;
+            }
+            Some(HerdrCloseOutcome::CloseHost) => {
+                debug_log!("smart-close", "herdr host requested outer window close");
+                log_close_event(
+                    "herdr_close_host",
+                    json!({
+                        "active": active_window_json(&active),
+                        "socket": runtime.socket_path,
+                        "session": runtime.session,
+                    }),
+                );
+            }
+            Some(HerdrCloseOutcome::Noop) => {
+                debug_log!("smart-close", "herdr host close returned noop");
+                log_close_event(
+                    "herdr_close_noop",
+                    json!({
+                        "active": active_window_json(&active),
+                        "socket": runtime.socket_path,
+                        "session": runtime.session,
+                    }),
+                );
+                return;
+            }
+            None => {
+                debug_log!(
+                    "smart-close",
+                    "herdr runtime detected but host.close failed"
+                );
+                log_close_event(
+                    "herdr_close_failed",
+                    json!({
+                        "active": active_window_json(&active),
+                        "socket": runtime.socket_path,
+                        "session": runtime.session,
+                    }),
+                );
+                std::process::exit(1);
+            }
+        }
+    }
 
     if is_terminal_window(&active.class, active.pid) {
         if is_kitty_window(&active.class, active.pid) {
@@ -159,6 +214,33 @@ fn active_window_json(active: &ActiveWindowInfo) -> serde_json::Value {
         "title": &active.title,
         "focus_history_id": active.focus_history_id,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HerdrCloseOutcome {
+    ClosePane,
+    CloseTab,
+    CloseHost,
+    Noop,
+}
+
+fn active_herdr_runtime(active: &ActiveWindowInfo) -> Option<HerdrRuntime> {
+    detect_herdr_runtime(active.pid, &active.class)
+}
+
+fn herdr_host_close(runtime: &HerdrRuntime) -> Option<HerdrCloseOutcome> {
+    let response = herdr_request(runtime, "hypr-close:host:close", "host.close", json!({}))?;
+    parse_herdr_host_close_response(&response)
+}
+
+fn parse_herdr_host_close_response(value: &Value) -> Option<HerdrCloseOutcome> {
+    match value.pointer("/result/close/action")?.as_str()? {
+        "close_pane" => Some(HerdrCloseOutcome::ClosePane),
+        "close_tab" => Some(HerdrCloseOutcome::CloseTab),
+        "close_host" => Some(HerdrCloseOutcome::CloseHost),
+        "noop" => Some(HerdrCloseOutcome::Noop),
+        _ => None,
+    }
 }
 
 fn log_close_event(event: &str, detail: serde_json::Value) {
@@ -349,5 +431,50 @@ mod tests {
     fn returns_none_when_kill_pane_target_missing() {
         let info = session_info(false, 3, 1);
         assert_eq!(choose_tmux_close_action(&info, None, "/dev/pts/3"), None);
+    }
+
+    #[test]
+    fn parses_herdr_host_close_pane_action() {
+        let response = json!({
+            "result": {
+                "type": "host_close",
+                "close": {
+                    "action": "close_pane"
+                }
+            }
+        });
+
+        assert_eq!(
+            parse_herdr_host_close_response(&response),
+            Some(HerdrCloseOutcome::ClosePane)
+        );
+    }
+
+    #[test]
+    fn parses_herdr_host_close_host_action() {
+        let response = json!({
+            "result": {
+                "type": "host_close",
+                "close": {
+                    "action": "close_host"
+                }
+            }
+        });
+
+        assert_eq!(
+            parse_herdr_host_close_response(&response),
+            Some(HerdrCloseOutcome::CloseHost)
+        );
+    }
+
+    #[test]
+    fn rejects_missing_herdr_host_close_contract() {
+        let response = json!({
+            "result": {
+                "type": "ok"
+            }
+        });
+
+        assert_eq!(parse_herdr_host_close_response(&response), None);
     }
 }
