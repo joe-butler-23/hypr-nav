@@ -18,6 +18,7 @@ enum TmuxCloseAction {
 }
 
 fn main() {
+    start_watchdog();
     let args: Vec<String> = env::args().collect();
     if args.len() != 1 {
         eprintln!("usage: hypr-smart-close");
@@ -43,8 +44,18 @@ fn main() {
     };
     log_close_event("active_captured", active_window_json(&active));
 
-    if let Some(runtime) = active_herdr_runtime(&active) {
-        match herdr_host_close(&runtime) {
+    let terminal_window = is_terminal_window(&active.class, active.pid);
+    let terminal = terminal_window.then(|| detect_terminal_runtime(active.pid, &active.class));
+    let nonterminal_herdr = (!terminal_window)
+        .then(|| detect_herdr_runtime(active.pid, &active.class))
+        .flatten();
+
+    if let Some(runtime) = terminal
+        .as_ref()
+        .and_then(|runtime| runtime.herdr.as_ref())
+        .or(nonterminal_herdr.as_ref())
+    {
+        match herdr_host_close(runtime) {
             Some(HerdrCloseOutcome::ClosePane | HerdrCloseOutcome::CloseTab) => {
                 debug_log!("smart-close", "herdr host close handled");
                 log_close_event(
@@ -98,7 +109,7 @@ fn main() {
         }
     }
 
-    if is_terminal_window(&active.class, active.pid) {
+    if let Some(terminal) = terminal {
         if is_kitty_window(&active.class, active.pid) {
             debug_log!(
                 "smart-close",
@@ -114,27 +125,30 @@ fn main() {
                 active.class,
                 active.pid
             );
-            if let Some(runtime) = detect_tmux_runtime(active.pid, &active.class) {
+            if let Some(runtime) = terminal.tmux {
                 let socket_path = runtime.socket_path.as_deref();
-                let pane = find_tmux_client_pane(&runtime.tty, socket_path)
-                    .or_else(|| find_tmux_pane_by_tty(&runtime.tty, socket_path));
-                if let Some(session) = find_tmux_session(&runtime.tty, socket_path)
-                    .or_else(|| find_tmux_session_by_pane_tty(&runtime.tty, socket_path))
+                if let Some(target) = find_tmux_client_target(&runtime.tty, socket_path)
+                    .or_else(|| find_tmux_pane_target(&runtime.tty, socket_path))
                 {
                     debug_log!(
                         "smart-close",
                         "resolved tmux session target={} pane={}",
-                        session,
-                        pane.as_deref().unwrap_or("<none>")
+                        target.session,
+                        target.pane
                     );
-                    if handle_tmux_close(&session, pane.as_deref(), &runtime.tty, socket_path) {
+                    if handle_tmux_close(
+                        &target.session,
+                        Some(&target.pane),
+                        &runtime.tty,
+                        socket_path,
+                    ) {
                         debug_log!("smart-close", "tmux close handled");
                         log_close_event(
                             "tmux_close_handled",
                             json!({
                                 "active": active_window_json(&active),
-                                "session": session,
-                                "pane": pane,
+                                "session": target.session,
+                                "pane": target.pane,
                                 "tty": runtime.tty,
                                 "socket": socket_path,
                             }),
@@ -149,8 +163,8 @@ fn main() {
                         "tmux_close_failed",
                         json!({
                             "active": active_window_json(&active),
-                            "session": session,
-                            "pane": pane,
+                            "session": target.session,
+                            "pane": target.pane,
                             "tty": runtime.tty,
                             "socket": socket_path,
                         }),
@@ -222,10 +236,6 @@ enum HerdrCloseOutcome {
     CloseTab,
     CloseHost,
     Noop,
-}
-
-fn active_herdr_runtime(active: &ActiveWindowInfo) -> Option<HerdrRuntime> {
-    detect_herdr_runtime(active.pid, &active.class)
 }
 
 fn herdr_host_close(runtime: &HerdrRuntime) -> Option<HerdrCloseOutcome> {

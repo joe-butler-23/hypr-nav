@@ -24,26 +24,9 @@ fn now_millis() -> u128 {
 }
 
 fn nav_state_path() -> PathBuf {
-    let base = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
-        let uid = current_uid_string();
-        format!("/run/user/{uid}")
-    });
+    let base = runtime_dir();
     let uid = current_uid_string();
     PathBuf::from(base).join(format!("{}-{}", NAV_STATE_FILE, uid))
-}
-
-fn current_uid_string() -> String {
-    if let Ok(status) = fs::read_to_string("/proc/self/status") {
-        for line in status.lines() {
-            if line.starts_with("Uid:") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() > 1 {
-                    return parts[1].to_string();
-                }
-            }
-        }
-    }
-    env::var("UID").unwrap_or_else(|_| "unknown".to_string())
 }
 
 fn load_nav_state() -> Option<NavState> {
@@ -186,6 +169,7 @@ fn choose_entry_assist_pane(pane_rows: &str, direction: Direction) -> Option<Str
 /// so the caller can `return` immediately.
 fn navigate_tmux_target(
     target: &str,
+    at_edge: bool,
     direction: Direction,
     move_dir: &str,
     tty: &str,
@@ -221,7 +205,6 @@ fn navigate_tmux_target(
         }
     }
 
-    let at_edge = is_pane_at_edge(target, direction, socket_path);
     if !at_edge && try_tmux_navigate(target, direction, socket_path) {
         debug_log!("tmux-nav", "tmux navigation succeeded");
         save_nav_state("tmux_select", move_dir, Some(tty));
@@ -300,6 +283,7 @@ fn prepare_herdr_entry(direction: Direction, runtime: &HerdrRuntime) -> bool {
 }
 
 fn main() {
+    start_watchdog();
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("usage: hypr-tmux-nav <h|j|k|l|left|right|up|down>");
@@ -397,24 +381,12 @@ fn main() {
             // Layer 3: Try tmux pane navigation
             if let Some(runtime) = terminal.tmux {
                 let socket_path = runtime.socket_path.as_deref();
-                if let Some(pane) = find_tmux_client_pane(&runtime.tty, socket_path)
-                    .or_else(|| find_tmux_pane_by_tty(&runtime.tty, socket_path))
+                if let Some(target) = find_tmux_client_target(&runtime.tty, socket_path)
+                    .or_else(|| find_tmux_pane_target(&runtime.tty, socket_path))
                 {
                     if navigate_tmux_target(
-                        &pane,
-                        direction,
-                        move_dir,
-                        &runtime.tty,
-                        socket_path,
-                        previous_state.as_ref(),
-                    ) {
-                        return;
-                    }
-                } else if let Some(session) = find_tmux_session(&runtime.tty, socket_path)
-                    .or_else(|| find_tmux_session_by_pane_tty(&runtime.tty, socket_path))
-                {
-                    if navigate_tmux_target(
-                        &session,
+                        &target.pane,
+                        target.at_edge(direction),
                         direction,
                         move_dir,
                         &runtime.tty,

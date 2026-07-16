@@ -7,6 +7,10 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
+
+const IO_TIMEOUT: Duration = Duration::from_millis(500);
+const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Known terminal emulator window classes
 pub const KNOWN_TERMINALS: &[&str] = &["kitty"];
@@ -75,15 +79,6 @@ impl Direction {
         }
     }
 
-    fn tmux_edge_flag(self) -> &'static str {
-        match self {
-            Self::Left => "#{pane_at_left}",
-            Self::Right => "#{pane_at_right}",
-            Self::Up => "#{pane_at_top}",
-            Self::Down => "#{pane_at_bottom}",
-        }
-    }
-
     pub fn herdr_direction(self) -> &'static str {
         match self {
             Self::Left => "left",
@@ -97,6 +92,23 @@ impl Direction {
 pub struct TmuxRuntime {
     pub tty: String,
     pub socket_path: Option<String>,
+}
+
+pub struct TmuxClientTarget {
+    pub pane: String,
+    pub session: String,
+    edges: [bool; 4],
+}
+
+impl TmuxClientTarget {
+    pub fn at_edge(&self, direction: Direction) -> bool {
+        self.edges[match direction {
+            Direction::Left => 0,
+            Direction::Right => 1,
+            Direction::Up => 2,
+            Direction::Down => 3,
+        }]
+    }
 }
 
 pub struct NvimRuntime {
@@ -125,6 +137,7 @@ pub struct ActiveWindowInfo {
 }
 
 struct KittyProbeResult {
+    tty: Option<String>,
     tmux: Option<TmuxRuntime>,
     nvim_socket: Option<String>,
     herdr: Option<HerdrRuntime>,
@@ -248,11 +261,33 @@ fn hypr_socket_names() -> [&'static str; 2] {
     [".socket.sock", "socket.sock"]
 }
 
-fn runtime_dir() -> String {
-    env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
-        let uid = env::var("UID").unwrap_or_else(|_| "unknown".to_string());
-        format!("/run/user/{uid}")
-    })
+pub fn current_uid_string() -> String {
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        if let Some(uid) = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|value| value.split_whitespace().next())
+        {
+            return uid.to_string();
+        }
+    }
+    env::var("UID").unwrap_or_else(|_| "unknown".to_string())
+}
+
+pub fn runtime_dir() -> String {
+    env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| format!("/run/user/{}", current_uid_string()))
+}
+
+fn configure_socket(stream: &UnixStream) -> bool {
+    stream.set_read_timeout(Some(IO_TIMEOUT)).is_ok()
+        && stream.set_write_timeout(Some(IO_TIMEOUT)).is_ok()
+}
+
+pub fn start_watchdog() {
+    std::thread::spawn(|| {
+        std::thread::sleep(WATCHDOG_TIMEOUT);
+        std::process::exit(124);
+    });
 }
 
 fn valid_hypr_socket_paths(dir: &Path) -> Vec<PathBuf> {
@@ -366,6 +401,7 @@ fn parse_active_window_info(response: &str) -> Option<ActiveWindowInfo> {
 /// Get active window address, class and PID in a single Hyprland query.
 pub fn get_active_window_snapshot(socket_path: &PathBuf) -> Option<ActiveWindowInfo> {
     let mut stream = UnixStream::connect(socket_path).ok()?;
+    configure_socket(&stream).then_some(())?;
     stream.write_all(b"activewindow").ok()?;
     stream.shutdown(std::net::Shutdown::Write).ok()?;
 
@@ -533,6 +569,32 @@ fn merge_herdr_runtime(target: &mut HerdrRuntime, source: HerdrRuntime) {
     }
 }
 
+fn herdr_runtime_for_client(pid: u32) -> Option<HerdrRuntime> {
+    let mut runtime = read_herdr_client_runtime_from_process(pid)?;
+    if let Some(environment) = read_herdr_runtime_from_environ(pid) {
+        merge_herdr_runtime(&mut runtime, environment);
+    }
+    Some(runtime)
+}
+
+fn process_children(pid: u32) -> Vec<u32> {
+    let mut children = Vec::new();
+    let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else {
+        return children;
+    };
+    for task in tasks.flatten() {
+        let path = task.path().join("children");
+        if let Ok(contents) = fs::read_to_string(path) {
+            children.extend(
+                contents
+                    .split_whitespace()
+                    .filter_map(|child| child.parse::<u32>().ok()),
+            );
+        }
+    }
+    children
+}
+
 fn process_is_nvim(pid: u32) -> bool {
     if let Some(comm) = read_process_comm(pid) {
         return comm == "nvim";
@@ -597,6 +659,10 @@ pub fn herdr_request(
             return None;
         }
     };
+    if !configure_socket(&stream) {
+        debug_log!("herdr-rpc", "socket timeout setup failed");
+        return None;
+    }
 
     let request = serde_json::json!({
         "id": id,
@@ -716,7 +782,9 @@ fn looks_like_host_port(socket: &str) -> bool {
 
 fn nvim_socket_is_live(socket: &str) -> bool {
     if std::path::Path::new(socket).exists() {
-        return UnixStream::connect(socket).is_ok();
+        return UnixStream::connect(socket)
+            .map(|stream| configure_socket(&stream))
+            .unwrap_or(false);
     }
 
     // Some setups expose nvim remote endpoints as host:port.
@@ -1082,22 +1150,26 @@ fn detect_terminal_runtime_from_kitty(active_pid: u32) -> KittyRuntimeProbe {
     let mut tmux_runtime: Option<TmuxRuntime> = None;
     let mut nvim_socket: Option<String> = None;
     let mut herdr_runtime: Option<HerdrRuntime> = None;
+    let mut tty: Option<String> = None;
 
     for pid in verified_pids {
-        let tty = read_process_tty(pid);
+        let process_tty = read_process_tty(pid);
+        if tty.is_none() {
+            tty = process_tty.clone();
+        }
         let tmux_sock = read_tmux_socket_from_environ(pid);
         let has_tmux = tmux_sock.is_some() || process_has_tmux(pid);
         debug_log!(
             "lib",
             "kitty-focused candidate pid={} tty={} tmux_socket={} has_tmux={}",
             pid,
-            tty.as_deref().unwrap_or("<none>"),
+            process_tty.as_deref().unwrap_or("<none>"),
             tmux_sock.as_deref().unwrap_or("<none>"),
             has_tmux
         );
 
         if tmux_runtime.is_none() && has_tmux {
-            if let Some(ref tty) = tty {
+            if let Some(ref tty) = process_tty {
                 tmux_runtime = Some(TmuxRuntime {
                     tty: tty.clone(),
                     socket_path: tmux_sock,
@@ -1130,8 +1202,7 @@ fn detect_terminal_runtime_from_kitty(active_pid: u32) -> KittyRuntimeProbe {
         }
 
         if herdr_runtime.is_none() {
-            herdr_runtime = read_herdr_runtime_from_environ(pid)
-                .or_else(|| read_herdr_client_runtime_from_process(pid));
+            herdr_runtime = herdr_runtime_for_client(pid);
             if let Some(ref runtime) = herdr_runtime {
                 debug_log!(
                     "lib",
@@ -1150,6 +1221,7 @@ fn detect_terminal_runtime_from_kitty(active_pid: u32) -> KittyRuntimeProbe {
 
     if tmux_runtime.is_some() || nvim_socket.is_some() || herdr_runtime.is_some() {
         KittyRuntimeProbe::Found(KittyProbeResult {
+            tty,
             tmux: tmux_runtime,
             nvim_socket,
             herdr: herdr_runtime,
@@ -1169,6 +1241,8 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
     let mut nvim_result: Option<NvimRuntime> = None;
     let mut kitty_nvim_socket: Option<String> = None;
     let mut herdr_result: Option<HerdrRuntime> = None;
+    let mut kitty_tty: Option<String> = None;
+    let mut kitty_probe_found = false;
 
     // Kitty fast-path: check focused PIDs for both tmux and nvim
     let kitty_by_class = class.to_ascii_lowercase().contains("kitty");
@@ -1186,6 +1260,7 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
         }
         match detect_terminal_runtime_from_kitty(pid) {
             KittyRuntimeProbe::Found(result) => {
+                kitty_probe_found = true;
                 if let Some(ref tmux) = result.tmux {
                     debug_log!(
                         "lib",
@@ -1205,6 +1280,7 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
                         runtime.session
                     );
                 }
+                kitty_tty = result.tty;
                 tmux_result = result.tmux;
                 kitty_nvim_socket = result.nvim_socket;
                 herdr_result = result.herdr;
@@ -1228,13 +1304,17 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
     }
 
     // BFS through process tree to find TTY, tmux, and nvim
-    let mut tty: Option<String> = None;
+    let mut tty: Option<String> = kitty_tty;
     let mut has_tmux = false;
     let mut tmux_socket_path: Option<String> = None;
     let mut nvim_socket: Option<String> = kitty_nvim_socket;
 
     const MAX_DEPTH: usize = 10;
-    let mut to_check: Vec<(u32, usize)> = vec![(pid, 0)];
+    let mut to_check: Vec<(u32, usize)> = if kitty_probe_found {
+        Vec::new()
+    } else {
+        vec![(pid, 0)]
+    };
     let mut checked: HashSet<u32> = HashSet::new();
 
     while let Some((current_pid, depth)) = to_check.pop() {
@@ -1298,8 +1378,7 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
             }
 
             if herdr_result.is_none() {
-                herdr_result = read_herdr_runtime_from_environ(current_pid)
-                    .or_else(|| read_herdr_client_runtime_from_process(current_pid));
+                herdr_result = herdr_runtime_for_client(current_pid);
                 if let Some(ref runtime) = herdr_result {
                     debug_log!(
                         "lib",
@@ -1327,15 +1406,11 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
             }
         }
 
-        // Get children - try fast path first
-        let children_path = format!("/proc/{}/task/{}/children", current_pid, current_pid);
-        if let Ok(children) = fs::read_to_string(&children_path) {
-            for child_str in children.split_whitespace() {
-                if let Ok(child_pid) = child_str.parse::<u32>() {
-                    to_check.push((child_pid, depth + 1));
-                }
-            }
-        }
+        to_check.extend(
+            process_children(current_pid)
+                .into_iter()
+                .map(|child_pid| (child_pid, depth + 1)),
+        );
     }
 
     // Build tmux result from BFS if not already found via kitty
@@ -1387,8 +1462,12 @@ pub fn detect_herdr_runtime(pid: u32, class: &str) -> Option<HerdrRuntime> {
     const MAX_DEPTH: usize = 10;
     let mut to_check: Vec<(u32, usize)> = vec![(pid, 0)];
     let mut checked: HashSet<u32> = HashSet::new();
+    let class_is_herdr = is_herdr_window(class, pid);
+    if !class_is_herdr && !is_terminal_window(class, pid) {
+        return None;
+    }
     let mut result = HerdrRuntime::default();
-    let mut has_herdr_signal = is_herdr_window(class, pid);
+    let mut has_herdr_client = false;
 
     while let Some((current_pid, depth)) = to_check.pop() {
         if checked.contains(&current_pid) || depth > MAX_DEPTH {
@@ -1396,33 +1475,27 @@ pub fn detect_herdr_runtime(pid: u32, class: &str) -> Option<HerdrRuntime> {
         }
         checked.insert(current_pid);
 
-        if let Some(runtime) = read_herdr_runtime_from_environ(current_pid) {
-            has_herdr_signal = true;
+        if let Some(runtime) = herdr_runtime_for_client(current_pid) {
+            has_herdr_client = true;
             merge_herdr_runtime(&mut result, runtime);
             if result.socket_path.is_some() && result.session.is_some() {
                 break;
             }
         }
 
-        if let Some(runtime) = read_herdr_client_runtime_from_process(current_pid) {
-            has_herdr_signal = true;
-            merge_herdr_runtime(&mut result, runtime);
-            if result.socket_path.is_some() && result.session.is_some() {
-                break;
+        if class_is_herdr {
+            if let Some(runtime) = read_herdr_runtime_from_environ(current_pid) {
+                merge_herdr_runtime(&mut result, runtime);
             }
         }
-
-        let children_path = format!("/proc/{}/task/{}/children", current_pid, current_pid);
-        if let Ok(children) = fs::read_to_string(&children_path) {
-            for child_str in children.split_whitespace() {
-                if let Ok(child_pid) = child_str.parse::<u32>() {
-                    to_check.push((child_pid, depth + 1));
-                }
-            }
-        }
+        to_check.extend(
+            process_children(current_pid)
+                .into_iter()
+                .map(|child_pid| (child_pid, depth + 1)),
+        );
     }
 
-    if !has_herdr_signal || (result.socket_path.is_none() && result.session.is_none()) {
+    if !class_is_herdr && !has_herdr_client {
         None
     } else {
         debug_log!(
@@ -1512,142 +1585,61 @@ pub fn tmux_status(args: &[&str], socket_path: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-/// Run a tmux `list-*` command whose `-F` format emits `<tty>\t<value>` rows,
-/// and return the value for the row whose tty matches exactly.
-///
-/// `label` is used only for diagnostic logging, so each thin wrapper below
-/// keeps its own name in `debug_log` output.
-fn tmux_lookup_by_tty(
-    label: &str,
-    list_args: &[&str],
-    tty: &str,
-    socket_path: Option<&str>,
-) -> Option<String> {
-    let output = tmux_command(socket_path)
-        .args(list_args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        debug_log!(
-            "lib",
-            "{} tty={} socket={} -> <none> (tmux error)",
-            label,
-            tty,
-            socket_path.unwrap_or("<default>")
-        );
-        return None;
+fn parse_tmux_client_target(rows: &str, tty: &str) -> Option<TmuxClientTarget> {
+    for line in rows.lines() {
+        let parts: Vec<_> = line.split('\t').map(str::trim).collect();
+        if parts.len() != 7 || parts[0] != tty {
+            continue;
+        }
+        return Some(TmuxClientTarget {
+            pane: parts[1].to_string(),
+            session: parts[2].to_string(),
+            edges: [
+                parts[3] == "1",
+                parts[4] == "1",
+                parts[5] == "1",
+                parts[6] == "1",
+            ],
+        });
     }
-
-    let rows = String::from_utf8_lossy(&output.stdout);
-    let value = parse_tmux_tty_keyed_value(&rows, tty);
-    debug_log!(
-        "lib",
-        "{} tty={} socket={} -> {}",
-        label,
-        tty,
-        socket_path.unwrap_or("<default>"),
-        value.as_deref().unwrap_or("<none>")
-    );
-    value
+    None
 }
 
-/// Parse TAB-delimited `<tty>\t<value>` rows (tty first) and return the value
-/// for the row whose tty matches exactly. Rows without a tab are malformed
-/// and skipped; the value is returned verbatim (including internal spaces,
-/// e.g. tmux session names) since only the tab is a field separator.
+#[cfg(test)]
 fn parse_tmux_tty_keyed_value(rows: &str, tty: &str) -> Option<String> {
     for line in rows.lines() {
         if let Some((key, value)) = line.split_once('\t') {
-            let key = key.trim();
-            let value = value.trim();
-            if tty == key {
-                return Some(value.to_string());
+            if key.trim() == tty {
+                return Some(value.trim().to_string());
             }
         }
     }
     None
 }
 
-/// Find the tmux session for a given TTY
-pub fn find_tmux_session(tty: &str, socket_path: Option<&str>) -> Option<String> {
-    tmux_lookup_by_tty(
-        "find_tmux_session",
-        &["list-clients", "-F", "#{client_tty}\t#{client_session}"],
-        tty,
+pub fn find_tmux_client_target(tty: &str, socket_path: Option<&str>) -> Option<TmuxClientTarget> {
+    let rows = tmux_capture(
+        &[
+            "list-clients",
+            "-F",
+            "#{client_tty}\t#{pane_id}\t#{client_session}\t#{pane_at_left}\t#{pane_at_right}\t#{pane_at_top}\t#{pane_at_bottom}",
+        ],
         socket_path,
-    )
+    )?;
+    parse_tmux_client_target(&rows, tty)
 }
 
-/// Find the active tmux pane for a given client TTY
-pub fn find_tmux_client_pane(tty: &str, socket_path: Option<&str>) -> Option<String> {
-    tmux_lookup_by_tty(
-        "find_tmux_client_pane",
-        &["list-clients", "-F", "#{client_tty}\t#{pane_id}"],
-        tty,
+pub fn find_tmux_pane_target(tty: &str, socket_path: Option<&str>) -> Option<TmuxClientTarget> {
+    let rows = tmux_capture(
+        &[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_tty}\t#{pane_id}\t#{session_id}\t#{pane_at_left}\t#{pane_at_right}\t#{pane_at_top}\t#{pane_at_bottom}",
+        ],
         socket_path,
-    )
-}
-
-/// Find pane by pane tty when we discovered a pane PTY rather than client TTY.
-pub fn find_tmux_pane_by_tty(tty: &str, socket_path: Option<&str>) -> Option<String> {
-    tmux_lookup_by_tty(
-        "find_tmux_pane_by_tty",
-        &["list-panes", "-a", "-F", "#{pane_tty}\t#{pane_id}"],
-        tty,
-        socket_path,
-    )
-}
-
-/// Find session by pane tty when we discovered a pane PTY rather than client TTY.
-pub fn find_tmux_session_by_pane_tty(tty: &str, socket_path: Option<&str>) -> Option<String> {
-    tmux_lookup_by_tty(
-        "find_tmux_session_by_pane_tty",
-        &["list-panes", "-a", "-F", "#{pane_tty}\t#{session_id}"],
-        tty,
-        socket_path,
-    )
-}
-
-/// Check if the active pane in the session is at the edge in the given direction
-pub fn is_pane_at_edge(session: &str, direction: Direction, socket_path: Option<&str>) -> bool {
-    let output = tmux_command(socket_path)
-        .args([
-            "display-message",
-            "-t",
-            session,
-            "-p",
-            direction.tmux_edge_flag(),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-
-    if let Ok(out) = output {
-        if out.status.success() {
-            let result = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let at_edge = result == "1";
-            debug_log!(
-                "lib",
-                "is_pane_at_edge target={} dir={} socket={} -> {}",
-                session,
-                direction.tmux_flag(),
-                socket_path.unwrap_or("<default>"),
-                at_edge
-            );
-            return at_edge;
-        }
-    }
-    debug_log!(
-        "lib",
-        "is_pane_at_edge target={} dir={} socket={} -> false (tmux error)",
-        session,
-        direction.tmux_flag(),
-        socket_path.unwrap_or("<default>")
-    );
-    false
+    )?;
+    parse_tmux_client_target(&rows, tty)
 }
 
 pub struct TmuxSessionInfo {
@@ -1763,6 +1755,10 @@ impl HyprDispatch {
 pub fn hypr_dispatch(socket_path: &PathBuf, dispatcher: &str) -> bool {
     match UnixStream::connect(socket_path) {
         Ok(mut stream) => {
+            if !configure_socket(&stream) {
+                debug_log!("lib", "hypr dispatch timeout setup failed");
+                return false;
+            }
             let cmd = format!("dispatch {}", dispatcher);
             debug_log!("lib", "hypr dispatch: {}", cmd);
             if let Err(err) = stream.write_all(cmd.as_bytes()) {

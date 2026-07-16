@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -10,7 +10,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct TestDir {
     path: PathBuf,
@@ -235,6 +235,88 @@ impl Drop for HyprServer {
     }
 }
 
+struct HerdrServer {
+    socket_path: PathBuf,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl HerdrServer {
+    fn start(config_home: &Path, response: &str) -> Self {
+        Self::start_inner(config_home, Some(response))
+    }
+
+    fn start_wedged(config_home: &Path) -> Self {
+        Self::start_inner(config_home, None)
+    }
+
+    fn start_inner(config_home: &Path, response: Option<&str>) -> Self {
+        let socket_dir = config_home.join("herdr");
+        fs::create_dir_all(&socket_dir).expect("herdr config dir should be created");
+        let socket_path = socket_dir.join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).expect("herdr socket should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("herdr socket should be nonblocking");
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let requests_clone = Arc::clone(&requests);
+        let stop_clone = Arc::clone(&stop);
+        let response = response.map(str::to_string);
+        let handle = thread::spawn(move || {
+            while !stop_clone.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = String::new();
+                        let _ = stream.read_to_string(&mut request);
+                        requests_clone
+                            .lock()
+                            .expect("requests lock should succeed")
+                            .push(request.trim().to_string());
+                        if let Some(response) = response.as_deref() {
+                            let _ = stream.write_all(response.as_bytes());
+                        } else {
+                            while !stop_clone.load(Ordering::Relaxed) {
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            socket_path,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .expect("requests lock should succeed")
+            .clone()
+    }
+}
+
+impl Drop for HerdrServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = UnixStream::connect(&self.socket_path);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 struct PtyProcess {
     script_child: Child,
     pid: u32,
@@ -358,20 +440,21 @@ if [[ "${args[0]-}" == "-S" ]]; then
   args=("${args[@]:2}")
 fi
 echo "tmux ${args[*]}" >> "$TEST_LOG"
+if [[ "${TEST_TMUX_SLEEP:-0}" == "1" ]]; then
+  while :; do sleep 1; done
+fi
 joined=" ${args[*]} "
 cmd="${args[0]-}"
 case "$cmd" in
   list-clients)
-    if [[ "$joined" == *$'#{client_tty}\t#{pane_id}'* ]]; then
-      printf '%s\t%s\n' "${TEST_TTY:?}" "${TEST_TMUX_PANE_ID:-%1}"
-      exit 0
-    fi
-    if [[ "$joined" == *$'#{client_tty}\t#{client_session}'* ]]; then
-      printf '%s\t%s\n' "${TEST_TTY:?}" "${TEST_TMUX_SESSION:-$1}"
-      exit 0
-    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${TEST_TTY:?}" "${TEST_TMUX_PANE_ID:-%1}" "${TEST_TMUX_SESSION:-$1}" "${TEST_TMUX_AT_LEFT:-${TEST_TMUX_AT_EDGE:-0}}" "${TEST_TMUX_AT_RIGHT:-${TEST_TMUX_AT_EDGE:-0}}" "${TEST_TMUX_AT_TOP:-${TEST_TMUX_AT_EDGE:-0}}" "${TEST_TMUX_AT_BOTTOM:-${TEST_TMUX_AT_EDGE:-0}}"
+    exit 0
     ;;
   list-panes)
+    if [[ "$joined" == *$'#{pane_tty}\t#{pane_id}\t#{session_id}\t#{pane_at_left}'* ]]; then
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${TEST_TTY:?}" "${TEST_TMUX_PANE_ID:-%1}" "${TEST_TMUX_SESSION:-$1}" "${TEST_TMUX_AT_LEFT:-1}" "${TEST_TMUX_AT_RIGHT:-0}" "${TEST_TMUX_AT_TOP:-1}" "${TEST_TMUX_AT_BOTTOM:-1}"
+      exit 0
+    fi
     if [[ "$joined" == *$'#{pane_tty}\t#{pane_id}'* ]]; then
       printf '%s\t%s\n' "${TEST_TTY:?}" "${TEST_TMUX_PANE_ID:-%1}"
       exit 0
@@ -504,14 +587,21 @@ fn wait_for_request(server: &HyprServer, needle: &str) -> Vec<String> {
 }
 
 fn spawn_process_named(name: &str) -> Child {
-    Command::new("bash")
+    spawn_process_named_with_env(name, &[])
+}
+
+fn spawn_process_named_with_env(name: &str, envs: &[(&str, &str)]) -> Child {
+    let mut command = Command::new("bash");
+    command
         .arg0(name)
         .args(["-c", "while :; do sleep 1; done"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("named process should spawn")
+        .stderr(Stdio::null());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.spawn().expect("named process should spawn")
 }
 
 fn run_binary_status(bin_name: &str, args: &[&str], envs: &[(String, String)]) -> ExitStatus {
@@ -534,6 +624,17 @@ fn run_binary_status(bin_name: &str, args: &[&str], envs: &[(String, String)]) -
 fn run_binary(bin_name: &str, args: &[&str], envs: &[(String, String)]) {
     let status = run_binary_status(bin_name, args, envs);
     assert!(status.success(), "binary exited with {status}");
+}
+
+fn wait_for_herdr_request(server: &HerdrServer, method: &str) -> Vec<String> {
+    for _ in 0..100 {
+        let requests = server.requests();
+        if requests.iter().any(|request| request.contains(method)) {
+            return requests;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    server.requests()
 }
 
 #[test]
@@ -673,8 +774,8 @@ fn hypr_smart_close_closes_captured_kitty_hypr_window_only() {
     );
     let log = harness.log_contents();
     assert!(
-        !log.contains("kitty @"),
-        "smart-close must not use global kitty remote control, got {log}"
+        !log.contains("close-window"),
+        "smart-close must not remotely close a kitty window, got {log}"
     );
 }
 
@@ -1494,4 +1595,255 @@ fn hypr_tmux_nav_falls_back_to_legacy_when_lua_dispatch_fails() {
         lua_idx < legacy_idx,
         "Lua attempt should come before legacy fallback"
     );
+}
+
+#[test]
+fn hypr_smart_close_detaches_named_tmux_session() {
+    let harness = Harness::new("smart-close-tmux-detach");
+    let pid_file = harness.runtime_dir.join("terminal.pid");
+    let pty = PtyProcess::spawn(&pid_file, &[("TMUX", "/tmp/fake-tmux,4242,0")]);
+    let hypr = HyprServer::start(&harness.runtime_dir, &harness.hypr_sig, "termstub", pty.pid);
+    let tty = fs::read_link(format!("/proc/{}/fd/0", pty.pid))
+        .expect("pty tty should be readable")
+        .display()
+        .to_string();
+
+    let mut envs = harness.envs();
+    envs.extend([
+        ("TERMINAL".to_string(), "termstub".to_string()),
+        ("TEST_TTY".to_string(), tty.clone()),
+        ("TEST_TMUX_SESSION".to_string(), "named".to_string()),
+        (
+            "TEST_TMUX_SESSION_INFO".to_string(),
+            "named\t2\t1".to_string(),
+        ),
+    ]);
+
+    run_binary("hypr-smart-close", &[], &envs);
+
+    wait_for_log_line(&harness.log_path, &format!("tmux detach-client -t {tty}"));
+    assert!(
+        !hypr
+            .requests()
+            .iter()
+            .any(|request| request.starts_with("dispatch ")),
+        "tmux close must not close the Hyprland window"
+    );
+}
+
+#[test]
+fn hypr_smart_close_kills_pane_for_unnamed_multi_pane_session() {
+    let harness = Harness::new("sc-kill");
+    let pid_file = harness.runtime_dir.join("terminal.pid");
+    let pty = PtyProcess::spawn(&pid_file, &[("TMUX", "/tmp/fake-tmux,4242,0")]);
+    let hypr = HyprServer::start(&harness.runtime_dir, &harness.hypr_sig, "termstub", pty.pid);
+    let tty = fs::read_link(format!("/proc/{}/fd/0", pty.pid))
+        .expect("pty tty should be readable")
+        .display()
+        .to_string();
+
+    let mut envs = harness.envs();
+    envs.extend([
+        ("TERMINAL".to_string(), "termstub".to_string()),
+        ("TEST_TTY".to_string(), tty),
+        ("TEST_TMUX_PANE_ID".to_string(), "%42".to_string()),
+        ("TEST_TMUX_SESSION".to_string(), "1".to_string()),
+        ("TEST_TMUX_SESSION_INFO".to_string(), "1\t2\t1".to_string()),
+    ]);
+
+    run_binary("hypr-smart-close", &[], &envs);
+
+    wait_for_log_line(&harness.log_path, "tmux kill-pane -t %42");
+    assert!(
+        !hypr
+            .requests()
+            .iter()
+            .any(|request| request.starts_with("dispatch ")),
+        "tmux close must not close the Hyprland window"
+    );
+}
+
+#[test]
+fn herdr_close_and_navigation_use_the_host_contract() {
+    let close_harness = Harness::new("herdr-c");
+    let close_server = HerdrServer::start(
+        &close_harness.runtime_dir,
+        r#"{"result":{"close":{"action":"close_pane"}}}"#,
+    );
+    let close_socket = close_server.socket_path.display().to_string();
+    let mut close_app =
+        spawn_process_named_with_env("herdr", &[("HERDR_SOCKET_PATH", &close_socket)]);
+    let close_hypr = HyprServer::start(
+        &close_harness.runtime_dir,
+        &close_harness.hypr_sig,
+        "herdr",
+        close_app.id(),
+    );
+    let close_envs = close_harness.envs();
+
+    run_binary("hypr-smart-close", &[], &close_envs);
+    let close_requests = wait_for_herdr_request(&close_server, "host.close");
+    assert!(
+        close_requests
+            .iter()
+            .any(|request| request.contains("host.close")),
+        "expected host.close request, got {close_requests:?}"
+    );
+    assert!(!close_hypr
+        .requests()
+        .iter()
+        .any(|request| request.starts_with("dispatch ")));
+    let _ = close_app.kill();
+    let _ = close_app.wait();
+
+    let nav_harness = Harness::new("herdr-n");
+    let nav_server = HerdrServer::start(
+        &nav_harness.runtime_dir,
+        r#"{"result":{"navigate":{"changed":true,"at_edge":false}}}"#,
+    );
+    let nav_socket = nav_server.socket_path.display().to_string();
+    let mut nav_app = spawn_process_named_with_env("herdr", &[("HERDR_SOCKET_PATH", &nav_socket)]);
+    let nav_hypr = HyprServer::start(
+        &nav_harness.runtime_dir,
+        &nav_harness.hypr_sig,
+        "herdr",
+        nav_app.id(),
+    );
+    let nav_envs = nav_harness.envs();
+
+    run_binary("hypr-tmux-nav", &["left"], &nav_envs);
+    let nav_requests = wait_for_herdr_request(&nav_server, "host.navigate");
+    assert!(
+        nav_requests
+            .iter()
+            .any(|request| request.contains("host.navigate")),
+        "expected host.navigate request, got {nav_requests:?}"
+    );
+    assert!(!nav_hypr
+        .requests()
+        .iter()
+        .any(|request| request.starts_with("dispatch ")));
+    let _ = nav_app.kill();
+    let _ = nav_app.wait();
+}
+
+#[test]
+fn inherited_herdr_environment_in_a_non_terminal_does_not_route_to_herdr() {
+    let harness = Harness::new("herdr-env");
+    let server = HerdrServer::start(
+        &harness.runtime_dir,
+        r#"{"result":{"close":{"action":"close_pane"}}}"#,
+    );
+    let socket_path = harness.runtime_dir.join("herdr/herdr.sock");
+    let socket = socket_path.display().to_string();
+    let mut app = spawn_process_named_with_env(
+        "brave",
+        &[
+            ("HERDR_SOCKET_PATH", &socket),
+            ("HERDR_SESSION", "inherited"),
+        ],
+    );
+    let hypr = HyprServer::start(&harness.runtime_dir, &harness.hypr_sig, "brave", app.id());
+    let mut envs = harness.envs();
+    envs.push((
+        "XDG_CONFIG_HOME".to_string(),
+        harness.runtime_dir.display().to_string(),
+    ));
+
+    run_binary("hypr-smart-close", &[], &envs);
+    let requests = wait_for_request(
+        &hypr,
+        "dispatch hl.dsp.window.close({address = \"0xabc123\"})",
+    );
+    assert!(requests
+        .iter()
+        .any(|request| request.starts_with("dispatch ")));
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| !request.contains("host.close")),
+        "inherited env must not send host.close"
+    );
+
+    run_binary("hypr-tmux-nav", &["left"], &envs);
+    let requests = wait_for_request(&hypr, "dispatch hl.dsp.focus({direction = \"l\"})");
+    assert!(requests
+        .iter()
+        .any(|request| request.starts_with("dispatch ")));
+    let herdr_requests = server.requests();
+    assert!(
+        herdr_requests
+            .iter()
+            .any(|request| request.contains("host.prepare_entry")),
+        "Hypr fallback must arm entry for the destination herdr host: {herdr_requests:?}"
+    );
+    assert!(
+        herdr_requests
+            .iter()
+            .all(|request| !request.contains("host.navigate")),
+        "inherited env must not send host.navigate: {herdr_requests:?}"
+    );
+    let _ = app.kill();
+    let _ = app.wait();
+}
+
+#[test]
+fn smart_close_watchdog_bounds_wedged_tmux_without_dispatching() {
+    let harness = Harness::new("smart-close-watchdog");
+    let pid_file = harness.runtime_dir.join("terminal.pid");
+    let pty = PtyProcess::spawn(&pid_file, &[("TMUX", "/tmp/fake-tmux,4242,0")]);
+    let hypr = HyprServer::start(&harness.runtime_dir, &harness.hypr_sig, "termstub", pty.pid);
+    let tty = fs::read_link(format!("/proc/{}/fd/0", pty.pid))
+        .expect("pty tty should be readable")
+        .display()
+        .to_string();
+    let mut envs = harness.envs();
+    envs.extend([
+        ("TERMINAL".to_string(), "termstub".to_string()),
+        ("TEST_TTY".to_string(), tty),
+        ("TEST_TMUX_SLEEP".to_string(), "1".to_string()),
+    ]);
+
+    let started = Instant::now();
+    let status = run_binary_status("hypr-smart-close", &[], &envs);
+    assert!(!status.success(), "watchdog must fail closed");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "watchdog did not bound the wedged tmux command"
+    );
+    assert!(
+        !hypr
+            .requests()
+            .iter()
+            .any(|request| request.starts_with("dispatch ")),
+        "watchdog exit must not dispatch a close"
+    );
+}
+
+#[test]
+fn smart_close_fails_closed_when_herdr_server_wedges() {
+    let harness = Harness::new("sc-herdr-wedge");
+    let server = HerdrServer::start_wedged(&harness.runtime_dir);
+    let socket = server.socket_path.display().to_string();
+    let mut app = spawn_process_named_with_env("herdr", &[("HERDR_SOCKET_PATH", &socket)]);
+    let hypr = HyprServer::start(&harness.runtime_dir, &harness.hypr_sig, "herdr", app.id());
+    let envs = harness.envs();
+
+    let started = Instant::now();
+    let status = run_binary_status("hypr-smart-close", &[], &envs);
+    assert!(!status.success(), "wedged herdr must fail closed");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "herdr socket read timeout did not bound the request"
+    );
+    assert!(
+        !hypr
+            .requests()
+            .iter()
+            .any(|request| request.starts_with("dispatch ")),
+        "a wedged herdr request must not dispatch a window close"
+    );
+    let _ = app.kill();
+    let _ = app.wait();
 }

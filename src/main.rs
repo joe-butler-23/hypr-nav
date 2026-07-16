@@ -4,6 +4,7 @@ use std::env;
 use std::process::{Command, Stdio};
 
 fn main() {
+    start_watchdog();
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("usage: hypr-nav <h|j|k|l|left|right|up|down>");
