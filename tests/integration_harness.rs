@@ -23,8 +23,8 @@ impl TestDir {
             .expect("system clock should be valid")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "hypr-nav-it-{}-{}-{}",
-            label,
+            "hn-{}-{}-{:x}",
+            label.chars().take(16).collect::<String>(),
             std::process::id(),
             nonce
         ));
@@ -244,14 +244,19 @@ struct HerdrServer {
 
 impl HerdrServer {
     fn start(config_home: &Path, response: &str) -> Self {
-        Self::start_inner(config_home, Some(response))
+        Self::start_inner(config_home, Some(vec![response.to_string()]))
     }
 
     fn start_wedged(config_home: &Path) -> Self {
         Self::start_inner(config_home, None)
     }
 
-    fn start_inner(config_home: &Path, response: Option<&str>) -> Self {
+    fn start_sequence(config_home: &Path, responses: Vec<String>) -> Self {
+        assert!(!responses.is_empty());
+        Self::start_inner(config_home, Some(responses))
+    }
+
+    fn start_inner(config_home: &Path, responses: Option<Vec<String>>) -> Self {
         let socket_dir = config_home.join("herdr");
         fs::create_dir_all(&socket_dir).expect("herdr config dir should be created");
         let socket_path = socket_dir.join("herdr.sock");
@@ -264,7 +269,7 @@ impl HerdrServer {
         let stop = Arc::new(AtomicBool::new(false));
         let requests_clone = Arc::clone(&requests);
         let stop_clone = Arc::clone(&stop);
-        let response = response.map(str::to_string);
+        let mut response_index = 0;
         let handle = thread::spawn(move || {
             while !stop_clone.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -275,7 +280,9 @@ impl HerdrServer {
                             .lock()
                             .expect("requests lock should succeed")
                             .push(request.trim().to_string());
-                        if let Some(response) = response.as_deref() {
+                        if let Some(responses) = responses.as_ref() {
+                            let response = &responses[response_index.min(responses.len() - 1)];
+                            response_index += 1;
                             let _ = stream.write_all(response.as_bytes());
                         } else {
                             while !stop_clone.load(Ordering::Relaxed) {
@@ -1664,38 +1671,7 @@ fn hypr_smart_close_kills_pane_for_unnamed_multi_pane_session() {
 }
 
 #[test]
-fn herdr_close_and_navigation_use_the_host_contract() {
-    let close_harness = Harness::new("herdr-c");
-    let close_server = HerdrServer::start(
-        &close_harness.runtime_dir,
-        r#"{"result":{"close":{"action":"close_pane"}}}"#,
-    );
-    let close_socket = close_server.socket_path.display().to_string();
-    let mut close_app =
-        spawn_process_named_with_env("herdr", &[("HERDR_SOCKET_PATH", &close_socket)]);
-    let close_hypr = HyprServer::start(
-        &close_harness.runtime_dir,
-        &close_harness.hypr_sig,
-        "herdr",
-        close_app.id(),
-    );
-    let close_envs = close_harness.envs();
-
-    run_binary("hypr-smart-close", &[], &close_envs);
-    let close_requests = wait_for_herdr_request(&close_server, "host.close");
-    assert!(
-        close_requests
-            .iter()
-            .any(|request| request.contains("host.close")),
-        "expected host.close request, got {close_requests:?}"
-    );
-    assert!(!close_hypr
-        .requests()
-        .iter()
-        .any(|request| request.starts_with("dispatch ")));
-    let _ = close_app.kill();
-    let _ = close_app.wait();
-
+fn herdr_navigation_uses_the_host_contract() {
     let nav_harness = Harness::new("herdr-n");
     let nav_server = HerdrServer::start(
         &nav_harness.runtime_dir,
@@ -1846,4 +1822,155 @@ fn smart_close_fails_closed_when_herdr_server_wedges() {
     );
     let _ = app.kill();
     let _ = app.wait();
+}
+
+fn close_snapshot(
+    pane_count: usize,
+    tab_count: usize,
+    workspace_count: usize,
+) -> serde_json::Value {
+    use serde_json::json;
+    let mut panes = Vec::new();
+    let mut tabs = Vec::new();
+    let mut workspaces = Vec::new();
+    for w in 1..=workspace_count {
+        workspaces.push(json!({"workspace_id":format!("w{w}"), "active_tab_id":format!("w{w}:t1"), "tab_count":tab_count}));
+        for t in 1..=tab_count {
+            tabs.push(json!({"tab_id":format!("w{w}:t{t}"), "workspace_id":format!("w{w}"), "pane_count":pane_count}));
+            for p in 1..=pane_count {
+                panes.push(json!({"pane_id":format!("w{w}:p{}", (t-1)*pane_count+p), "tab_id":format!("w{w}:t{t}"), "workspace_id":format!("w{w}")}));
+            }
+        }
+    }
+    json!({"result":{"type":"session_snapshot", "snapshot":{
+        "focused_pane_id":"w1:p1", "focused_tab_id":"w1:t1", "focused_workspace_id":"w1",
+        "panes":panes, "tabs":tabs, "workspaces":workspaces
+    }}})
+}
+
+fn check_current_herdr_close(
+    snapshot: serde_json::Value,
+    close_response: serde_json::Value,
+    success: bool,
+    inner: bool,
+) {
+    let harness = Harness::new("herdr-current-close");
+    let server = HerdrServer::start_sequence(
+        &harness.runtime_dir,
+        vec![snapshot.to_string(), close_response.to_string()],
+    );
+    let socket = server.socket_path.display().to_string();
+    let mut app = spawn_process_named_with_env("herdr", &[("HERDR_SOCKET_PATH", &socket)]);
+    let hypr = HyprServer::start(&harness.runtime_dir, &harness.hypr_sig, "herdr", app.id());
+    let status = run_binary_status("hypr-smart-close", &[], &harness.envs());
+    let _ = app.kill();
+    let _ = app.wait();
+    assert_eq!(status.success(), success);
+    let requests: Vec<serde_json::Value> = server
+        .requests()
+        .iter()
+        .map(|r| serde_json::from_str(r).unwrap())
+        .collect();
+    assert_eq!(requests[0]["method"], "session.snapshot");
+    assert_eq!(requests.len(), if inner { 2 } else { 1 });
+    if inner {
+        assert_eq!(requests[1]["method"], "pane.close");
+        assert_eq!(
+            requests[1]["params"],
+            serde_json::json!({"pane_id":"w1:p1"})
+        );
+    }
+    assert_eq!(
+        hypr.requests().iter().any(|r| r.starts_with("dispatch ")),
+        success && !inner
+    );
+}
+
+#[test]
+fn herdr_close_current_api_targets_captured_pane() {
+    check_current_herdr_close(
+        close_snapshot(2, 1, 1),
+        serde_json::json!({"result":{"type":"ok"}}),
+        true,
+        true,
+    );
+}
+
+#[test]
+fn herdr_close_current_api_preserves_other_tabs_and_workspaces() {
+    for (tabs, workspaces) in [(2, 1), (1, 2)] {
+        check_current_herdr_close(
+            close_snapshot(1, tabs, workspaces),
+            serde_json::json!({"result":{"type":"ok"}}),
+            true,
+            true,
+        );
+    }
+}
+
+#[test]
+fn herdr_close_current_api_final_pane_only_closes_outer_host() {
+    check_current_herdr_close(
+        close_snapshot(1, 1, 1),
+        serde_json::json!({"result":{"type":"ok"}}),
+        true,
+        false,
+    );
+}
+
+#[test]
+fn herdr_close_current_api_errors_never_close_outer_host() {
+    for response in [
+        serde_json::json!({"error":{"code":"pane_not_found"}}),
+        serde_json::json!({"result":{"type":"pane_list"}}),
+    ] {
+        check_current_herdr_close(close_snapshot(2, 1, 1), response, false, true);
+    }
+}
+
+#[test]
+fn herdr_close_current_api_rejects_incomplete_or_ambiguous_target() {
+    let original = close_snapshot(1, 1, 1);
+    let mut cases = vec![serde_json::json!({"result":{"type":"ok"}})];
+    for key in [
+        "focused_pane_id",
+        "focused_tab_id",
+        "focused_workspace_id",
+        "panes",
+        "tabs",
+        "workspaces",
+    ] {
+        let mut snapshot = original.clone();
+        snapshot["result"]["snapshot"]
+            .as_object_mut()
+            .unwrap()
+            .remove(key);
+        cases.push(snapshot);
+    }
+    for (key, value) in [
+        ("focused_pane_id", ""),
+        ("focused_tab_id", "missing"),
+        ("focused_workspace_id", "missing"),
+    ] {
+        let mut snapshot = original.clone();
+        snapshot["result"]["snapshot"][key] = serde_json::json!(value);
+        cases.push(snapshot);
+    }
+    for list in ["panes", "tabs", "workspaces"] {
+        let mut snapshot = original.clone();
+        let items = snapshot["result"]["snapshot"][list].as_array_mut().unwrap();
+        items.push(items[0].clone());
+        cases.push(snapshot);
+    }
+    let mut snapshot = original.clone();
+    snapshot["result"]["snapshot"]["tabs"][0]["pane_count"] = serde_json::json!(2);
+    cases.push(snapshot);
+    for snapshot in cases {
+        check_current_herdr_close(
+            snapshot,
+            serde_json::json!({"result":{"type":"ok"}}),
+            false,
+            false,
+        );
+    }
 }

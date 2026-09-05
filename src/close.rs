@@ -55,8 +55,8 @@ fn main() {
         .and_then(|runtime| runtime.herdr.as_ref())
         .or(nonterminal_herdr.as_ref())
     {
-        match herdr_host_close(runtime) {
-            Some(HerdrCloseOutcome::ClosePane | HerdrCloseOutcome::CloseTab) => {
+        match herdr_close(runtime) {
+            Some(HerdrCloseAction::ClosePane(_)) => {
                 debug_log!("smart-close", "herdr host close handled");
                 log_close_event(
                     "herdr_close_handled",
@@ -68,7 +68,7 @@ fn main() {
                 );
                 return;
             }
-            Some(HerdrCloseOutcome::CloseHost) => {
+            Some(HerdrCloseAction::CloseHost) => {
                 debug_log!("smart-close", "herdr host requested outer window close");
                 log_close_event(
                     "herdr_close_host",
@@ -79,23 +79,8 @@ fn main() {
                     }),
                 );
             }
-            Some(HerdrCloseOutcome::Noop) => {
-                debug_log!("smart-close", "herdr host close returned noop");
-                log_close_event(
-                    "herdr_close_noop",
-                    json!({
-                        "active": active_window_json(&active),
-                        "socket": runtime.socket_path,
-                        "session": runtime.session,
-                    }),
-                );
-                return;
-            }
             None => {
-                debug_log!(
-                    "smart-close",
-                    "herdr runtime detected but host.close failed"
-                );
+                debug_log!("smart-close", "herdr runtime detected but close failed");
                 log_close_event(
                     "herdr_close_failed",
                     json!({
@@ -230,26 +215,88 @@ fn active_window_json(active: &ActiveWindowInfo) -> serde_json::Value {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HerdrCloseOutcome {
-    ClosePane,
-    CloseTab,
+#[derive(Debug, PartialEq, Eq)]
+enum HerdrCloseAction {
+    ClosePane(String),
     CloseHost,
-    Noop,
 }
 
-fn herdr_host_close(runtime: &HerdrRuntime) -> Option<HerdrCloseOutcome> {
-    let response = herdr_request(runtime, "hypr-close:host:close", "host.close", json!({}))?;
-    parse_herdr_host_close_response(&response)
+fn herdr_close(runtime: &HerdrRuntime) -> Option<HerdrCloseAction> {
+    let snapshot = herdr_request(
+        runtime,
+        "hypr-close:snapshot",
+        "session.snapshot",
+        json!({}),
+    )?;
+    let action = choose_herdr_close_action(&snapshot)?;
+    if let HerdrCloseAction::ClosePane(ref pane_id) = action {
+        // Closing the captured pane also removes an empty tab/workspace. Never
+        // close an entire tab: another pane may have appeared since the snapshot.
+        let response = herdr_request(
+            runtime,
+            "hypr-close:pane:close",
+            "pane.close",
+            json!({ "pane_id": pane_id }),
+        )?;
+        if response.pointer("/result/type")?.as_str()? != "ok" {
+            return None;
+        }
+    }
+    Some(action)
 }
 
-fn parse_herdr_host_close_response(value: &Value) -> Option<HerdrCloseOutcome> {
-    match value.pointer("/result/close/action")?.as_str()? {
-        "close_pane" => Some(HerdrCloseOutcome::ClosePane),
-        "close_tab" => Some(HerdrCloseOutcome::CloseTab),
-        "close_host" => Some(HerdrCloseOutcome::CloseHost),
-        "noop" => Some(HerdrCloseOutcome::Noop),
-        _ => None,
+fn choose_herdr_close_action(response: &Value) -> Option<HerdrCloseAction> {
+    let result = response.get("result")?;
+    if result.get("type")?.as_str()? != "session_snapshot" {
+        return None;
+    }
+    let snapshot = result.get("snapshot")?;
+    let pane_id = snapshot.get("focused_pane_id")?.as_str()?;
+    let tab_id = snapshot.get("focused_tab_id")?.as_str()?;
+    let workspace_id = snapshot.get("focused_workspace_id")?.as_str()?;
+    if pane_id.is_empty() || tab_id.is_empty() || workspace_id.is_empty() {
+        return None;
+    }
+    let panes = snapshot.get("panes")?.as_array()?;
+    let tabs = snapshot.get("tabs")?.as_array()?;
+    let workspaces = snapshot.get("workspaces")?.as_array()?;
+    let unique = |items: &[Value], key: &str, id: &str| {
+        items
+            .iter()
+            .filter(|item| item.get(key).and_then(Value::as_str) == Some(id))
+            .count()
+            == 1
+    };
+    if !unique(panes, "pane_id", pane_id)
+        || !unique(tabs, "tab_id", tab_id)
+        || !unique(workspaces, "workspace_id", workspace_id)
+    {
+        return None;
+    }
+    let pane = panes.iter().find(|pane| pane["pane_id"] == pane_id)?;
+    let tab = tabs.iter().find(|tab| tab["tab_id"] == tab_id)?;
+    let workspace = workspaces
+        .iter()
+        .find(|ws| ws["workspace_id"] == workspace_id)?;
+    if pane.get("tab_id")?.as_str()? != tab_id
+        || pane.get("workspace_id")?.as_str()? != workspace_id
+        || tab.get("workspace_id")?.as_str()? != workspace_id
+        || workspace.get("active_tab_id")?.as_str()? != tab_id
+        || tab.get("pane_count")?.as_u64()?
+            != panes.iter().filter(|p| p["tab_id"] == tab_id).count() as u64
+        || workspace.get("tab_count")?.as_u64()?
+            != tabs
+                .iter()
+                .filter(|t| t["workspace_id"] == workspace_id)
+                .count() as u64
+    {
+        return None;
+    }
+    if panes.len() == 1 && tabs.len() == 1 && workspaces.len() == 1 {
+        // Detach the outer terminal, preserving the final persistent pane.
+        Some(HerdrCloseAction::CloseHost)
+    } else {
+        Some(HerdrCloseAction::ClosePane(pane_id.to_string()))
     }
 }
 
@@ -441,50 +488,5 @@ mod tests {
     fn returns_none_when_kill_pane_target_missing() {
         let info = session_info(false, 3, 1);
         assert_eq!(choose_tmux_close_action(&info, None, "/dev/pts/3"), None);
-    }
-
-    #[test]
-    fn parses_herdr_host_close_pane_action() {
-        let response = json!({
-            "result": {
-                "type": "host_close",
-                "close": {
-                    "action": "close_pane"
-                }
-            }
-        });
-
-        assert_eq!(
-            parse_herdr_host_close_response(&response),
-            Some(HerdrCloseOutcome::ClosePane)
-        );
-    }
-
-    #[test]
-    fn parses_herdr_host_close_host_action() {
-        let response = json!({
-            "result": {
-                "type": "host_close",
-                "close": {
-                    "action": "close_host"
-                }
-            }
-        });
-
-        assert_eq!(
-            parse_herdr_host_close_response(&response),
-            Some(HerdrCloseOutcome::CloseHost)
-        );
-    }
-
-    #[test]
-    fn rejects_missing_herdr_host_close_contract() {
-        let response = json!({
-            "result": {
-                "type": "ok"
-            }
-        });
-
-        assert_eq!(parse_herdr_host_close_response(&response), None);
     }
 }
