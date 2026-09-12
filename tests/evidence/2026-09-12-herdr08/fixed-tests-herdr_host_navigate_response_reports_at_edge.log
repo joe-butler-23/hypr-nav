@@ -1,0 +1,10 @@
+command: cargo test --bin hypr-tmux-nav tests::herdr_host_navigate_response_reports_at_edge -- --exact --nocapture
+exit: 0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/tmux.rs (target/debug/deps/hypr_tmux_nav-7bfe54f123671188)
+
+running 1 test
+test tests::herdr_host_navigate_response_reports_at_edge ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+

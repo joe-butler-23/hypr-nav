@@ -1,0 +1,30 @@
+command: cargo test --test integration_harness herdr08_close_refuses_lost_compositor_identity -- --exact --nocapture
+exit: 101
+   Compiling zmij v1.0.20
+   Compiling serde_core v1.0.228
+   Compiling serde_json v1.0.149
+   Compiling libc v0.2.189
+   Compiling itoa v1.0.17
+   Compiling memchr v2.8.0
+   Compiling hypr-nav v1.0.0 (/tmp/hypr-nav-yu3-before-x998am27)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.19s
+     Running tests/integration_harness.rs (target/debug/deps/integration_harness-1d601b570046b4ca)
+
+running 1 test
+
+thread 'herdr08_close_refuses_lost_compositor_identity' (3006230) panicked at tests/integration_harness.rs:1041:5:
+{"component":"hypr-smart-close","detail":{"argv":["/tmp/hypr-nav-yu3-before-x998am27/target/debug/hypr-smart-close"]},"event":"invoked","parent_comm":"integration_har","pid":3006232,"ppid":3006229,"ts_unix_ms":1789240164755}
+{"component":"hypr-smart-close","detail":{"address":"0xabc123","class":"brave-browser","focus_history_id":null,"pid":4242,"title":null},"event":"active_captured","parent_comm":"integration_har","pid":3006232,"ppid":3006229,"ts_unix_ms":1789240164764}
+{"component":"hypr-smart-close","detail":{"active":{"address":"0xabc123","class":"brave-browser","focus_history_id":null,"pid":4242,"title":null},"dispatcher":"hl.dsp.window.close({address = \"0xabc123\"})"},"event":"dispatch_closewindow_failed","parent_comm":"integration_har","pid":3006232,"ppid":3006229,"ts_unix_ms":1789240164765}
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test herdr08_close_refuses_lost_compositor_identity ... FAILED
+
+failures:
+
+failures:
+    herdr08_close_refuses_lost_compositor_identity
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 46 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--test integration_harness`

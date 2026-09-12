@@ -1,0 +1,112 @@
+{
+  "base_revision": "94de958fd21c1eedf16741bf70dc9a67b1c8363b",
+  "before_tree": "/tmp/hypr-nav-yu3-before-x998am27",
+  "production_sha256": {
+    "src/close.rs": "b37b609acce8921db34fde45879a670705a46baffbaf7bf6ae47c761da135c1f",
+    "src/lib.rs": "7d6c0fd454b61c52c0122d857aec0b5c42bf903edbb71fcd5c32ecd1aeea02fe",
+    "src/main.rs": "fcaedd9ec86551be961e68627b636238c0b03f5515386ab44bf5410905648602",
+    "src/tmux.rs": "2aed72332c3629a72cf339e45a4cbee9584f7f47d217ca033622fa86d468c4cb"
+  },
+  "records": [
+    {
+      "lane": "fixed",
+      "test": "herdr08_close_refuses_lost_compositor_identity",
+      "exit": 0
+    },
+    {
+      "lane": "fixed",
+      "test": "herdr08_navigation_uses_current_protocol",
+      "exit": 0
+    },
+    {
+      "lane": "fixed",
+      "test": "herdr08_named_client_close_ignores_inherited_parent_socket",
+      "exit": 0
+    },
+    {
+      "lane": "fixed",
+      "test": "herdr08_final_host_close_refuses_changed_window",
+      "exit": 0
+    },
+    {
+      "lane": "fixed",
+      "test": "herdr08_cross_window_entry_targets_observed_destination",
+      "exit": 0
+    },
+    {
+      "lane": "fixed",
+      "test": "inherited_herdr_environment_in_a_non_terminal_does_not_route_to_herdr",
+      "exit": 0
+    },
+    {
+      "lane": "fixed",
+      "test": "herdr08_regression::herdr08_accepts_named_client_options",
+      "exit": 0
+    },
+    {
+      "lane": "fixed",
+      "test": "herdr08_regression::herdr08_rejects_remote_and_malformed_clients",
+      "exit": 0
+    },
+    {
+      "lane": "fixed",
+      "test": "tests::herdr_host_navigate_response_reports_moved",
+      "exit": 0
+    },
+    {
+      "lane": "fixed",
+      "test": "tests::herdr_host_navigate_response_reports_at_edge",
+      "exit": 0
+    },
+    {
+      "lane": "before",
+      "test": "herdr08_close_refuses_lost_compositor_identity",
+      "exit": 101
+    },
+    {
+      "lane": "before",
+      "test": "herdr08_navigation_uses_current_protocol",
+      "exit": 101
+    },
+    {
+      "lane": "before",
+      "test": "herdr08_named_client_close_ignores_inherited_parent_socket",
+      "exit": 101
+    },
+    {
+      "lane": "before",
+      "test": "herdr08_final_host_close_refuses_changed_window",
+      "exit": 101
+    },
+    {
+      "lane": "before",
+      "test": "herdr08_cross_window_entry_targets_observed_destination",
+      "exit": 101
+    },
+    {
+      "lane": "before",
+      "test": "inherited_herdr_environment_in_a_non_terminal_does_not_route_to_herdr",
+      "exit": 101
+    },
+    {
+      "lane": "before",
+      "test": "herdr08_regression::herdr08_accepts_named_client_options",
+      "exit": 101
+    },
+    {
+      "lane": "before",
+      "test": "herdr08_regression::herdr08_rejects_remote_and_malformed_clients",
+      "exit": 101
+    },
+    {
+      "lane": "before",
+      "test": "tests::herdr_host_navigate_response_reports_moved",
+      "exit": 101
+    },
+    {
+      "lane": "before",
+      "test": "tests::herdr_host_navigate_response_reports_at_edge",
+      "exit": 101
+    }
+  ]
+}

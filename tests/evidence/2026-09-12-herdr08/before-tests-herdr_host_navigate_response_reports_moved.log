@@ -1,0 +1,23 @@
+command: cargo test --bin hypr-tmux-nav tests::herdr_host_navigate_response_reports_moved -- --exact --nocapture
+exit: 101
+   Compiling hypr-nav v1.0.0 (/tmp/hypr-nav-yu3-before-x998am27)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.29s
+     Running unittests src/tmux.rs (target/debug/deps/hypr_tmux_nav-7bfe54f123671188)
+
+running 1 test
+
+thread 'tests::herdr_host_navigate_response_reports_moved' (3006936) panicked at src/tmux.rs:541:9:
+assertion `left == right` failed
+  left: None
+ right: Some(Moved)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tests::herdr_host_navigate_response_reports_moved ... FAILED
+
+failures:
+
+failures:
+    tests::herdr_host_navigate_response_reports_moved
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--bin hypr-tmux-nav`

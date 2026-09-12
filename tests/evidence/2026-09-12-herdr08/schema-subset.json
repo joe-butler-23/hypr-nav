@@ -1,0 +1,243 @@
+{
+  "command": "herdr api schema --json",
+  "protocol": 22,
+  "schema_version": 1,
+  "requests": [
+    {
+      "properties": {
+        "method": {
+          "const": "pane.layout",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/schemas/request/$defs/PaneLayoutParams"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "pane.focus_direction",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/schemas/request/$defs/PaneFocusDirectionParams"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "pane.focus",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/schemas/request/$defs/PaneTarget"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "type": "object"
+    }
+  ],
+  "request_definitions": {
+    "PaneDirection": {
+      "enum": [
+        "left",
+        "right",
+        "up",
+        "down"
+      ],
+      "type": "string"
+    },
+    "PaneFocusDirectionParams": {
+      "properties": {
+        "direction": {
+          "$ref": "#/schemas/request/$defs/PaneDirection"
+        },
+        "pane_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "direction"
+      ],
+      "type": "object"
+    },
+    "PaneLayoutParams": {
+      "properties": {
+        "pane_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "PaneTarget": {
+      "properties": {
+        "pane_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pane_id"
+      ],
+      "type": "object"
+    }
+  },
+  "response_definitions": {
+    "PaneFocusDirectionReason": {
+      "enum": [
+        "no_neighbor"
+      ],
+      "type": "string"
+    },
+    "PaneFocusDirectionResult": {
+      "properties": {
+        "changed": {
+          "type": "boolean"
+        },
+        "focused_pane_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "layout": {
+          "$ref": "#/schemas/success_response/$defs/PaneLayoutSnapshot"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/schemas/success_response/$defs/PaneFocusDirectionReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_pane_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "changed",
+        "source_pane_id",
+        "layout"
+      ],
+      "type": "object"
+    },
+    "PaneLayoutPane": {
+      "properties": {
+        "focused": {
+          "type": "boolean"
+        },
+        "pane_id": {
+          "type": "string"
+        },
+        "rect": {
+          "$ref": "#/schemas/success_response/$defs/PaneLayoutRect"
+        }
+      },
+      "required": [
+        "pane_id",
+        "focused",
+        "rect"
+      ],
+      "type": "object"
+    },
+    "PaneLayoutRect": {
+      "properties": {
+        "height": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "width": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "x": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "y": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "width",
+        "height"
+      ],
+      "type": "object"
+    },
+    "PaneLayoutSnapshot": {
+      "properties": {
+        "area": {
+          "$ref": "#/schemas/success_response/$defs/PaneLayoutRect"
+        },
+        "focused_pane_id": {
+          "type": "string"
+        },
+        "panes": {
+          "items": {
+            "$ref": "#/schemas/success_response/$defs/PaneLayoutPane"
+          },
+          "type": "array"
+        },
+        "splits": {
+          "items": {
+            "$ref": "#/schemas/success_response/$defs/PaneLayoutSplit"
+          },
+          "type": "array"
+        },
+        "tab_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        },
+        "zoomed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "tab_id",
+        "zoomed",
+        "area",
+        "focused_pane_id",
+        "panes",
+        "splits"
+      ],
+      "type": "object"
+    }
+  }
+}

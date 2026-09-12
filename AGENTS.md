@@ -83,3 +83,21 @@ Standalone Kitty split navigation resolves neighbour groups to explicit pane IDs
 against the pre-fix source, including tagged Herdr/tmux/Neovim routing, custom
 classes, stale daemon focus, ambiguous metadata and a focus change. All protocol
 fixtures are disposable; these results do not claim live compositor deployment.
+
+
+## Herdr API compatibility
+
+Herdr 0.8 navigation uses `pane.focus_direction`. Cross-window entry resolves
+the actual destination after the Hyprland focus dispatch, reads `pane.layout`,
+and focuses a pane on the entering edge with `pane.focus`. An unrelated window
+does not cause requests to the default Herdr server. Ambiguous layouts and a
+changed compositor target cancel the entry action.
+
+Named clients accept `--session NAME` and `--session=NAME`, with or without an
+explicit `client` command. Explicit session identity takes precedence over
+parent-session environment variables. Remote clients and one-shot commands
+are not treated as attached local clients. Every outer close revalidates the
+captured compositor identity, including after a Herdr final-pane snapshot.
+
+`tests/evidence/2026-09-12-herdr08` records isolated regression pairs against
+94de958, the inspected protocol 22 schema subset, and the complete Rust gates.

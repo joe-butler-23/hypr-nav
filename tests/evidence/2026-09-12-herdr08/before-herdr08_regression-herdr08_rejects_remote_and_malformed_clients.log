@@ -1,0 +1,22 @@
+command: cargo test --lib herdr08_regression::herdr08_rejects_remote_and_malformed_clients -- --exact --nocapture
+exit: 101
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/hypr_nav_lib-df21f5f1d695be1a)
+
+running 1 test
+
+thread 'herdr08_regression::herdr08_rejects_remote_and_malformed_clients' (3006786) panicked at src/lib.rs:2444:13:
+assertion `left == right` failed
+  left: Some(HerdrRuntime { socket_path: None, session: None })
+ right: None
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test herdr08_regression::herdr08_rejects_remote_and_malformed_clients ... FAILED
+
+failures:
+
+failures:
+    herdr08_regression::herdr08_rejects_remote_and_malformed_clients
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

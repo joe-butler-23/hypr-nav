@@ -609,17 +609,43 @@ fn parse_herdr_client_runtime_from_args(args: &[String]) -> Option<HerdrRuntime>
         return None;
     }
 
-    match args.get(1).map(String::as_str) {
-        None | Some("client") => Some(HerdrRuntime::default()),
-        Some("session") if args.get(2).map(String::as_str) == Some("attach") => {
-            let session = args.get(3).filter(|value| !value.trim().is_empty())?;
-            Some(HerdrRuntime {
+    if args.get(1).map(String::as_str) == Some("session") {
+        return (args.len() == 4 && args.get(2).map(String::as_str) == Some("attach"))
+            .then(|| args.get(3))
+            .flatten()
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| HerdrRuntime {
                 socket_path: None,
-                session: Some(session.to_string()),
-            })
-        }
-        _ => None,
+                session: Some(name.clone()),
+            });
     }
+    let mut session = None;
+    let mut client = false;
+    let mut rest = args.iter().skip(1);
+    while let Some(arg) = rest.next() {
+        if arg == "client" && !client {
+            client = true;
+        } else if arg == "--session" && session.is_none() {
+            session = Some(rest.next()?.clone());
+        } else {
+            // Remote clients and one-shot commands are not local attached clients.
+            let name = arg.strip_prefix("--session=")?;
+            if session.is_some() {
+                return None;
+            }
+            session = Some(name.to_string());
+        }
+    }
+    if session
+        .as_deref()
+        .is_some_and(|name| name.trim().is_empty())
+    {
+        return None;
+    }
+    Some(HerdrRuntime {
+        socket_path: None,
+        session,
+    })
 }
 
 pub fn parse_herdr_runtime_environ(environ: &[u8]) -> Option<HerdrRuntime> {
@@ -676,8 +702,12 @@ fn merge_herdr_runtime(target: &mut HerdrRuntime, source: HerdrRuntime) {
 
 fn herdr_runtime_for_client(pid: u32) -> Option<HerdrRuntime> {
     let mut runtime = read_herdr_client_runtime_from_process(pid)?;
-    if let Some(environment) = read_herdr_runtime_from_environ(pid) {
-        merge_herdr_runtime(&mut runtime, environment);
+    // Explicit CLI session identity wins over ambient socket/session variables
+    // inherited from a parent Herdr pane.
+    if runtime.session.is_none() {
+        if let Some(environment) = read_herdr_runtime_from_environ(pid) {
+            merge_herdr_runtime(&mut runtime, environment);
+        }
     }
     Some(runtime)
 }
@@ -1551,6 +1581,9 @@ pub fn detect_herdr_runtime(pid: u32, class: &str) -> Option<HerdrRuntime> {
         checked.insert(current_pid);
 
         if let Some(runtime) = herdr_runtime_for_client(current_pid) {
+            if runtime.session.is_some() {
+                return Some(runtime);
+            }
             has_herdr_client = true;
             merge_herdr_runtime(&mut result, runtime);
             if result.socket_path.is_some() && result.session.is_some() {
@@ -2405,5 +2438,43 @@ Window 0xABC123 -> terminal:
     fn hypr_dispatch_legacy_payload_closewindow() {
         let action = HyprDispatch::CloseWindow("0xdeadbeef".to_string());
         assert_eq!(action.legacy_payload(), "closewindow address:0xdeadbeef");
+    }
+}
+
+#[cfg(test)]
+mod herdr08_regression {
+    use super::*;
+
+    #[test]
+    fn herdr08_accepts_named_client_options() {
+        for args in [
+            vec!["herdr", "--session", "review", "client"],
+            vec!["herdr", "client", "--session", "review"],
+            vec!["herdr", "--session=review", "client"],
+            vec!["herdr", "--session", "review"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_string).collect();
+            assert_eq!(
+                parse_herdr_client_runtime_from_args(&args),
+                Some(HerdrRuntime {
+                    socket_path: None,
+                    session: Some("review".into())
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn herdr08_rejects_remote_and_malformed_clients() {
+        for args in [
+            vec!["herdr", "client", "--remote", "elsewhere"],
+            vec!["herdr", "client", "--session"],
+            vec!["herdr", "client", "--session="],
+            vec!["herdr", "client", "--session", "one", "--session", "two"],
+            vec!["herdr", "client", "server"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_string).collect();
+            assert_eq!(parse_herdr_client_runtime_from_args(&args), None);
+        }
     }
 }

@@ -1,0 +1,11 @@
+command: cargo test --bin hypr-tmux-nav tests::herdr_host_navigate_response_reports_moved -- --exact --nocapture
+exit: 0
+   Compiling hypr-nav v1.0.0 (/home/joebutler/development/hypr-nav)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.21s
+     Running unittests src/tmux.rs (target/debug/deps/hypr_tmux_nav-7bfe54f123671188)
+
+running 1 test
+test tests::herdr_host_navigate_response_reports_moved ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+

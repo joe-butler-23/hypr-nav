@@ -190,6 +190,10 @@ fn main() {
         debug_log!("smart-close", "non-terminal active class={}", active.class);
     }
 
+    if !active_window_is_current(&hypr_socket, &active) {
+        log_close_event("active_window_changed", active_window_json(&active));
+        std::process::exit(1);
+    }
     debug_log!(
         "smart-close",
         "closing captured hypr address={}",

@@ -1,0 +1,23 @@
+command: cargo test --lib herdr08_regression::herdr08_accepts_named_client_options -- --exact --nocapture
+exit: 101
+   Compiling hypr-nav v1.0.0 (/tmp/hypr-nav-yu3-before-x998am27)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.69s
+     Running unittests src/lib.rs (target/debug/deps/hypr_nav_lib-df21f5f1d695be1a)
+
+running 1 test
+
+thread 'herdr08_regression::herdr08_accepts_named_client_options' (3006743) panicked at src/lib.rs:2424:13:
+assertion `left == right` failed
+  left: None
+ right: Some(HerdrRuntime { socket_path: None, session: Some("review") })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test herdr08_regression::herdr08_accepts_named_client_options ... FAILED
+
+failures:
+
+failures:
+    herdr08_regression::herdr08_accepts_named_client_options
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

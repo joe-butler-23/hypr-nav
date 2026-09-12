@@ -1013,7 +1013,7 @@ fn hypr_smart_close_respects_disabled_close_log_value() {
 }
 
 #[test]
-fn hypr_smart_close_logs_failed_hypr_dispatch_and_exits_nonzero() {
+fn herdr08_close_refuses_lost_compositor_identity() {
     let harness = Harness::new("sc-dfail");
     let close_log = harness.runtime_dir.join("close-events.jsonl");
     let hypr = HyprServer::start_with_response_then_stop(
@@ -1034,12 +1034,12 @@ fn hypr_smart_close_logs_failed_hypr_dispatch_and_exits_nonzero() {
         !status.success(),
         "failed Hypr dispatch should exit non-zero"
     );
-    // Server stops after activewindow, so both Lua and legacy dispatch attempts will fail
+    // Server stops after the capture: revalidation must refuse any close.
     let requests = hypr.requests();
     assert!(requests.iter().any(|request| request == "activewindow"));
     let events = fs::read_to_string(&close_log).expect("close log should be written");
     assert!(
-        events.contains("\"event\":\"dispatch_closewindow_failed\""),
+        events.contains("\"event\":\"active_window_changed\""),
         "{events}"
     );
     assert!(
@@ -1731,11 +1731,11 @@ fn hypr_smart_close_kills_pane_for_unnamed_multi_pane_session() {
 }
 
 #[test]
-fn herdr_navigation_uses_the_host_contract() {
+fn herdr08_navigation_uses_current_protocol() {
     let nav_harness = Harness::new("herdr-n");
     let nav_server = HerdrServer::start(
         &nav_harness.runtime_dir,
-        r#"{"result":{"navigate":{"changed":true,"at_edge":false}}}"#,
+        r#"{"result":{"type":"pane_focus_direction","focus":{"changed":true,"reason":null}}}"#,
     );
     let nav_socket = nav_server.socket_path.display().to_string();
     let mut nav_app = spawn_process_named_with_env("herdr", &[("HERDR_SOCKET_PATH", &nav_socket)]);
@@ -1748,12 +1748,12 @@ fn herdr_navigation_uses_the_host_contract() {
     let nav_envs = nav_harness.envs();
 
     run_binary("hypr-tmux-nav", &["left"], &nav_envs);
-    let nav_requests = wait_for_herdr_request(&nav_server, "host.navigate");
+    let nav_requests = wait_for_herdr_request(&nav_server, "pane.focus_direction");
     assert!(
         nav_requests
             .iter()
-            .any(|request| request.contains("host.navigate")),
-        "expected host.navigate request, got {nav_requests:?}"
+            .any(|request| request.contains("pane.focus_direction")),
+        "expected pane.focus_direction request, got {nav_requests:?}"
     );
     assert!(!nav_hypr
         .requests()
@@ -1809,16 +1809,8 @@ fn inherited_herdr_environment_in_a_non_terminal_does_not_route_to_herdr() {
         .any(|request| request.starts_with("dispatch ")));
     let herdr_requests = server.requests();
     assert!(
-        herdr_requests
-            .iter()
-            .any(|request| request.contains("host.prepare_entry")),
-        "Hypr fallback must arm entry for the destination herdr host: {herdr_requests:?}"
-    );
-    assert!(
-        herdr_requests
-            .iter()
-            .all(|request| !request.contains("host.navigate")),
-        "inherited env must not send host.navigate: {herdr_requests:?}"
+        herdr_requests.is_empty(),
+        "unrelated windows must not contact a Herdr session: {herdr_requests:?}"
     );
     let _ = app.kill();
     let _ = app.wait();
@@ -2121,6 +2113,10 @@ struct SharedKitty {
 
 impl SharedKitty {
     fn start(dir: &Path, herdr_socket: &Path) -> Self {
+        Self::start_with_session(dir, herdr_socket, false)
+    }
+
+    fn start_with_session(dir: &Path, herdr_socket: &Path, named: bool) -> Self {
         fs::write(
             dir.join("active"),
             "printf 'shell %s\n' \"$$\"; while :; do sleep 1; done\n",
@@ -2135,7 +2131,7 @@ impl SharedKitty {
             .arg0("kitty")
             .args([
                 "-c",
-                "(exec -a zsh bash active) & (exec -a herdr bash client) & wait",
+                if named { "(exec -a zsh bash active) & (exec -a herdr bash client --session review) & wait" } else { "(exec -a zsh bash active) & (exec -a herdr bash client) & wait" },
             ])
             .current_dir(dir)
             .env("HERDR_SOCKET_PATH", herdr_socket)
@@ -2433,4 +2429,156 @@ fn shared_kitty_focus_change_refuses_stale_inner_action() {
     assert!(!status.success());
     assert!(server.requests().is_empty());
     assert!(!hypr.requests().iter().any(|r| r.starts_with("dispatch ")));
+}
+
+#[test]
+fn herdr08_named_client_close_ignores_inherited_parent_socket() {
+    let harness = Harness::new("herdr08-named");
+    let correct = HerdrServer::start_sequence(
+        &harness.runtime_dir.join("correct"),
+        vec![
+            close_snapshot(2, 1, 1).to_string(),
+            r#"{"result":{"type":"ok"}}"#.into(),
+        ],
+    );
+    let inherited = HerdrServer::start_sequence(
+        &harness.runtime_dir.join("wrong"),
+        vec![
+            close_snapshot(2, 1, 1).to_string(),
+            r#"{"result":{"type":"ok"}}"#.into(),
+        ],
+    );
+    let config = harness.runtime_dir.join("config");
+    let session = config.join("herdr/sessions/review");
+    fs::create_dir_all(&session).unwrap();
+    std::os::unix::fs::symlink(&correct.socket_path, session.join("herdr.sock")).unwrap();
+    let kitty = SharedKitty::start_with_session(&harness.runtime_dir, &inherited.socket_path, true);
+    let hypr = HyprServer::start_with_response(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        &format!(
+            "Window abc123 -> named Herdr:\nclass: kitty\npid: {}\nxdgTag: nav-target\n",
+            kitty.root.id()
+        ),
+    );
+    let mut windows = kitty.windows("kitty");
+    windows[0]["tabs"][0]["windows"][0]["pid"] = kitty.herdr_pid.into();
+    let mut envs = harness.envs();
+    envs.extend([
+        ("TEST_KITTY_LS_JSON".into(), windows.to_string()),
+        ("XDG_CONFIG_HOME".into(), config.display().to_string()),
+    ]);
+    run_binary("hypr-smart-close", &[], &envs);
+    assert!(
+        inherited.requests().is_empty(),
+        "must not use inherited parent socket"
+    );
+    assert_eq!(correct.requests().len(), 2);
+    assert!(correct.requests()[1].contains("pane.close"));
+    assert!(!hypr.requests().iter().any(|r| r.starts_with("dispatch ")));
+}
+
+fn check_herdr08_cross_window_entry(mode: &str) {
+    let harness = Harness::new("herdr08-entry");
+    let mut layout = serde_json::json!({"result":{"type":"pane_layout","layout":{
+        "zoomed":false,"focused_pane_id":"p2", "area":{"x":0,"y":0,"width":100,"height":40},
+        "panes":[
+            {"pane_id":"p1","rect":{"x":0,"y":0,"width":50,"height":40}},
+            {"pane_id":"p2","rect":{"x":50,"y":0,"width":50,"height":40}}
+        ]
+    }}});
+    match mode {
+        "duplicate_pane" => layout["result"]["layout"]["panes"][1]["pane_id"] = "p1".into(),
+        "zoomed" => layout["result"]["layout"]["zoomed"] = true.into(),
+        "missing_rect" => layout["result"]["layout"]["panes"][0]["rect"] = serde_json::Value::Null,
+        "already_on_edge" => layout["result"]["layout"]["focused_pane_id"] = "p1".into(),
+        _ => {}
+    }
+    let server = HerdrServer::start_sequence(
+        &harness.runtime_dir,
+        vec![layout.to_string(), r#"{"result":{"type":"ok"}}"#.into()],
+    );
+    let socket = server.socket_path.display().to_string();
+    let mut app = spawn_process_named_with_env("herdr", &[("HERDR_SOCKET_PATH", &socket)]);
+    let source = "Window abc123 -> browser:\nclass: brave\npid: 4242\n";
+    let destination = format!(
+        "Window def456 -> destination:\nclass: herdr\npid: {}\n",
+        app.id()
+    );
+    let hypr = HyprServer::start_with_options(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        source,
+        "ok",
+        false,
+        Some(&destination),
+    );
+    let mut envs = harness.envs();
+    envs.push((
+        "XDG_CONFIG_HOME".into(),
+        harness.runtime_dir.display().to_string(),
+    ));
+    run_binary("hypr-tmux-nav", &["right"], &envs);
+    let _ = app.kill();
+    let _ = app.wait();
+    let calls: Vec<serde_json::Value> = server
+        .requests()
+        .iter()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(
+        calls.len(),
+        if mode == "healthy" { 2 } else { 1 },
+        "{mode}: {calls:?}"
+    );
+    assert_eq!(calls[0]["method"], "pane.layout");
+    if mode == "healthy" {
+        assert_eq!(calls[1]["method"], "pane.focus");
+        assert_eq!(calls[1]["params"]["pane_id"], "p1");
+    }
+    eprintln!(
+        "entry fixture {mode}: {} calls, exact destination only",
+        calls.len()
+    );
+    assert!(hypr
+        .requests()
+        .iter()
+        .any(|r| r == "dispatch hl.dsp.focus({direction = \"r\"})"));
+}
+
+#[test]
+fn herdr08_final_host_close_refuses_changed_window() {
+    let harness = Harness::new("herdr08-close-race");
+    let server = HerdrServer::start(&harness.runtime_dir, &close_snapshot(1, 1, 1).to_string());
+    let socket = server.socket_path.display().to_string();
+    let mut app = spawn_process_named_with_env("herdr", &[("HERDR_SOCKET_PATH", &socket)]);
+    let initial = format!("Window abc123 -> Herdr:\nclass: herdr\npid: {}\n", app.id());
+    let changed = "Window def456 -> browser:\nclass: brave\npid: 4242\n";
+    let hypr = HyprServer::start_with_options(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        &initial,
+        "ok",
+        false,
+        Some(changed),
+    );
+    let status = run_binary_status("hypr-smart-close", &[], &harness.envs());
+    let _ = app.kill();
+    let _ = app.wait();
+    assert!(!status.success());
+    assert_eq!(server.requests().len(), 1); // Snapshot was read before focus changed.
+    assert!(!hypr.requests().iter().any(|r| r.starts_with("dispatch ")));
+}
+
+#[test]
+fn herdr08_cross_window_entry_targets_observed_destination() {
+    for mode in [
+        "healthy",
+        "duplicate_pane",
+        "zoomed",
+        "missing_rect",
+        "already_on_edge",
+    ] {
+        check_herdr08_cross_window_entry(mode);
+    }
 }

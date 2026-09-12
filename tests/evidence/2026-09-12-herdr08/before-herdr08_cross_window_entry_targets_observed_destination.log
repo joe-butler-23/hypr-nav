@@ -1,0 +1,22 @@
+command: cargo test --test integration_harness herdr08_cross_window_entry_targets_observed_destination -- --exact --nocapture
+exit: 101
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running tests/integration_harness.rs (target/debug/deps/integration_harness-1d601b570046b4ca)
+
+running 1 test
+
+thread 'herdr08_cross_window_entry_targets_observed_destination' (3006322) panicked at tests/integration_harness.rs:2529:5:
+assertion `left == right` failed: healthy: [Object {"id": String("hypr-nav:host:prepare-entry"), "method": String("host.prepare_entry"), "params": Object {"direction": String("right")}}]
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test herdr08_cross_window_entry_targets_observed_destination ... FAILED
+
+failures:
+
+failures:
+    herdr08_cross_window_entry_targets_observed_destination
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 46 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `--test integration_harness`

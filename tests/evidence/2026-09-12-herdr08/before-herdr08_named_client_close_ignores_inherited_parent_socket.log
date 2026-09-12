@@ -1,0 +1,20 @@
+command: cargo test --test integration_harness herdr08_named_client_close_ignores_inherited_parent_socket -- --exact --nocapture
+exit: 101
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running tests/integration_harness.rs (target/debug/deps/integration_harness-1d601b570046b4ca)
+
+running 1 test
+
+thread 'herdr08_named_client_close_ignores_inherited_parent_socket' (3006278) panicked at tests/integration_harness.rs:2472:5:
+must not use inherited parent socket
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test herdr08_named_client_close_ignores_inherited_parent_socket ... FAILED
+
+failures:
+
+failures:
+    herdr08_named_client_close_ignores_inherited_parent_socket
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 46 filtered out; finished in 0.06s
+
+error: test failed, to rerun pass `--test integration_harness`

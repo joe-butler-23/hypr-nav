@@ -221,22 +221,17 @@ enum HerdrNavigateOutcome {
 }
 
 fn parse_herdr_host_navigate_response(value: &Value) -> Option<HerdrNavigateOutcome> {
-    let navigate = value.pointer("/result/navigate")?;
-    if navigate
-        .get("at_edge")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Some(HerdrNavigateOutcome::AtEdge);
+    if value.pointer("/result/type")?.as_str()? != "pane_focus_direction" {
+        return None;
     }
-    if navigate
-        .get("changed")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Some(HerdrNavigateOutcome::Moved);
+    let focus = value.pointer("/result/focus")?;
+    if focus.get("changed")?.as_bool()? {
+        Some(HerdrNavigateOutcome::Moved)
+    } else if focus.get("reason").and_then(Value::as_str) == Some("no_neighbor") {
+        Some(HerdrNavigateOutcome::AtEdge)
+    } else {
+        None
     }
-    None
 }
 
 fn herdr_host_navigate(
@@ -245,41 +240,102 @@ fn herdr_host_navigate(
 ) -> Option<HerdrNavigateOutcome> {
     let response = herdr_request(
         runtime,
-        "hypr-nav:host:navigate",
-        "host.navigate",
+        "hypr-nav:pane:focus-direction",
+        "pane.focus_direction",
         json!({ "direction": direction.herdr_direction() }),
     )?;
-    let outcome = parse_herdr_host_navigate_response(&response)?;
-    debug_log!(
-        "tmux-nav",
-        "herdr host.navigate direction={} outcome={:?}",
-        direction.herdr_direction(),
-        outcome
-    );
-    Some(outcome)
+    parse_herdr_host_navigate_response(&response)
 }
 
-fn prepare_herdr_entry(direction: Direction, runtime: &HerdrRuntime) -> bool {
-    let prepared = herdr_request(
-        runtime,
-        "hypr-nav:host:prepare-entry",
-        "host.prepare_entry",
-        json!({ "direction": direction.herdr_direction() }),
-    )
-    .and_then(|response| {
-        response
-            .pointer("/result/entry/armed")
-            .and_then(Value::as_bool)
-    })
-    .unwrap_or(false);
-    if prepared {
-        debug_log!(
-            "tmux-nav",
-            "herdr host.prepare_entry armed direction={}",
-            direction.herdr_direction()
-        );
+fn herdr_entry_pane(response: &Value, direction: Direction) -> Option<String> {
+    if response.pointer("/result/type")?.as_str()? != "pane_layout" {
+        return None;
     }
-    prepared
+    let layout = response.pointer("/result/layout")?;
+    if layout.get("zoomed")?.as_bool()? {
+        return None;
+    }
+    let panes = layout.get("panes")?.as_array()?;
+    if panes.len() < 2 {
+        return None;
+    }
+    let area = layout.get("area")?;
+    let (axis, extent, far_edge) = match direction {
+        Direction::Left => ("x", "width", true),
+        Direction::Right => ("x", "width", false),
+        Direction::Up => ("y", "height", true),
+        Direction::Down => ("y", "height", false),
+    };
+    let boundary = area.get(axis)?.as_u64()?.checked_add(if far_edge {
+        area.get(extent)?.as_u64()?
+    } else {
+        0
+    })?;
+    let focused = layout.get("focused_pane_id")?.as_str()?;
+    let mut candidates = Vec::new();
+    let mut ids = std::collections::HashSet::new();
+    for pane in panes {
+        let id = pane.get("pane_id")?.as_str()?;
+        if id.is_empty() || !ids.insert(id) {
+            return None;
+        }
+        let rect = pane.get("rect")?;
+        let edge = rect.get(axis)?.as_u64()?.checked_add(if far_edge {
+            rect.get(extent)?.as_u64()?
+        } else {
+            0
+        })?;
+        if edge == boundary {
+            candidates.push(id);
+        }
+    }
+    // Keep the current pane when already on the entering edge. Otherwise the
+    // first pane in the server's layout order provides deterministic entry.
+    if candidates.contains(&focused) {
+        return None;
+    }
+    candidates.first().map(|id| id.to_string())
+}
+
+fn enter_herdr_destination(
+    socket: &PathBuf,
+    previous: Option<&ActiveWindowInfo>,
+    direction: Direction,
+) -> bool {
+    let Some(destination) = get_active_window_snapshot(socket) else {
+        return false;
+    };
+    if previous.is_some_and(|window| window.address == destination.address) {
+        return false;
+    }
+    let runtime = if is_terminal_window(&destination.class, destination.pid) {
+        detect_terminal_runtime(&destination).and_then(|terminal| terminal.herdr)
+    } else {
+        detect_herdr_runtime(destination.pid, &destination.class)
+    };
+    let Some(runtime) = runtime else {
+        return false;
+    };
+    if !active_window_is_current(socket, &destination) {
+        return false;
+    }
+    let Some(layout) = herdr_request(&runtime, "hypr-nav:pane:layout", "pane.layout", json!({}))
+    else {
+        return false;
+    };
+    let Some(pane_id) = herdr_entry_pane(&layout, direction) else {
+        return false;
+    };
+    if !active_window_is_current(socket, &destination) {
+        return false;
+    }
+    herdr_request(
+        &runtime,
+        "hypr-nav:pane:entry",
+        "pane.focus",
+        json!({ "pane_id": pane_id }),
+    )
+    .is_some_and(|response| response.pointer("/result/type").and_then(Value::as_str) == Some("ok"))
 }
 
 fn main() {
@@ -310,15 +366,15 @@ fn main() {
     );
     let previous_state = load_nav_state();
     let mut current_tty: Option<String> = None;
-    let mut herdr_entry_runtime: Option<HerdrRuntime> = None;
+    let captured = get_active_window_snapshot(&hypr_socket);
 
-    if let Some(active) = get_active_window_snapshot(&hypr_socket) {
+    if let Some(ref active) = captured {
         let class = &active.class;
         let pid = active.pid;
         if is_terminal_window(class, pid) {
             debug_log!("tmux-nav", "terminal active class={} pid={}", class, pid);
-            let terminal = detect_terminal_runtime(&active).unwrap_or_default();
-            if !active_window_is_current(&hypr_socket, &active) {
+            let terminal = detect_terminal_runtime(active).unwrap_or_default();
+            if !active_window_is_current(&hypr_socket, active) {
                 std::process::exit(1);
             }
             current_tty = terminal.tty.clone();
@@ -361,10 +417,9 @@ fn main() {
 
             // Layer 2: Try Herdr pane navigation for a Herdr client running in the terminal
             if let Some(ref runtime) = terminal.herdr {
-                if !active_window_is_current(&hypr_socket, &active) {
+                if !active_window_is_current(&hypr_socket, active) {
                     std::process::exit(1);
                 }
-                herdr_entry_runtime = Some(runtime.clone());
                 debug_log!(
                     "tmux-nav",
                     "herdr runtime socket={:?} session={:?} detected in terminal class={}",
@@ -392,7 +447,7 @@ fn main() {
                 if let Some(target) = find_tmux_client_target(&runtime.tty, socket_path)
                     .or_else(|| find_tmux_pane_target(&runtime.tty, socket_path))
                 {
-                    if !active_window_is_current(&hypr_socket, &active) {
+                    if !active_window_is_current(&hypr_socket, active) {
                         std::process::exit(1);
                     }
                     if navigate_tmux_target(
@@ -413,7 +468,6 @@ fn main() {
                 debug_log!("tmux-nav", "terminal active but no tmux runtime detected");
             }
         } else if let Some(runtime) = detect_herdr_runtime(pid, class) {
-            herdr_entry_runtime = Some(runtime.clone());
             debug_log!(
                 "tmux-nav",
                 "herdr runtime socket={:?} session={:?} detected for class={}",
@@ -441,15 +495,10 @@ fn main() {
     }
 
     debug_log!("tmux-nav", "fallback to hypr movefocus {}", move_dir);
-    let default_runtime = HerdrRuntime::default();
-    let herdr_prepared = prepare_herdr_entry(
-        direction,
-        herdr_entry_runtime.as_ref().unwrap_or(&default_runtime),
-    );
     let action = HyprDispatch::MoveFocus(direction);
     if hypr_dispatch_action(&hypr_socket, &action) {
-        if herdr_prepared {
-            save_nav_state("herdr_prepare_entry", move_dir, current_tty.as_deref());
+        if enter_herdr_destination(&hypr_socket, captured.as_ref(), direction) {
+            save_nav_state("herdr_entry", move_dir, current_tty.as_deref());
         } else {
             save_nav_state("hypr_movefocus", move_dir, current_tty.as_deref());
         }
@@ -529,10 +578,10 @@ mod tests {
     fn herdr_host_navigate_response_reports_moved() {
         let response = serde_json::json!({
             "result": {
-                "type": "host_navigate",
-                "navigate": {
+                "type": "pane_focus_direction",
+                "focus": {
                     "changed": true,
-                    "at_edge": false,
+                    "reason": null,
                     "focused_pane_id": "w1:p2"
                 }
             }
@@ -548,10 +597,10 @@ mod tests {
     fn herdr_host_navigate_response_reports_at_edge() {
         let response = serde_json::json!({
             "result": {
-                "type": "host_navigate",
-                "navigate": {
+                "type": "pane_focus_direction",
+                "focus": {
                     "changed": false,
-                    "at_edge": true,
+                    "reason": "no_neighbor",
                     "focused_pane_id": "w1:p1"
                 }
             }

@@ -1,0 +1,163 @@
+command: cargo fmt --check
+exit: 0
+
+command: cargo test
+exit: 0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/hypr_nav_lib-df21f5f1d695be1a)
+
+running 57 tests
+test herdr08_regression::herdr08_rejects_remote_and_malformed_clients ... ok
+test herdr08_regression::herdr08_accepts_named_client_options ... ok
+test tests::direction_parse_supports_aliases ... ok
+test tests::direction_maps_to_herdr_direction ... ok
+test tests::hypr_dispatch_legacy_payload_closewindow ... ok
+test tests::hypr_dispatch_legacy_payload_movefocus ... ok
+test tests::hypr_dispatch_lua_payload_closewindow ... ok
+test tests::hypr_dispatch_lua_payload_movefocus_down ... ok
+test tests::hypr_dispatch_lua_payload_movefocus_left ... ok
+test tests::hypr_dispatch_lua_payload_movefocus_right ... ok
+test tests::hypr_dispatch_lua_payload_movefocus_up ... ok
+test tests::looks_like_host_port_accepts_valid_hostname_with_port ... ok
+test tests::looks_like_host_port_accepts_valid_ipv4_with_port ... ok
+test tests::looks_like_host_port_rejects_empty_host ... ok
+test tests::kitty_control_socket_uri_ignores_stale_env_and_uses_single_live_socket ... ok
+test tests::kitty_control_socket_uri_prefers_active_pid_socket_over_stale_env ... ok
+test tests::looks_like_host_port_rejects_empty_port ... ok
+test tests::looks_like_host_port_rejects_port_out_of_range ... ok
+test tests::looks_like_host_port_rejects_non_numeric_port ... ok
+test tests::kitty_control_socket_uri_preserves_tcp_env ... ok
+test tests::looks_like_host_port_rejects_socket_path ... ok
+test tests::normalize_kitty_listen_on_normalizes_bare_path ... ok
+test tests::normalize_kitty_listen_on_preserves_tcp_uri ... ok
+test tests::find_hyprland_socket_with_uses_unique_fallback_socket ... ok
+test tests::kitty_control_socket_uri_rejects_ambiguous_generic_sockets ... ok
+test tests::normalize_kitty_listen_on_preserves_unix_uri ... ok
+test tests::parse_active_window_info_normalizes_address ... ok
+test tests::parse_active_window_info_preserves_prefixed_address ... ok
+test tests::find_hyprland_socket_with_rejects_ambiguous_fallback_sockets ... ok
+test tests::parse_active_window_info_rejects_missing_or_invalid_address ... ok
+test tests::parse_herdr_client_runtime_from_args_detects_default_client ... ok
+test tests::parse_herdr_client_runtime_from_args_detects_named_session_attach ... ok
+test tests::parse_herdr_client_runtime_from_args_rejects_non_client_commands ... ok
+test tests::parse_herdr_focus_changed_invalid_output_is_none ... ok
+test tests::parse_herdr_focus_changed_no_neighbor_is_false ... ok
+test tests::parse_herdr_focus_changed_reads_cli_result_shape ... ok
+test tests::parse_herdr_focus_changed_returns_true ... ok
+test tests::parse_herdr_runtime_environ_detects_session ... ok
+test tests::parse_herdr_runtime_environ_detects_socket_path ... ok
+test tests::parse_nvim_socket_from_environ_finds_legacy_listen_address ... ok
+test tests::parse_nvim_socket_from_environ_finds_nvim_entry ... ok
+test tests::parse_nvim_socket_from_environ_ignores_empty_values ... ok
+test tests::parse_nvim_socket_from_environ_returns_none_when_absent ... ok
+test tests::parse_tmux_session_info_output_detects_numeric_session_name ... ok
+test tests::parse_tmux_session_info_output_handles_named_session_with_spaces ... ok
+test tests::parse_tmux_socket_from_environ_finds_tmux_entry ... ok
+test tests::parse_tmux_socket_from_environ_ignores_missing_tmux_entry ... ok
+test tests::parse_tmux_socket_from_value_extracts_socket_path ... ok
+test tests::parse_tmux_tty_keyed_value_ignores_malformed_rows_without_tab ... ok
+test tests::parse_tmux_tty_keyed_value_matches_exact_tty ... ok
+test tests::parse_tmux_tty_keyed_value_preserves_names_with_spaces ... ok
+test tests::parse_tmux_tty_keyed_value_rejects_spaced_value_with_wrong_tty ... ok
+test tests::parse_tmux_tty_keyed_value_returns_none_when_tty_missing ... ok
+test tests::pid_has_ancestor_true_for_identical_pid ... ok
+test tests::pid_has_ancestor_false_for_unrelated_pid ... ok
+test tests::pid_has_ancestor_true_for_real_parent ... ok
+test tests::pid_has_ancestor_true_for_spawned_child ... ok
+
+test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/hypr_nav-38bf87a0366765c1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/close.rs (target/debug/deps/hypr_smart_close-536be0dfc919ec88)
+
+running 4 tests
+test tests::chooses_detach_client_for_named_session ... ok
+test tests::chooses_detach_client_for_single_pane_single_window ... ok
+test tests::returns_none_when_kill_pane_target_missing ... ok
+test tests::chooses_kill_pane_for_multi_pane_session ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/tmux.rs (target/debug/deps/hypr_tmux_nav-7bfe54f123671188)
+
+running 7 tests
+test tests::choose_entry_assist_pane_can_fallback_to_active_edge_pane ... ok
+test tests::choose_entry_assist_pane_prefers_inactive_opposite_edge ... ok
+test tests::choose_entry_assist_pane_uses_active_edge_when_no_inactive_edge_exists ... ok
+test tests::choose_entry_assist_pane_requires_multiple_panes ... ok
+test tests::herdr_host_navigate_response_rejects_missing_contract ... ok
+test tests::herdr_host_navigate_response_reports_moved ... ok
+test tests::herdr_host_navigate_response_reports_at_edge ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/integration_harness.rs (target/debug/deps/integration_harness-1d601b570046b4ca)
+
+running 47 tests
+test herdr08_close_refuses_lost_compositor_identity ... ok
+test hypr_nav_exits_nonzero_when_hypr_fallback_dispatch_fails ... ok
+test herdr08_navigation_uses_current_protocol ... ok
+test hypr_nav_prefers_kitty_before_hypr_fallback ... ok
+test hypr_nav_detects_custom_class_kitty_by_pid ... ok
+test hypr_nav_falls_back_to_hypr_when_kitty_navigation_fails ... ok
+test herdr08_final_host_close_refuses_changed_window ... ok
+test hypr_nav_falls_back_to_legacy_when_lua_dispatch_fails ... ok
+test herdr_close_current_api_targets_captured_pane ... ok
+test herdr_close_current_api_final_pane_only_closes_outer_host ... ok
+usage: hypr-smart-close
+test hypr_smart_close_closes_captured_non_terminal_window ... ok
+test hypr_smart_close_closes_captured_kitty_hypr_window_only ... ok
+test hypr_smart_close_fails_closed_when_active_window_identity_is_incomplete ... ok
+test hypr_smart_close_rejects_unexpected_args_without_acting ... ok
+test herdr08_named_client_close_ignores_inherited_parent_socket ... ok
+test hypr_smart_close_does_not_log_by_default ... ok
+test hypr_smart_close_detaches_named_tmux_session ... ok
+test hypr_smart_close_falls_back_to_legacy_when_lua_dispatch_fails ... ok
+test hypr_tmux_nav_exits_nonzero_when_hypr_fallback_dispatch_fails ... ok
+test herdr_close_current_api_errors_never_close_outer_host ... ok
+test hypr_smart_close_logs_captured_address_and_dispatch ... ok
+test herdr_close_current_api_preserves_other_tabs_and_workspaces ... ok
+test hypr_smart_close_logs_failed_hypr_dispatch_reply_and_exits_nonzero ... ok
+test hypr_smart_close_fails_closed_when_tmux_target_is_ambiguous ... ok
+test hypr_smart_close_respects_disabled_close_log_value ... ok
+test hypr_smart_close_truncates_large_explicit_close_log ... ok
+test hypr_smart_close_kills_pane_for_unnamed_multi_pane_session ... ok
+test hypr_tmux_nav_prefers_nvim_before_tmux_and_hypr ... ok
+test hypr_tmux_nav_exits_nonzero_when_hypr_fallback_dispatch_reply_is_rejected ... ok
+test shared_kitty_focus_change_refuses_stale_inner_action ... ok
+test hypr_tmux_nav_falls_back_to_hypr_when_tmux_cannot_move ... ok
+test hypr_tmux_nav_falls_back_to_tmux_before_hypr ... ok
+test hypr_tmux_nav_uses_kitty_probe_pid_that_is_descendant_of_active_window ... ok
+test shared_kitty_neighbor_uses_exact_tagged_pane_id ... ok
+test shared_kitty_herdr_close_uses_tagged_context_despite_other_os_focus ... ok
+test hypr_tmux_nav_falls_back_to_legacy_when_lua_dispatch_fails ... ok
+test inherited_herdr_environment_in_a_non_terminal_does_not_route_to_herdr ... ok
+test shared_kitty_custom_class_empty_context_is_authoritative ... ok
+test hypr_tmux_nav_ignores_kitty_probe_pid_from_unrelated_process_tree ... ok
+test shared_kitty_nvim_navigation_keeps_precedence ... ok
+test shared_kitty_plain_shell_does_not_close_sibling_herdr ... ok
+test shared_kitty_tmux_navigation_uses_tagged_tty ... ok
+test shared_kitty_ambiguous_or_failed_identity_refuses_close ... ok
+test herdr08_cross_window_entry_targets_observed_destination ... ok
+test herdr_close_current_api_rejects_incomplete_or_ambiguous_target ... ok
+test smart_close_fails_closed_when_herdr_server_wedges ... ok
+test smart_close_watchdog_bounds_wedged_tmux_without_dispatching ... ok
+
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.20s
+
+   Doc-tests hypr_nav_lib
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+command: cargo clippy --all-targets -- -D warnings
+exit: 0
+    Checking hypr-nav v1.0.0 (/home/joebutler/development/hypr-nav)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.20s

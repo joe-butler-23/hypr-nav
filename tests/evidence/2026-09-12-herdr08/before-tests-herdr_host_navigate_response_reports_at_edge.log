@@ -1,0 +1,22 @@
+command: cargo test --bin hypr-tmux-nav tests::herdr_host_navigate_response_reports_at_edge -- --exact --nocapture
+exit: 101
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/tmux.rs (target/debug/deps/hypr_tmux_nav-7bfe54f123671188)
+
+running 1 test
+
+thread 'tests::herdr_host_navigate_response_reports_at_edge' (3006950) panicked at src/tmux.rs:560:9:
+assertion `left == right` failed
+  left: None
+ right: Some(AtEdge)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tests::herdr_host_navigate_response_reports_at_edge ... FAILED
+
+failures:
+
+failures:
+    tests::herdr_host_navigate_response_reports_at_edge
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--bin hypr-tmux-nav`
