@@ -2,15 +2,19 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 const IO_TIMEOUT: Duration = Duration::from_millis(500);
 const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(2);
+const WATCHDOG_REAP_TIMEOUT: Duration = Duration::from_millis(500);
+static COMMAND_CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 
 /// Known terminal emulator window classes
 pub const KNOWN_TERMINALS: &[&str] = &["kitty"];
@@ -284,10 +288,110 @@ fn configure_socket(stream: &UnixStream) -> bool {
 }
 
 pub fn start_watchdog() {
+    // Adopt command grandchildren so timeout cleanup can reap the whole group.
+    // SAFETY: prctl takes integer arguments and no pointers for this operation.
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+        eprintln!(
+            "hypr-nav: cannot own command descendants: {}",
+            io::Error::last_os_error()
+        );
+        std::process::exit(1);
+    }
     std::thread::spawn(|| {
         std::thread::sleep(WATCHDOG_TIMEOUT);
+        // Hold ownership until exit: a command unblocked by SIGKILL must never
+        // return to the routing code and dispatch a late close or fallback.
+        let children = COMMAND_CHILDREN.lock().unwrap();
+        for child in children.iter() {
+            // Each unreaped child pins the ID of its private process group.
+            // SAFETY: only groups created by watched_command are targeted.
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+        }
+        let reap_deadline = Instant::now() + WATCHDOG_REAP_TIMEOUT;
+        loop {
+            // SAFETY: null status is permitted; these are our own children,
+            // including grandchildren adopted after their parent is killed.
+            let result = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            if result < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+                break;
+            }
+            if Instant::now() >= reap_deadline {
+                eprintln!("hypr-nav: command cleanup exceeded its deadline");
+                break;
+            }
+            if result <= 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
         std::process::exit(124);
     });
+}
+
+/// Run IPC clients under the keypress watchdog's process ownership.
+pub trait WatchdogCommand {
+    fn watched_output(&mut self) -> io::Result<Output>;
+    fn watched_status(&mut self) -> io::Result<ExitStatus>;
+}
+
+impl WatchdogCommand for Command {
+    fn watched_output(&mut self) -> io::Result<Output> {
+        self.stdin(Stdio::null()).stdout(Stdio::piped());
+        watched_command(self)
+    }
+
+    fn watched_status(&mut self) -> io::Result<ExitStatus> {
+        self.stdout(Stdio::null());
+        watched_command(self).map(|output| output.status)
+    }
+}
+
+fn watched_command(command: &mut Command) -> io::Result<Output> {
+    let (pid, stdout) = {
+        let mut children = COMMAND_CHILDREN.lock().unwrap();
+        let mut child = command.process_group(0).stderr(Stdio::null()).spawn()?;
+        let pid = child.id();
+        let stdout = child.stdout.take();
+        children.push(child);
+        (pid, stdout)
+    };
+    let mut output = Vec::new();
+    let read_result = stdout.map(|mut pipe| pipe.read_to_end(&mut output));
+
+    // Observe exit without reaping: the watchdog must not signal a process
+    // group whose leader's PID has been released for reuse.
+    let wait_result = loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+        // SAFETY: info is writable; WNOWAIT preserves ownership until the lock.
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        } == 0
+        {
+            break Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            break Err(error);
+        }
+    };
+    let mut children = COMMAND_CHILDREN.lock().unwrap();
+    // The watchdog may have reaped the child before waitid ran. Even that
+    // error must wait for ownership, so it cannot escape into route fallback.
+    wait_result?;
+    let index = children.iter().position(|child| child.id() == pid).unwrap();
+    let status = children.swap_remove(index).wait()?;
+    if let Some(result) = read_result {
+        result?;
+    }
+    Ok(Output {
+        status,
+        stdout: output,
+        stderr: Vec::new(),
+    })
 }
 
 fn valid_hypr_socket_paths(dir: &Path) -> Vec<PathBuf> {
@@ -823,7 +927,7 @@ pub fn nvim_navigate_or_edge(socket: &str, direction: Direction) -> NvimNavOutco
         .args(["--server", socket, "--remote-expr", &expr])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output();
+        .watched_output();
 
     let outcome = match output {
         Ok(out) if out.status.success() => {
@@ -1095,7 +1199,7 @@ fn detect_terminal_runtime_from_kitty(active_pid: u32) -> KittyRuntimeProbe {
         .args(["@", "--to", &kitty_uri, "ls"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .watched_output()
         .ok();
 
     let output = match output {
@@ -1531,7 +1635,7 @@ pub fn try_nvim_entry_assist(socket: &str, direction: Direction) -> bool {
         .args(["--server", socket, "--remote-expr", &expr])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output();
+        .watched_output();
 
     let result = match output {
         Ok(out) if out.status.success() => {
@@ -1565,7 +1669,7 @@ pub fn tmux_capture(args: &[&str], socket_path: Option<&str>) -> Option<String> 
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .watched_output()
         .ok()?;
 
     if !output.status.success() {
@@ -1580,7 +1684,7 @@ pub fn tmux_status(args: &[&str], socket_path: Option<&str>) -> bool {
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .watched_status()
         .map(|status| status.success())
         .unwrap_or(false)
 }
@@ -1678,7 +1782,7 @@ pub fn get_tmux_session_info(session: &str, socket_path: Option<&str>) -> Option
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .watched_output()
         .ok()?;
 
     if !output.status.success() {

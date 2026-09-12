@@ -49,7 +49,7 @@ fn main() {
                 ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status();
+                .watched_status();
 
             if let Ok(s) = status {
                 if s.success() {

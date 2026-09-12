@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -448,7 +449,11 @@ if [[ "${args[0]-}" == "-S" ]]; then
 fi
 echo "tmux ${args[*]}" >> "$TEST_LOG"
 if [[ "${TEST_TMUX_SLEEP:-0}" == "1" ]]; then
-  while :; do sleep 1; done
+  sleep 3600 &
+  sleeper=$!
+  printf '%s %s\n' "$$" "$sleeper" > "$TEST_TMUX_PID_FILE.tmp"
+  mv "$TEST_TMUX_PID_FILE.tmp" "$TEST_TMUX_PID_FILE"
+  wait "$sleeper"
 fi
 joined=" ${args[*]} "
 cmd="${args[0]-}"
@@ -611,7 +616,7 @@ fn spawn_process_named_with_env(name: &str, envs: &[(&str, &str)]) -> Child {
     command.spawn().expect("named process should spawn")
 }
 
-fn run_binary_status(bin_name: &str, args: &[&str], envs: &[(String, String)]) -> ExitStatus {
+fn binary_command(bin_name: &str, args: &[&str], envs: &[(String, String)]) -> Command {
     let bin = match bin_name {
         "hypr-nav" => env!("CARGO_BIN_EXE_hypr-nav"),
         "hypr-tmux-nav" => env!("CARGO_BIN_EXE_hypr-tmux-nav"),
@@ -625,7 +630,39 @@ fn run_binary_status(bin_name: &str, args: &[&str], envs: &[(String, String)]) -
     for (key, value) in envs {
         command.env(key, value);
     }
-    command.status().expect("binary should run")
+    command
+}
+
+fn run_binary_status(bin_name: &str, args: &[&str], envs: &[(String, String)]) -> ExitStatus {
+    binary_command(bin_name, args, envs)
+        .status()
+        .expect("binary should run")
+}
+
+struct WatchdogFixture {
+    child: Child,
+    descendants: Vec<(u32, OwnedFd)>,
+}
+
+impl Drop for WatchdogFixture {
+    fn drop(&mut self) {
+        // A failed assertion or mutation trial must not leave its fixture alive.
+        // pidfds retain exact identity even after a fixture PID has been reused.
+        for (_, fd) in &self.descendants {
+            // SAFETY: fd belongs to a fixture we observed while it was running.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 fn run_binary(bin_name: &str, args: &[&str], envs: &[(String, String)]) {
@@ -1775,15 +1812,69 @@ fn smart_close_watchdog_bounds_wedged_tmux_without_dispatching() {
         .display()
         .to_string();
     let mut envs = harness.envs();
+    let tmux_pid_file = harness.runtime_dir.join("tmux.pids");
     envs.extend([
         ("TERMINAL".to_string(), "termstub".to_string()),
         ("TEST_TTY".to_string(), tty),
         ("TEST_TMUX_SLEEP".to_string(), "1".to_string()),
+        (
+            "TEST_TMUX_PID_FILE".to_string(),
+            tmux_pid_file.display().to_string(),
+        ),
     ]);
 
     let started = Instant::now();
-    let status = run_binary_status("hypr-smart-close", &[], &envs);
-    assert!(!status.success(), "watchdog must fail closed");
+    let mut fixture = WatchdogFixture {
+        child: binary_command("hypr-smart-close", &[], &envs)
+            .spawn()
+            .expect("smart-close should spawn"),
+        descendants: Vec::new(),
+    };
+    let publication_deadline = started + Duration::from_secs(2);
+    let pids = loop {
+        if let Ok(contents) = fs::read_to_string(&tmux_pid_file) {
+            break contents
+                .split_whitespace()
+                .map(|pid| pid.parse::<u32>().expect("fixture PID should be valid"))
+                .collect::<Vec<_>>();
+        }
+        assert!(
+            Instant::now() < publication_deadline,
+            "tmux did not publish its descendants"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(
+        pids.len(),
+        2,
+        "must exercise both command child and grandchild"
+    );
+    for pid in pids {
+        // SAFETY: pidfd_open has integer arguments and returns an owned FD.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+        assert!(
+            fd >= 0,
+            "fixture {pid} should still be alive: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: a successful pidfd_open returns a new, uniquely owned FD.
+        fixture
+            .descendants
+            .push((pid, unsafe { OwnedFd::from_raw_fd(fd) }));
+    }
+    let exit_deadline = started + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = fixture
+            .child
+            .try_wait()
+            .expect("smart-close status should be readable")
+        {
+            break status;
+        }
+        assert!(Instant::now() < exit_deadline, "watchdog did not terminate");
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(status.code(), Some(124), "watchdog must fail closed");
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "watchdog did not bound the wedged tmux command"
@@ -1795,6 +1886,17 @@ fn smart_close_watchdog_bounds_wedged_tmux_without_dispatching() {
             .any(|request| request.starts_with("dispatch ")),
         "watchdog exit must not dispatch a close"
     );
+    let log = harness.log_contents();
+    assert!(
+        !log.contains("detach-client") && !log.contains("kill-pane"),
+        "timeout must not close a tmux target: {log}"
+    );
+    for (pid, _) in &fixture.descendants {
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "watchdog left descendant {pid} alive or unreaped"
+        );
+    }
 }
 
 #[test]
