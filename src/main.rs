@@ -16,53 +16,39 @@ fn main() {
         None => std::process::exit(2),
     };
     let move_dir = direction.hypr_movefocus_arg();
-    let kitty_dir = direction.kitty_neighbor();
 
     let hypr_socket = match find_hyprland_socket() {
         Some(path) => path,
         None => std::process::exit(1),
     };
-    debug_log!(
-        "kitty-nav",
-        "input={} move_dir={} kitty_dir={}",
-        args[1],
-        move_dir,
-        kitty_dir
-    );
+    debug_log!("kitty-nav", "input={} move_dir={}", args[1], move_dir);
 
-    // Check if active window is Kitty
-    if let Some(active_pid) = active_kitty_pid(&hypr_socket) {
-        debug_log!(
-            "kitty-nav",
-            "kitty is active, trying kitty neighbor navigation"
-        );
-        if let Some(kitty_socket_uri) = kitty_control_socket_uri_for_pid(active_pid) {
-            let neighbor_match = format!("neighbor:{}", kitty_dir);
-            let status = Command::new("kitty")
-                .args([
-                    "@",
-                    "--to",
-                    &kitty_socket_uri,
-                    "focus-window",
-                    "--match",
-                    &neighbor_match,
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .watched_status();
-
-            if let Ok(s) = status {
-                if s.success() {
-                    debug_log!("kitty-nav", "kitty neighbor navigation succeeded");
-                    return;
+    if let Some(active) = get_active_window_snapshot(&hypr_socket) {
+        if is_kitty_window(&active.class, active.pid) {
+            if let Some(context) = kitty_context(&active) {
+                if let Some(neighbor) = context.neighbor_id(direction) {
+                    if !active_window_is_current(&hypr_socket, &active) {
+                        return;
+                    }
+                    let target = format!("id:{neighbor}");
+                    let status = Command::new("kitty")
+                        .args([
+                            "@",
+                            "--to",
+                            &context.socket_uri,
+                            "focus-window",
+                            "--match",
+                            &target,
+                        ])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .watched_status();
+                    if status.is_ok_and(|status| status.success()) {
+                        return;
+                    }
                 }
             }
-            debug_log!("kitty-nav", "kitty command did not succeed");
-        } else {
-            debug_log!("kitty-nav", "kitty socket unavailable");
         }
-    } else {
-        debug_log!("kitty-nav", "kitty not active");
     }
 
     debug_log!("kitty-nav", "fallback to hypr movefocus {}", move_dir);
@@ -70,19 +56,4 @@ fn main() {
     if !hypr_dispatch_action(&hypr_socket, &action) {
         std::process::exit(1);
     }
-}
-
-fn active_kitty_pid(socket_path: &std::path::PathBuf) -> Option<u32> {
-    if let Some((class, pid)) = get_active_window_info(socket_path) {
-        let is_kitty = is_kitty_window(&class, pid);
-        debug_log!(
-            "kitty-nav",
-            "activewindow class={} pid={} kitty={}",
-            class,
-            pid,
-            is_kitty
-        );
-        return is_kitty.then_some(pid);
-    }
-    None
 }

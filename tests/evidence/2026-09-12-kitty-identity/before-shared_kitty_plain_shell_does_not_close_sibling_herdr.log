@@ -1,0 +1,27 @@
+command: cargo test --test integration_harness shared_kitty_plain_shell_does_not_close_sibling_herdr -- --exact --nocapture
+exit: 101
+   Compiling zmij v1.0.20
+   Compiling serde_core v1.0.228
+   Compiling libc v0.2.189
+   Compiling serde_json v1.0.149
+   Compiling memchr v2.8.0
+   Compiling itoa v1.0.17
+   Compiling hypr-nav v1.0.0 (/tmp/hypr-nav-klv-before-doudole4)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.00s
+     Running tests/integration_harness.rs (target/debug/deps/integration_harness-1d601b570046b4ca)
+
+running 1 test
+
+thread 'shared_kitty_plain_shell_does_not_close_sibling_herdr' (2957807) panicked at tests/integration_harness.rs:2236:5:
+must not touch sibling Herdr: ["{\"id\":\"hypr-close:snapshot\",\"method\":\"session.snapshot\",\"params\":{}}", "{\"id\":\"hypr-close:pane:close\",\"method\":\"pane.close\",\"params\":{\"pane_id\":\"w1:p1\"}}"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test shared_kitty_plain_shell_does_not_close_sibling_herdr ... FAILED
+
+failures:
+
+failures:
+    shared_kitty_plain_shell_does_not_close_sibling_herdr
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.05s
+
+error: test failed, to rerun pass `--test integration_harness`

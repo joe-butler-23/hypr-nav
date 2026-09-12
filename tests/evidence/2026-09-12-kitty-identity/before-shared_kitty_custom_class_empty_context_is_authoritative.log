@@ -1,0 +1,20 @@
+command: cargo test --test integration_harness shared_kitty_custom_class_empty_context_is_authoritative -- --exact --nocapture
+exit: 101
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running tests/integration_harness.rs (target/debug/deps/integration_harness-1d601b570046b4ca)
+
+running 1 test
+
+thread 'shared_kitty_custom_class_empty_context_is_authoritative' (2957830) panicked at tests/integration_harness.rs:2236:5:
+must not touch sibling Herdr: ["{\"id\":\"hypr-close:snapshot\",\"method\":\"session.snapshot\",\"params\":{}}", "{\"id\":\"hypr-close:pane:close\",\"method\":\"pane.close\",\"params\":{\"pane_id\":\"w1:p1\"}}"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test shared_kitty_custom_class_empty_context_is_authoritative ... FAILED
+
+failures:
+
+failures:
+    shared_kitty_custom_class_empty_context_is_authoritative
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.05s
+
+error: test failed, to rerun pass `--test integration_harness`

@@ -1,0 +1,22 @@
+command: cargo test --test integration_harness shared_kitty_herdr_close_uses_tagged_context_despite_other_os_focus -- --exact --nocapture
+exit: 101
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running tests/integration_harness.rs (target/debug/deps/integration_harness-1d601b570046b4ca)
+
+running 1 test
+
+thread 'shared_kitty_herdr_close_uses_tagged_context_despite_other_os_focus' (2957900) panicked at tests/integration_harness.rs:2328:5:
+assertion `left == right` failed
+  left: 0
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test shared_kitty_herdr_close_uses_tagged_context_despite_other_os_focus ... FAILED
+
+failures:
+
+failures:
+    shared_kitty_herdr_close_uses_tagged_context_despite_other_os_focus
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `--test integration_harness`

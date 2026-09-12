@@ -312,10 +312,15 @@ fn main() {
     let mut current_tty: Option<String> = None;
     let mut herdr_entry_runtime: Option<HerdrRuntime> = None;
 
-    if let Some((class, pid)) = get_active_window_info(&hypr_socket) {
-        if is_terminal_window(&class, pid) {
+    if let Some(active) = get_active_window_snapshot(&hypr_socket) {
+        let class = &active.class;
+        let pid = active.pid;
+        if is_terminal_window(class, pid) {
             debug_log!("tmux-nav", "terminal active class={} pid={}", class, pid);
-            let terminal = detect_terminal_runtime(pid, &class);
+            let terminal = detect_terminal_runtime(&active).unwrap_or_default();
+            if !active_window_is_current(&hypr_socket, &active) {
+                std::process::exit(1);
+            }
             current_tty = terminal.tty.clone();
 
             // Layer 1: Try nvim split navigation first
@@ -356,6 +361,9 @@ fn main() {
 
             // Layer 2: Try Herdr pane navigation for a Herdr client running in the terminal
             if let Some(ref runtime) = terminal.herdr {
+                if !active_window_is_current(&hypr_socket, &active) {
+                    std::process::exit(1);
+                }
                 herdr_entry_runtime = Some(runtime.clone());
                 debug_log!(
                     "tmux-nav",
@@ -384,6 +392,9 @@ fn main() {
                 if let Some(target) = find_tmux_client_target(&runtime.tty, socket_path)
                     .or_else(|| find_tmux_pane_target(&runtime.tty, socket_path))
                 {
+                    if !active_window_is_current(&hypr_socket, &active) {
+                        std::process::exit(1);
+                    }
                     if navigate_tmux_target(
                         &target.pane,
                         target.at_edge(direction),
@@ -401,7 +412,7 @@ fn main() {
             } else {
                 debug_log!("tmux-nav", "terminal active but no tmux runtime detected");
             }
-        } else if let Some(runtime) = detect_herdr_runtime(pid, &class) {
+        } else if let Some(runtime) = detect_herdr_runtime(pid, class) {
             herdr_entry_runtime = Some(runtime.clone());
             debug_log!(
                 "tmux-nav",

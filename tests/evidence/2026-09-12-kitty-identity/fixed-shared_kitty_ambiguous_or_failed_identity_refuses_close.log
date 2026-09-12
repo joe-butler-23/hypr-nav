@@ -1,0 +1,17 @@
+command: cargo test --test integration_harness shared_kitty_ambiguous_or_failed_identity_refuses_close -- --exact --nocapture
+exit: 0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running tests/integration_harness.rs (target/debug/deps/integration_harness-1d601b570046b4ca)
+
+running 1 test
+identity fixture kitty/duplicate_tag: exit=exit status: 1 dispatched=false sibling_requests=0
+identity fixture kitty/missing_tag: exit=exit status: 1 dispatched=false sibling_requests=0
+identity fixture kitty/wrong_class: exit=exit status: 1 dispatched=false sibling_requests=0
+identity fixture kitty/duplicate_active_pane: exit=exit status: 1 dispatched=false sibling_requests=0
+identity fixture kitty/missing_active_tab: exit=exit status: 1 dispatched=false sibling_requests=0
+identity fixture kitty/unrelated_pid: exit=exit status: 1 dispatched=false sibling_requests=0
+identity fixture kitty/probe_failure: exit=exit status: 1 dispatched=false sibling_requests=0
+test shared_kitty_ambiguous_or_failed_identity_refuses_close ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.22s
+

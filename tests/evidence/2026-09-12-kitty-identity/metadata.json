@@ -1,0 +1,92 @@
+{
+  "base_revision": "a08ce514f6b94438832d88d9ac810312b6d3d4ce",
+  "before_tree": "/tmp/hypr-nav-klv-before-doudole4",
+  "production_sha256": {
+    "src/close.rs": "a7da17d27893eed4f4f5e9216589fc9586c67b4c42ee4742f80bbcd6db6e7e79",
+    "src/lib.rs": "983705c672458ea387bf6e0074821813ee8a9cf42e0b21c5d7d9d4962019bffb",
+    "src/main.rs": "fcaedd9ec86551be961e68627b636238c0b03f5515386ab44bf5410905648602",
+    "src/tmux.rs": "2e7ceabb67c95c5875ffc3332035b278bbb423233a8d9f1849980f35793236b8"
+  },
+  "records": [
+    {
+      "lane": "fixed",
+      "test": "shared_kitty_plain_shell_does_not_close_sibling_herdr",
+      "exit": 0
+    },
+    {
+      "lane": "fixed",
+      "test": "shared_kitty_custom_class_empty_context_is_authoritative",
+      "exit": 0
+    },
+    {
+      "lane": "fixed",
+      "test": "shared_kitty_ambiguous_or_failed_identity_refuses_close",
+      "exit": 0
+    },
+    {
+      "lane": "fixed",
+      "test": "shared_kitty_neighbor_uses_exact_tagged_pane_id",
+      "exit": 0
+    },
+    {
+      "lane": "fixed",
+      "test": "shared_kitty_herdr_close_uses_tagged_context_despite_other_os_focus",
+      "exit": 0
+    },
+    {
+      "lane": "fixed",
+      "test": "shared_kitty_tmux_navigation_uses_tagged_tty",
+      "exit": 0
+    },
+    {
+      "lane": "fixed",
+      "test": "shared_kitty_nvim_navigation_keeps_precedence",
+      "exit": 0
+    },
+    {
+      "lane": "fixed",
+      "test": "shared_kitty_focus_change_refuses_stale_inner_action",
+      "exit": 0
+    },
+    {
+      "lane": "before",
+      "test": "shared_kitty_plain_shell_does_not_close_sibling_herdr",
+      "exit": 101
+    },
+    {
+      "lane": "before",
+      "test": "shared_kitty_custom_class_empty_context_is_authoritative",
+      "exit": 101
+    },
+    {
+      "lane": "before",
+      "test": "shared_kitty_ambiguous_or_failed_identity_refuses_close",
+      "exit": 101
+    },
+    {
+      "lane": "before",
+      "test": "shared_kitty_neighbor_uses_exact_tagged_pane_id",
+      "exit": 101
+    },
+    {
+      "lane": "before",
+      "test": "shared_kitty_herdr_close_uses_tagged_context_despite_other_os_focus",
+      "exit": 101
+    },
+    {
+      "lane": "before",
+      "test": "shared_kitty_tmux_navigation_uses_tagged_tty",
+      "exit": 101
+    },
+    {
+      "lane": "before",
+      "test": "shared_kitty_nvim_navigation_keeps_precedence",
+      "exit": 101
+    },
+    {
+      "lane": "before",
+      "test": "shared_kitty_focus_change_refuses_stale_inner_action",
+      "exit": 101
+    }
+  ]
+}

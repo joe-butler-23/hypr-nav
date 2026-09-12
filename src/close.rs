@@ -45,7 +45,19 @@ fn main() {
     log_close_event("active_captured", active_window_json(&active));
 
     let terminal_window = is_terminal_window(&active.class, active.pid);
-    let terminal = terminal_window.then(|| detect_terminal_runtime(active.pid, &active.class));
+    let terminal = if terminal_window {
+        let Some(runtime) = detect_terminal_runtime(&active) else {
+            log_close_event("terminal_identity_unresolved", active_window_json(&active));
+            std::process::exit(1);
+        };
+        Some(runtime)
+    } else {
+        None
+    };
+    if terminal_window && !active_window_is_current(&hypr_socket, &active) {
+        log_close_event("active_window_changed", active_window_json(&active));
+        std::process::exit(1);
+    }
     let nonterminal_herdr = (!terminal_window)
         .then(|| detect_herdr_runtime(active.pid, &active.class))
         .flatten();
@@ -55,7 +67,7 @@ fn main() {
         .and_then(|runtime| runtime.herdr.as_ref())
         .or(nonterminal_herdr.as_ref())
     {
-        match herdr_close(runtime) {
+        match herdr_close(runtime, || active_window_is_current(&hypr_socket, &active)) {
             Some(HerdrCloseAction::ClosePane(_)) => {
                 debug_log!("smart-close", "herdr host close handled");
                 log_close_event(
@@ -221,7 +233,10 @@ enum HerdrCloseAction {
     CloseHost,
 }
 
-fn herdr_close(runtime: &HerdrRuntime) -> Option<HerdrCloseAction> {
+fn herdr_close(
+    runtime: &HerdrRuntime,
+    still_current: impl Fn() -> bool,
+) -> Option<HerdrCloseAction> {
     let snapshot = herdr_request(
         runtime,
         "hypr-close:snapshot",
@@ -232,6 +247,9 @@ fn herdr_close(runtime: &HerdrRuntime) -> Option<HerdrCloseAction> {
     if let HerdrCloseAction::ClosePane(ref pane_id) = action {
         // Closing the captured pane also removes an empty tab/workspace. Never
         // close an entire tab: another pane may have appeared since the snapshot.
+        if !still_current() {
+            return None;
+        }
         let response = herdr_request(
             runtime,
             "hypr-close:pane:close",

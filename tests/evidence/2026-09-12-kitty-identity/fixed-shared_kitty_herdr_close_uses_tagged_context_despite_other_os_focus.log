@@ -1,0 +1,10 @@
+command: cargo test --test integration_harness shared_kitty_herdr_close_uses_tagged_context_despite_other_os_focus -- --exact --nocapture
+exit: 0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running tests/integration_harness.rs (target/debug/deps/integration_harness-1d601b570046b4ca)
+
+running 1 test
+test shared_kitty_herdr_close_uses_tagged_context_despite_other_os_focus ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.05s
+

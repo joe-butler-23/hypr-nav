@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -64,11 +64,11 @@ impl HyprServer {
     }
 
     fn start_with_response(runtime_dir: &Path, sig: &str, active_response: &str) -> Self {
-        Self::start_with_options(runtime_dir, sig, active_response, "ok", false)
+        Self::start_with_options(runtime_dir, sig, active_response, "ok", false, None)
     }
 
     fn start_with_response_then_stop(runtime_dir: &Path, sig: &str, active_response: &str) -> Self {
-        Self::start_with_options(runtime_dir, sig, active_response, "ok", true)
+        Self::start_with_options(runtime_dir, sig, active_response, "ok", true, None)
     }
 
     /// Start a fake Hyprland server whose `dispatch ...` requests are
@@ -80,7 +80,14 @@ impl HyprServer {
         active_response: &str,
         dispatch_response: &str,
     ) -> Self {
-        Self::start_with_options(runtime_dir, sig, active_response, dispatch_response, false)
+        Self::start_with_options(
+            runtime_dir,
+            sig,
+            active_response,
+            dispatch_response,
+            false,
+            None,
+        )
     }
 
     /// Start a fake Hyprland server that rejects Lua-form dispatches and
@@ -164,6 +171,7 @@ impl HyprServer {
         active_response: &str,
         dispatch_response: &str,
         stop_after_activewindow: bool,
+        next_active_response: Option<&str>,
     ) -> Self {
         let socket_dir = runtime_dir.join("hypr").join(sig);
         fs::create_dir_all(&socket_dir).expect("hypr runtime dir should be created");
@@ -178,6 +186,8 @@ impl HyprServer {
         let requests_clone = Arc::clone(&requests);
         let stop_clone = Arc::clone(&stop);
         let active_response = active_response.to_string();
+        let next_active_response = next_active_response.map(str::to_string);
+        let mut active_queries = 0;
         let dispatch_response = dispatch_response.to_string();
         let socket_path_for_thread = socket_path.clone();
 
@@ -189,7 +199,13 @@ impl HyprServer {
                         let _ = stream.read_to_string(&mut request);
                         let request = request.trim().to_string();
                         if request == "activewindow" {
-                            let _ = stream.write_all(active_response.as_bytes());
+                            let response = if active_queries == 0 {
+                                &active_response
+                            } else {
+                                next_active_response.as_ref().unwrap_or(&active_response)
+                            };
+                            active_queries += 1;
+                            let _ = stream.write_all(response.as_bytes());
                             if stop_after_activewindow {
                                 let _ = fs::remove_file(&socket_path_for_thread);
                                 stop_clone.store(true, Ordering::Relaxed);
@@ -394,7 +410,7 @@ if [[ "${1-}" == "--sleep-forever" ]]; then
 fi
 if [[ "${1-}" == "@" && "${4-}" == "ls" ]]; then
   printf '%s' "${TEST_KITTY_LS_JSON:-[]}"
-  exit 0
+  exit "${TEST_KITTY_LS_EXIT:-0}"
 fi
 if [[ "${1-}" == "@" && "${4-}" == "close-window" ]]; then
   if [[ "${TEST_KITTY_CLOSE_OK:-0}" == "1" ]]; then
@@ -538,15 +554,19 @@ exit 1
                 self.hypr_sig.clone(),
             ),
             ("KITTY_LISTEN_ON".to_string(), self.kitty_socket_uri.clone()),
+            (
+                "TEST_KITTY_LS_JSON".to_string(),
+                singleton_kitty("kitty", std::process::id()).to_string(),
+            ),
             ("TEST_LOG".to_string(), self.log_path.display().to_string()),
             ("PATH".to_string(), path),
         ]
     }
 
-    fn kitty_focus_log_line(&self, neighbor: &str) -> String {
+    fn kitty_focus_log_line(&self, _neighbor: &str) -> String {
         format!(
-            "kitty @ --to {} focus-window --match neighbor:{}",
-            self.kitty_socket_uri, neighbor
+            "kitty @ --to {} focus-window --match id:2",
+            self.kitty_socket_uri
         )
     }
 
@@ -721,6 +741,10 @@ fn hypr_nav_detects_custom_class_kitty_by_pid() {
     let mut envs = harness.envs();
     envs.push(("TEST_KITTY_FOCUS_OK".to_string(), "1".to_string()));
 
+    envs.push((
+        "TEST_KITTY_LS_JSON".to_string(),
+        singleton_kitty("custom-terminal", kitty_process.id()).to_string(),
+    ));
     run_binary("hypr-nav", &["left"], &envs);
 
     let _ = kitty_process.kill();
@@ -793,8 +817,7 @@ fn hypr_smart_close_closes_captured_kitty_hypr_window_only() {
     envs.push(("TEST_KITTY_CLOSE_OK".to_string(), "1".to_string()));
     envs.push((
         "TEST_KITTY_LS_JSON".to_string(),
-        r#"[{"is_focused":true,"tabs":[{"is_focused":true,"windows":[{"is_focused":true,"pid":999}]}]}]"#
-            .to_string(),
+        singleton_kitty("kitty", std::process::id()).to_string(),
     ));
 
     run_binary("hypr-smart-close", &[], &envs);
@@ -865,7 +888,7 @@ fn hypr_smart_close_logs_captured_address_and_dispatch() {
     let hypr = HyprServer::start_with_response(
         &harness.runtime_dir,
         &harness.hypr_sig,
-        "Window abc123 -> test window:\nclass: kitty\ntitle: work terminal\npid: 4242\nfocusHistoryID: 0\n",
+        &format!("Window abc123 -> test window:\nclass: kitty\ntitle: work terminal\npid: {}\nfocusHistoryID: 0\n", std::process::id()),
     );
 
     let mut envs = harness.envs();
@@ -1430,7 +1453,7 @@ fn hypr_tmux_nav_ignores_kitty_probe_pid_from_unrelated_process_tree() {
     envs.push((
         "TEST_KITTY_LS_JSON".to_string(),
         format!(
-            r#"[{{"is_focused":true,"tabs":[{{"is_focused":true,"windows":[{{"is_focused":true,"pid":{}}}]}}]}}]"#,
+            r#"[{{"wm_class":"kitty","is_focused":true,"tabs":[{{"is_focused":true,"windows":[{{"is_focused":true,"pid":{}}}]}}]}}]"#,
             other_pty.pid
         ),
     ));
@@ -1485,7 +1508,7 @@ fn hypr_tmux_nav_uses_kitty_probe_pid_that_is_descendant_of_active_window() {
     envs.push((
         "TEST_KITTY_LS_JSON".to_string(),
         format!(
-            r#"[{{"is_focused":true,"tabs":[{{"is_focused":true,"windows":[{{"is_focused":true,"pid":{}}}]}}]}}]"#,
+            r#"[{{"wm_class":"kitty","is_focused":true,"tabs":[{{"is_focused":true,"windows":[{{"is_focused":true,"pid":{}}}]}}]}}]"#,
             pty.pid
         ),
     ));
@@ -2075,4 +2098,339 @@ fn herdr_close_current_api_rejects_incomplete_or_ambiguous_target() {
             false,
         );
     }
+}
+
+fn singleton_kitty(class: &str, pid: u32) -> serde_json::Value {
+    serde_json::json!([{
+        "id": 1, "wm_class": class, "wm_name": "kitty", "is_focused": true,
+        "tabs": [{"id": 1, "is_active": true, "is_focused": true,
+            "active_window_history": [2, 1], "groups": [{"id":100,"windows":[1]}, {"id":200,"windows":[2]}], "windows": [
+                {"id": 1, "is_active": true, "is_focused": true, "pid": pid, "neighbors": {"left": [200]}},
+                {"id": 2, "is_active": false, "is_focused": false, "pid": pid, "neighbors": {"right": [100]}}
+            ]}]
+    }])
+}
+
+/// Two terminal contexts beneath one real process tree. The sibling is a
+/// recognizable Herdr client; all protocol sockets remain fake and disposable.
+struct SharedKitty {
+    root: Child,
+    shell_pid: u32,
+    herdr_pid: u32,
+}
+
+impl SharedKitty {
+    fn start(dir: &Path, herdr_socket: &Path) -> Self {
+        fs::write(
+            dir.join("active"),
+            "printf 'shell %s\n' \"$$\"; while :; do sleep 1; done\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("client"),
+            "printf 'herdr %s\n' \"$$\"; while :; do sleep 1; done\n",
+        )
+        .unwrap();
+        let mut root = Command::new("bash")
+            .arg0("kitty")
+            .args([
+                "-c",
+                "(exec -a zsh bash active) & (exec -a herdr bash client) & wait",
+            ])
+            .current_dir(dir)
+            .env("HERDR_SOCKET_PATH", herdr_socket)
+            .env_remove("NVIM")
+            .env_remove("TMUX")
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut reader = BufReader::new(root.stdout.take().unwrap());
+        let mut shell_pid = 0;
+        let mut herdr_pid = 0;
+        for _ in 0..2 {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let (kind, pid) = line
+                .trim()
+                .split_once(' ')
+                .expect("child readiness handshake");
+            if kind == "shell" {
+                shell_pid = pid.parse().unwrap();
+            } else {
+                herdr_pid = pid.parse().unwrap();
+            }
+        }
+        assert_ne!(shell_pid, 0);
+        assert_ne!(herdr_pid, 0);
+        Self {
+            root,
+            shell_pid,
+            herdr_pid,
+        }
+    }
+
+    fn windows(&self, class: &str) -> serde_json::Value {
+        let mut active = singleton_kitty(class, self.shell_pid)[0].clone();
+        active["wm_name"] = "nav-target".into();
+        // The daemon has stale focus on another OS window. is_active still
+        // identifies the selected tab/pane within this exact tagged OS window.
+        active["is_focused"] = false.into();
+        active["tabs"][0]["is_focused"] = false.into();
+        active["tabs"][0]["windows"][0]["is_focused"] = false.into();
+        let mut sibling = singleton_kitty(class, self.herdr_pid)[0].clone();
+        sibling["id"] = 2.into();
+        sibling["wm_name"] = "nav-sibling".into();
+        serde_json::json!([active, sibling])
+    }
+}
+
+impl Drop for SharedKitty {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(-(self.root.id() as i32), libc::SIGTERM);
+        }
+        let _ = self.root.wait();
+    }
+}
+
+fn shared_kitty_close_case(class: &str, mode: &str) {
+    let harness = Harness::new("shared-kitty-close");
+    let server = HerdrServer::start_sequence(
+        &harness.runtime_dir,
+        vec![
+            close_snapshot(2, 1, 1).to_string(),
+            r#"{"result":{"type":"ok"}}"#.into(),
+        ],
+    );
+    let kitty = SharedKitty::start(&harness.runtime_dir, &server.socket_path);
+    let tag = if mode == "missing_tag" {
+        ""
+    } else {
+        "nav-target"
+    };
+    let hypr = HyprServer::start_with_response(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        &format!(
+            "Window abc123 -> shell:\nclass: {class}\npid: {}\nxdgTag: {tag}\n",
+            kitty.root.id()
+        ),
+    );
+    let mut windows = kitty.windows(class);
+    match mode {
+        "duplicate_tag" => windows[1]["wm_name"] = "nav-target".into(),
+        "wrong_class" => windows[0]["wm_class"] = "other".into(),
+        "duplicate_active_pane" => windows[0]["tabs"][0]["windows"][1]["is_active"] = true.into(),
+        "missing_active_tab" => windows[0]["tabs"][0]["is_active"] = false.into(),
+        "unrelated_pid" => windows[0]["tabs"][0]["windows"][0]["pid"] = std::process::id().into(),
+        _ => {}
+    }
+    let mut envs = harness.envs();
+    envs.push(("TEST_KITTY_LS_JSON".into(), windows.to_string()));
+    if mode == "probe_failure" {
+        envs.push(("TEST_KITTY_LS_EXIT".into(), "1".into()));
+    }
+    let status = run_binary_status("hypr-smart-close", &[], &envs);
+    assert!(
+        server.requests().is_empty(),
+        "must not touch sibling Herdr: {:?}",
+        server.requests()
+    );
+    let dispatched = hypr.requests().iter().any(|r| r.starts_with("dispatch "));
+    assert_eq!(status.success(), mode == "healthy", "case {class}/{mode}");
+    assert_eq!(dispatched, mode == "healthy", "case {class}/{mode}");
+    eprintln!(
+        "identity fixture {class}/{mode}: exit={} dispatched={dispatched} sibling_requests=0",
+        status
+    );
+}
+
+#[test]
+fn shared_kitty_plain_shell_does_not_close_sibling_herdr() {
+    shared_kitty_close_case("kitty", "healthy");
+}
+
+#[test]
+fn shared_kitty_custom_class_empty_context_is_authoritative() {
+    shared_kitty_close_case("filepicker", "healthy");
+}
+
+#[test]
+fn shared_kitty_ambiguous_or_failed_identity_refuses_close() {
+    for mode in [
+        "duplicate_tag",
+        "missing_tag",
+        "wrong_class",
+        "duplicate_active_pane",
+        "missing_active_tab",
+        "unrelated_pid",
+        "probe_failure",
+    ] {
+        shared_kitty_close_case("kitty", mode);
+    }
+}
+
+#[test]
+fn shared_kitty_neighbor_uses_exact_tagged_pane_id() {
+    let harness = Harness::new("shared-kitty-nav");
+    let server = HerdrServer::start(&harness.runtime_dir, r#"{"result":{"type":"ok"}}"#);
+    let kitty = SharedKitty::start(&harness.runtime_dir, &server.socket_path);
+    let hypr = HyprServer::start_with_response(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        &format!(
+            "Window abc123 -> shell:\nclass: kitty\npid: {}\nxdgTag: nav-target\n",
+            kitty.root.id()
+        ),
+    );
+    let mut envs = harness.envs();
+    envs.extend([
+        (
+            "TEST_KITTY_LS_JSON".into(),
+            kitty.windows("kitty").to_string(),
+        ),
+        ("TEST_KITTY_FOCUS_OK".into(), "1".into()),
+    ]);
+    run_binary("hypr-nav", &["left"], &envs);
+    assert!(harness.log_contents().contains("focus-window --match id:2"));
+    assert!(!harness.log_contents().contains("neighbor:"));
+    assert!(!hypr.requests().iter().any(|r| r.starts_with("dispatch ")));
+}
+
+#[test]
+fn shared_kitty_herdr_close_uses_tagged_context_despite_other_os_focus() {
+    let harness = Harness::new("shared-herdr-close");
+    let server = HerdrServer::start_sequence(
+        &harness.runtime_dir,
+        vec![
+            close_snapshot(2, 1, 1).to_string(),
+            r#"{"result":{"type":"ok"}}"#.into(),
+        ],
+    );
+    let kitty = SharedKitty::start(&harness.runtime_dir, &server.socket_path);
+    let hypr = HyprServer::start_with_response(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        &format!(
+            "Window abc123 -> Herdr:\nclass: kitty\npid: {}\nxdgTag: nav-target\n",
+            kitty.root.id()
+        ),
+    );
+    let mut windows = kitty.windows("kitty");
+    windows[0]["tabs"][0]["windows"][0]["pid"] = kitty.herdr_pid.into();
+    windows[1]["tabs"][0]["windows"][0]["pid"] = kitty.shell_pid.into();
+    let mut envs = harness.envs();
+    envs.push(("TEST_KITTY_LS_JSON".into(), windows.to_string()));
+    run_binary("hypr-smart-close", &[], &envs);
+    let requests: Vec<serde_json::Value> = server
+        .requests()
+        .iter()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1]["method"], "pane.close");
+    assert_eq!(requests[1]["params"]["pane_id"], "w1:p1");
+    assert!(!hypr.requests().iter().any(|r| r.starts_with("dispatch ")));
+}
+
+fn shared_kitty_navigation_case(nvim: bool) {
+    let harness = Harness::new("shared-inner-nav");
+    let nvim_socket = harness.runtime_dir.join("nvim.sock");
+    let _nvim_listener = UnixListener::bind(&nvim_socket).unwrap();
+    let nvim_path = nvim_socket.display().to_string();
+    let mut child_env = vec![("TMUX", "/tmp/fake-tmux,4242,0")];
+    if nvim {
+        child_env.push(("NVIM", &nvim_path));
+    }
+    let active = PtyProcess::spawn(&harness.runtime_dir.join("active.pid"), &child_env);
+    let sibling = PtyProcess::spawn(&harness.runtime_dir.join("sibling.pid"), &[]);
+    let hypr = HyprServer::start_with_response(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        &format!(
+            "Window abc123 -> editor:\nclass: kitty\npid: {}\nxdgTag: nav-target\n",
+            std::process::id()
+        ),
+    );
+    let mut matched = singleton_kitty("kitty", active.pid)[0].clone();
+    matched["wm_name"] = "nav-target".into();
+    matched["is_focused"] = false.into();
+    matched["tabs"][0]["is_focused"] = false.into();
+    matched["tabs"][0]["windows"][0]["is_focused"] = false.into();
+    let mut other = singleton_kitty("kitty", sibling.pid)[0].clone();
+    other["wm_name"] = "other".into();
+    let tty = fs::read_link(format!("/proc/{}/fd/0", active.pid))
+        .unwrap()
+        .display()
+        .to_string();
+    let mut envs = harness.envs();
+    envs.extend([
+        (
+            "TEST_KITTY_LS_JSON".into(),
+            serde_json::json!([matched, other]).to_string(),
+        ),
+        ("TEST_TTY".into(), tty),
+        ("TEST_TMUX_AT_EDGE".into(), "0".into()),
+        ("TEST_TMUX_SELECT_OK".into(), "1".into()),
+        ("TEST_NVIM_AT_EDGE".into(), "0".into()),
+        ("TEST_NVIM_SEND_OK".into(), "1".into()),
+    ]);
+    run_binary("hypr-tmux-nav", &["left"], &envs);
+    let log = harness.log_contents();
+    if nvim {
+        assert!(log.contains("execute('wincmd h')"), "{log}");
+        assert!(!log.contains("tmux "), "nvim precedence: {log}");
+    } else {
+        assert!(log.contains("tmux select-pane -t %1 -L"), "{log}");
+    }
+    assert!(!hypr.requests().iter().any(|r| r.starts_with("dispatch ")));
+}
+
+#[test]
+fn shared_kitty_tmux_navigation_uses_tagged_tty() {
+    shared_kitty_navigation_case(false);
+}
+
+#[test]
+fn shared_kitty_nvim_navigation_keeps_precedence() {
+    shared_kitty_navigation_case(true);
+}
+
+#[test]
+fn shared_kitty_focus_change_refuses_stale_inner_action() {
+    let harness = Harness::new("shared-focus-change");
+    let server = HerdrServer::start_sequence(
+        &harness.runtime_dir,
+        vec![
+            close_snapshot(2, 1, 1).to_string(),
+            r#"{"result":{"type":"ok"}}"#.into(),
+        ],
+    );
+    let kitty = SharedKitty::start(&harness.runtime_dir, &server.socket_path);
+    let initial = format!(
+        "Window abc123 -> Herdr:\nclass: kitty\npid: {}\nxdgTag: nav-target\n",
+        kitty.root.id()
+    );
+    let changed = format!(
+        "Window def456 -> sibling:\nclass: kitty\npid: {}\nxdgTag: other\n",
+        kitty.root.id()
+    );
+    let hypr = HyprServer::start_with_options(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        &initial,
+        "ok",
+        false,
+        Some(&changed),
+    );
+    let mut windows = kitty.windows("kitty");
+    windows[0]["tabs"][0]["windows"][0]["pid"] = kitty.herdr_pid.into();
+    let mut envs = harness.envs();
+    envs.push(("TEST_KITTY_LS_JSON".into(), windows.to_string()));
+    let status = run_binary_status("hypr-smart-close", &[], &envs);
+    assert!(!status.success());
+    assert!(server.requests().is_empty());
+    assert!(!hypr.requests().iter().any(|r| r.starts_with("dispatch ")));
 }

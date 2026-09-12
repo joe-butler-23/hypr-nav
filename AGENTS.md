@@ -63,3 +63,23 @@ That proves deployment only. Also exercise each affected route through its real 
 - **Risk-proportionate verification:** Define success before editing. Run the cheapest sufficient checks first and escalate according to risk. Bugs require regression coverage, and completion requires evidence at the surface the user cares about.
 - **Timing and state:** Use time to model time, not to infer state. When work involves polling, debounce, readiness, timeouts, TTLs, cooldowns, throttling, retries, scheduling, animation timing, or event delivery, load the `timer-inference` skill.
 <!-- clai:instructions:coding:end -->
+
+
+## Kitty shared-process identity
+
+Shared Kitty daemons require a unique launch token passed with `--os-window-tag`,
+exposed as Hyprland `xdgTag` and Kitty `wm_name`. The terminal package must actually
+forward that Wayland tag. Class names retain their existing role. Untagged Kitty
+remains supported only when its daemon reports exactly one OS window.
+
+The resolver matches tag plus class, verifies foreground-process ancestry, and
+selects the active tab and pane inside that OS window. It never searches another
+Kitty window's process tree when identity is absent, ambiguous, or unavailable.
+Navigation falls through to Hyprland when inner context cannot be established;
+close refuses that ambiguity. A changed captured window cancels an inner action.
+Standalone Kitty split navigation resolves neighbour groups to explicit pane IDs.
+
+`tests/evidence/2026-09-12-kitty-identity` records eight isolated regression pairs
+against the pre-fix source, including tagged Herdr/tmux/Neovim routing, custom
+classes, stale daemon focus, ambiguous metadata and a focus change. All protocol
+fixtures are disposable; these results do not claim live compositor deployment.

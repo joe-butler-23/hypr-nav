@@ -125,6 +125,7 @@ pub struct HerdrRuntime {
     pub session: Option<String>,
 }
 
+#[derive(Default)]
 pub struct TerminalRuntime {
     pub tty: Option<String>,
     pub tmux: Option<TmuxRuntime>,
@@ -132,12 +133,14 @@ pub struct TerminalRuntime {
     pub herdr: Option<HerdrRuntime>,
 }
 
+#[derive(Clone, Debug)]
 pub struct ActiveWindowInfo {
     pub address: String,
     pub class: String,
     pub pid: u32,
     pub title: Option<String>,
     pub focus_history_id: Option<i64>,
+    pub xdg_tag: Option<String>,
 }
 
 struct KittyProbeResult {
@@ -145,12 +148,6 @@ struct KittyProbeResult {
     tmux: Option<TmuxRuntime>,
     nvim_socket: Option<String>,
     herdr: Option<HerdrRuntime>,
-}
-
-enum KittyRuntimeProbe {
-    Found(KittyProbeResult),
-    NothingFound,
-    Unavailable,
 }
 
 pub fn debug_enabled() -> bool {
@@ -472,6 +469,7 @@ fn parse_active_window_info(response: &str) -> Option<ActiveWindowInfo> {
     let mut pid = None;
     let mut title = None;
     let mut focus_history_id = None;
+    let mut xdg_tag = None;
 
     for line in response.lines() {
         let trimmed = line.trim();
@@ -483,6 +481,8 @@ fn parse_active_window_info(response: &str) -> Option<ActiveWindowInfo> {
             class = Some(c.trim().to_string());
         } else if let Some(t) = trimmed.strip_prefix("title: ") {
             title = Some(t.trim().to_string());
+        } else if let Some(t) = trimmed.strip_prefix("xdgTag: ") {
+            xdg_tag = Some(t.trim().to_string());
         } else if let Some(p) = trimmed.strip_prefix("pid: ") {
             pid = p.trim().parse::<u32>().ok();
         } else if let Some(id) = trimmed.strip_prefix("focusHistoryID: ") {
@@ -497,6 +497,7 @@ fn parse_active_window_info(response: &str) -> Option<ActiveWindowInfo> {
             pid: p,
             title,
             focus_history_id,
+            xdg_tag,
         }),
         _ => None,
     }
@@ -1086,14 +1087,6 @@ fn normalize_kitty_listen_on(listen_on: &str) -> Option<String> {
     Some(format!("unix:{}", listen_on))
 }
 
-fn find_focused_index(items: &[Value]) -> Option<usize> {
-    items.iter().position(|item| {
-        item.get("is_focused")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    })
-}
-
 fn read_pids_from_kitty_window(window: &Value) -> Vec<u32> {
     let mut pids = Vec::new();
     let mut seen = HashSet::new();
@@ -1121,31 +1114,142 @@ fn read_pids_from_kitty_window(window: &Value) -> Vec<u32> {
     pids
 }
 
-fn parse_focused_kitty_pids(json: &str) -> Option<Vec<u32>> {
-    let parsed: Value = match serde_json::from_str(json) {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
+/// Exact inner Kitty target, selected independently of the daemon's global focus.
+pub struct KittyContext {
+    pub socket_uri: String,
+    window: Value,
+    tab: Value,
+    pids: Vec<u32>,
+}
 
-    let os_windows = match parsed.as_array() {
-        Some(v) if !v.is_empty() => v,
-        _ => return None,
-    };
-    let os_window = &os_windows[find_focused_index(os_windows)?];
+fn selected_item(items: &[Value]) -> Option<&Value> {
+    let mut selected = items.iter().filter(|item| {
+        item.get("is_active")
+            .or_else(|| item.get("is_focused"))
+            .and_then(Value::as_bool)
+            == Some(true)
+    });
+    let result = selected.next()?;
+    selected.next().is_none().then_some(result)
+}
 
-    let tabs = match os_window.get("tabs").and_then(Value::as_array) {
-        Some(v) if !v.is_empty() => v,
-        _ => return None,
-    };
-    let tab = &tabs[find_focused_index(tabs)?];
+fn select_kitty_window<'a>(windows: &'a [Value], active: &ActiveWindowInfo) -> Option<&'a Value> {
+    let tag = active.xdg_tag.as_deref().filter(|tag| !tag.is_empty());
+    // Without a compositor-visible tag, only one OS window in this daemon can
+    // establish identity. A unique class is not a per-window lifetime token.
+    if tag.is_none() && windows.len() != 1 {
+        return None;
+    }
+    let mut matches = windows.iter().filter(|window| {
+        window.get("wm_class").and_then(Value::as_str) == Some(active.class.as_str())
+            && tag.is_none_or(|tag| window.get("wm_name").and_then(Value::as_str) == Some(tag))
+    });
+    let matched = matches.next()?;
+    matches.next().is_none().then_some(matched)
+}
 
-    let windows = match tab.get("windows").and_then(Value::as_array) {
-        Some(v) if !v.is_empty() => v,
-        _ => return None,
-    };
-    let window = &windows[find_focused_index(windows)?];
+/// Resolve one OS window and its selected tab/pane. A shared PID alone cannot
+/// distinguish OS windows; missing/duplicate identity never falls back to BFS.
+pub fn kitty_context(active: &ActiveWindowInfo) -> Option<KittyContext> {
+    let socket_uri = kitty_control_socket_uri_for_pid(active.pid)?;
+    let output = Command::new("kitty")
+        .args(["@", "--to", &socket_uri, "ls"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .watched_output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let data: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let os_window = select_kitty_window(data.as_array()?, active)?;
+    let tab = selected_item(os_window.get("tabs")?.as_array()?)?;
+    let window = selected_item(tab.get("windows")?.as_array()?)?;
+    let pids = read_pids_from_kitty_window(window);
+    if pids.is_empty()
+        || pids
+            .iter()
+            .any(|&pid| !pid_has_ancestor(pid, active.pid, KITTY_PROBE_ANCESTRY_MAX_HOPS))
+    {
+        return None;
+    }
+    Some(KittyContext {
+        socket_uri,
+        window: window.clone(),
+        tab: tab.clone(),
+        pids,
+    })
+}
 
-    Some(read_pids_from_kitty_window(window))
+impl KittyContext {
+    /// Kitty prefers the most recently active neighbouring group, then the
+    /// layout's first candidate. Resolve that to an explicit pane ID so the
+    /// remote command cannot reinterpret daemon-global focus after the query.
+    pub fn neighbor_id(&self, direction: Direction) -> Option<u64> {
+        let neighbors = self
+            .window
+            .get("neighbors")?
+            .get(direction.kitty_neighbor())?
+            .as_array()?;
+        let candidates: Vec<u64> = neighbors.iter().filter_map(Value::as_u64).collect();
+        let groups = self.tab.get("groups")?.as_array()?;
+        let panes = self.tab.get("windows")?.as_array()?;
+        let recent_groups = self
+            .tab
+            .get("active_window_history")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .rev()
+            .filter_map(Value::as_u64)
+            .filter_map(|pane_id| {
+                let mut matches = groups.iter().filter(|group| {
+                    group
+                        .get("windows")
+                        .and_then(Value::as_array)
+                        .is_some_and(|ids| ids.iter().any(|id| id.as_u64() == Some(pane_id)))
+                });
+                let group = matches.next()?;
+                matches
+                    .next()
+                    .is_none()
+                    .then(|| group.get("id")?.as_u64())
+                    .flatten()
+            });
+        for group_id in recent_groups.chain(candidates.iter().copied()) {
+            if !candidates.contains(&group_id) {
+                continue;
+            }
+            let mut matches = groups
+                .iter()
+                .filter(|group| group.get("id").and_then(Value::as_u64) == Some(group_id));
+            let group = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            // Kitty's active member is the last window of an overlay group.
+            let target = group.get("windows")?.as_array()?.last()?.as_u64()?;
+            if panes
+                .iter()
+                .filter(|pane| pane.get("id").and_then(Value::as_u64) == Some(target))
+                .count()
+                == 1
+            {
+                return Some(target);
+            }
+            return None;
+        }
+        None
+    }
+}
+
+pub fn active_window_is_current(socket: &PathBuf, captured: &ActiveWindowInfo) -> bool {
+    get_active_window_snapshot(socket).is_some_and(|live| {
+        live.address == captured.address
+            && live.pid == captured.pid
+            && live.class == captured.class
+            && live.xdg_tag == captured.xdg_tag
+    })
 }
 
 /// Walk `/proc/<pid>/status` `PPid:` lines to determine whether `ancestor` is
@@ -1189,74 +1293,14 @@ fn pid_has_ancestor(pid: u32, ancestor: u32, max_hops: usize) -> bool {
 /// process tree.
 const KITTY_PROBE_ANCESTRY_MAX_HOPS: usize = 15;
 
-fn detect_terminal_runtime_from_kitty(active_pid: u32) -> KittyRuntimeProbe {
-    let kitty_uri = match kitty_control_socket_uri_for_pid(active_pid) {
-        Some(uri) => uri,
-        None => return KittyRuntimeProbe::Unavailable,
-    };
-
-    let output = Command::new("kitty")
-        .args(["@", "--to", &kitty_uri, "ls"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .watched_output()
-        .ok();
-
-    let output = match output {
-        Some(out) => out,
-        None => {
-            debug_log!(
-                "lib",
-                "kitty ls failed while resolving focused kitty context"
-            );
-            return KittyRuntimeProbe::Unavailable;
-        }
-    };
-
-    if !output.status.success() {
-        debug_log!(
-            "lib",
-            "kitty ls failed while resolving focused kitty context"
-        );
-        return KittyRuntimeProbe::Unavailable;
-    }
-
-    let parsed = String::from_utf8_lossy(&output.stdout);
-    let candidate_pids = parse_focused_kitty_pids(&parsed).unwrap_or_default();
-    if candidate_pids.is_empty() {
-        debug_log!(
-            "lib",
-            "kitty ls returned no focused foreground pid candidates"
-        );
-        return KittyRuntimeProbe::Unavailable;
-    }
-
-    // With more than one kitty instance running, `kitty ls`'s notion of the
-    // "focused" window belongs to whichever kitty process answered on the
-    // resolved control socket, which may not be the Hyprland-active window
-    // at all. Only trust candidate pids that are (or descend from) the
-    // active window's pid; otherwise this probe result is meaningless and we
-    // fall back to the process-tree BFS in the caller.
-    let verified_pids: Vec<u32> = candidate_pids
-        .iter()
-        .copied()
-        .filter(|&pid| pid_has_ancestor(pid, active_pid, KITTY_PROBE_ANCESTRY_MAX_HOPS))
-        .collect();
-
-    if verified_pids.is_empty() {
-        debug_log!("lib",
-                "kitty ls focused window does not belong to active window pid={}; ignoring probe (candidates={:?})",
-                active_pid, candidate_pids
-            );
-        return KittyRuntimeProbe::Unavailable;
-    }
-
+fn detect_terminal_runtime_from_kitty(active: &ActiveWindowInfo) -> Option<KittyProbeResult> {
+    let context = kitty_context(active)?;
     let mut tmux_runtime: Option<TmuxRuntime> = None;
     let mut nvim_socket: Option<String> = None;
     let mut herdr_runtime: Option<HerdrRuntime> = None;
     let mut tty: Option<String> = None;
 
-    for pid in verified_pids {
+    for pid in context.pids {
         let process_tty = read_process_tty(pid);
         if tty.is_none() {
             tty = process_tty.clone();
@@ -1323,102 +1367,40 @@ fn detect_terminal_runtime_from_kitty(active_pid: u32) -> KittyRuntimeProbe {
         }
     }
 
-    if tmux_runtime.is_some() || nvim_socket.is_some() || herdr_runtime.is_some() {
-        KittyRuntimeProbe::Found(KittyProbeResult {
-            tty,
-            tmux: tmux_runtime,
-            nvim_socket,
-            herdr: herdr_runtime,
-        })
-    } else {
-        debug_log!(
-            "lib",
-            "kitty-focused context found but no tmux, nvim, or herdr in focused window"
-        );
-        KittyRuntimeProbe::NothingFound
-    }
+    Some(KittyProbeResult {
+        tty,
+        tmux: tmux_runtime,
+        nvim_socket,
+        herdr: herdr_runtime,
+    })
 }
 
 /// Combined detection: find TTY plus nested runtime metadata from process tree.
-pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
+pub fn detect_terminal_runtime(active: &ActiveWindowInfo) -> Option<TerminalRuntime> {
+    if is_kitty_window(&active.class, active.pid) {
+        let result = detect_terminal_runtime_from_kitty(active)?;
+        return Some(TerminalRuntime {
+            tty: result.tty,
+            tmux: result.tmux,
+            nvim: result
+                .nvim_socket
+                .filter(|socket| nvim_socket_is_live(socket))
+                .map(|socket_path| NvimRuntime { socket_path }),
+            herdr: result.herdr,
+        });
+    }
+    let pid = active.pid;
     let mut tmux_result: Option<TmuxRuntime> = None;
     let mut nvim_result: Option<NvimRuntime> = None;
-    let mut kitty_nvim_socket: Option<String> = None;
     let mut herdr_result: Option<HerdrRuntime> = None;
-    let mut kitty_tty: Option<String> = None;
-    let mut kitty_probe_found = false;
-
-    // Kitty fast-path: check focused PIDs for both tmux and nvim
-    let kitty_by_class = class.to_ascii_lowercase().contains("kitty");
-    let kitty_by_pid = process_matches_terminal_name(pid, "kitty");
-    let mut kitty_authoritative_nothing = false;
-    if kitty_by_class || kitty_by_pid {
-        let probe_authoritative = kitty_by_class;
-        if kitty_by_pid && !kitty_by_class {
-            debug_log!(
-                "lib",
-                "active pid={} is kitty with custom class={} ; using kitty-focused probe",
-                pid,
-                class
-            );
-        }
-        match detect_terminal_runtime_from_kitty(pid) {
-            KittyRuntimeProbe::Found(result) => {
-                kitty_probe_found = true;
-                if let Some(ref tmux) = result.tmux {
-                    debug_log!(
-                        "lib",
-                        "tmux runtime from kitty tty={} socket={}",
-                        tmux.tty,
-                        tmux.socket_path.as_deref().unwrap_or("<default>")
-                    );
-                }
-                if let Some(ref socket) = result.nvim_socket {
-                    debug_log!("lib", "nvim socket from kitty: {}", socket);
-                }
-                if let Some(ref runtime) = result.herdr {
-                    debug_log!(
-                        "lib",
-                        "herdr runtime from kitty socket={:?} session={:?}",
-                        runtime.socket_path,
-                        runtime.session
-                    );
-                }
-                kitty_tty = result.tty;
-                tmux_result = result.tmux;
-                kitty_nvim_socket = result.nvim_socket;
-                herdr_result = result.herdr;
-            }
-            KittyRuntimeProbe::NothingFound => {
-                if probe_authoritative {
-                    debug_log!(
-                        "lib",
-                        "kitty-focused probe confirms no tmux, nvim, or herdr"
-                    );
-                    kitty_authoritative_nothing = true;
-                } else {
-                    debug_log!(
-                        "lib",
-                        "kitty-focused probe found nothing for custom class; trying process tree"
-                    );
-                }
-            }
-            KittyRuntimeProbe::Unavailable => {}
-        }
-    }
-
     // BFS through process tree to find TTY, tmux, and nvim
-    let mut tty: Option<String> = kitty_tty;
+    let mut tty: Option<String> = None;
     let mut has_tmux = false;
     let mut tmux_socket_path: Option<String> = None;
-    let mut nvim_socket: Option<String> = kitty_nvim_socket;
+    let mut nvim_socket: Option<String> = None;
 
     const MAX_DEPTH: usize = 10;
-    let mut to_check: Vec<(u32, usize)> = if kitty_probe_found {
-        Vec::new()
-    } else {
-        vec![(pid, 0)]
-    };
+    let mut to_check = vec![(pid, 0)];
     let mut checked: HashSet<u32> = HashSet::new();
 
     while let Some((current_pid, depth)) = to_check.pop() {
@@ -1434,80 +1416,71 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
             tty = current_tty.clone();
         }
 
-        if kitty_authoritative_nothing {
-            // The kitty-focused probe already confirmed there is no nested
-            // runtime in the focused window. Only `tty` is still used in this
-            // path, so skip runtime probing and stop as soon as `tty` resolves.
-            if tty.is_some() {
-                break;
-            }
-        } else {
-            // Check if this process is tmux
-            if !has_tmux {
-                has_tmux = process_has_tmux(current_pid);
-            }
+        // Check if this process is tmux
+        if !has_tmux {
+            has_tmux = process_has_tmux(current_pid);
+        }
 
-            if tmux_socket_path.is_none() {
-                tmux_socket_path = read_tmux_socket_from_environ(current_pid);
-                if tmux_socket_path.is_some() {
-                    has_tmux = true;
-                    if current_tty.is_some() {
-                        tty = current_tty.clone();
-                    }
+        if tmux_socket_path.is_none() {
+            tmux_socket_path = read_tmux_socket_from_environ(current_pid);
+            if tmux_socket_path.is_some() {
+                has_tmux = true;
+                if current_tty.is_some() {
+                    tty = current_tty.clone();
                 }
             }
+        }
 
-            // Check for nvim: is this process nvim itself?
-            if nvim_socket.is_none() && process_is_nvim(current_pid) {
-                nvim_socket = find_nvim_listen_socket(current_pid);
+        // Check for nvim: is this process nvim itself?
+        if nvim_socket.is_none() && process_is_nvim(current_pid) {
+            nvim_socket = find_nvim_listen_socket(current_pid);
+            debug_log!(
+                "lib",
+                "found nvim process pid={} socket={}",
+                current_pid,
+                nvim_socket.as_deref().unwrap_or("<none>")
+            );
+        }
+
+        // Check for nvim: is this a child of nvim (has $NVIM in environ)?
+        if nvim_socket.is_none() {
+            if let Some(s) = read_nvim_socket_from_environ(current_pid) {
+                nvim_socket = Some(s);
                 debug_log!(
                     "lib",
-                    "found nvim process pid={} socket={}",
+                    "found nvim socket from environ of pid={} socket={}",
                     current_pid,
                     nvim_socket.as_deref().unwrap_or("<none>")
                 );
             }
+        }
 
-            // Check for nvim: is this a child of nvim (has $NVIM in environ)?
-            if nvim_socket.is_none() {
-                if let Some(s) = read_nvim_socket_from_environ(current_pid) {
-                    nvim_socket = Some(s);
-                    debug_log!(
-                        "lib",
-                        "found nvim socket from environ of pid={} socket={}",
-                        current_pid,
-                        nvim_socket.as_deref().unwrap_or("<none>")
-                    );
-                }
+        if herdr_result.is_none() {
+            herdr_result = herdr_runtime_for_client(current_pid);
+            if let Some(ref runtime) = herdr_result {
+                debug_log!(
+                    "lib",
+                    "found herdr runtime from environ pid={} socket={:?} session={:?}",
+                    current_pid,
+                    runtime.socket_path,
+                    runtime.session
+                );
             }
+        }
 
-            if herdr_result.is_none() {
-                herdr_result = herdr_runtime_for_client(current_pid);
-                if let Some(ref runtime) = herdr_result {
-                    debug_log!(
-                        "lib",
-                        "found herdr runtime from environ pid={} socket={:?} session={:?}",
-                        current_pid,
-                        runtime.socket_path,
-                        runtime.session
-                    );
-                }
-            }
-
-            // Nothing left that can change the outcome: `tty` only changes
-            // above while it is `None` or when `tmux_socket_path` is first
-            // discovered (which only happens once, guarded by
-            // `tmux_socket_path.is_none()`); `nvim_socket` only changes
-            // while `None`. Once all four are resolved, no further pid can
-            // alter any of them, so it's safe to stop walking.
-            if tty.is_some()
-                && has_tmux
-                && tmux_socket_path.is_some()
-                && nvim_socket.is_some()
-                && herdr_result.is_some()
-            {
-                break;
-            }
+        // Nothing left that can change the outcome: `tty` only changes
+        // above while it is `None` or when `tmux_socket_path` is first
+        // discovered (which only happens once, guarded by
+        // `tmux_socket_path.is_none()`); `nvim_socket` only changes
+        // while `None`. Once all four are resolved, no further pid can
+        // alter any of them, so it's safe to stop walking.
+        if tty.is_some()
+            && has_tmux
+            && tmux_socket_path.is_some()
+            && nvim_socket.is_some()
+            && herdr_result.is_some()
+        {
+            break;
         }
 
         to_check.extend(
@@ -1518,7 +1491,7 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
     }
 
     // Build tmux result from BFS if not already found via kitty
-    if tmux_result.is_none() && !kitty_authoritative_nothing {
+    if tmux_result.is_none() {
         if has_tmux {
             let runtime = tty.clone().map(|tty| TmuxRuntime {
                 tty,
@@ -1541,25 +1514,23 @@ pub fn detect_terminal_runtime(pid: u32, class: &str) -> TerminalRuntime {
     }
 
     // Build nvim result, validating socket liveness
-    if !kitty_authoritative_nothing {
-        if let Some(socket) = nvim_socket {
-            if nvim_socket_is_live(&socket) {
-                debug_log!("lib", "nvim runtime socket={} (live)", socket);
-                nvim_result = Some(NvimRuntime {
-                    socket_path: socket,
-                });
-            } else {
-                debug_log!("lib", "nvim socket={} is stale, ignoring", socket);
-            }
+    if let Some(socket) = nvim_socket {
+        if nvim_socket_is_live(&socket) {
+            debug_log!("lib", "nvim runtime socket={} (live)", socket);
+            nvim_result = Some(NvimRuntime {
+                socket_path: socket,
+            });
+        } else {
+            debug_log!("lib", "nvim socket={} is stale, ignoring", socket);
         }
     }
 
-    TerminalRuntime {
+    Some(TerminalRuntime {
         tty,
         tmux: tmux_result,
         nvim: nvim_result,
         herdr: herdr_result,
-    }
+    })
 }
 
 pub fn detect_herdr_runtime(pid: u32, class: &str) -> Option<HerdrRuntime> {
@@ -1610,12 +1581,6 @@ pub fn detect_herdr_runtime(pid: u32, class: &str) -> Option<HerdrRuntime> {
         );
         Some(result)
     }
-}
-
-/// Combined detection: find TTY, tmux presence, and tmux socket from process tree.
-/// Delegates to detect_terminal_runtime and returns only the tmux portion.
-pub fn detect_tmux_runtime(pid: u32, class: &str) -> Option<TmuxRuntime> {
-    detect_terminal_runtime(pid, class).tmux
 }
 
 /// Attempt nvim entry assist: navigate to opposite-edge window on cross-window entry.
@@ -2138,64 +2103,6 @@ Window 0xABC123 -> terminal:
 
         assert_eq!(parse_herdr_client_runtime_from_args(&status_args), None);
         assert_eq!(parse_herdr_client_runtime_from_args(&pane_args), None);
-    }
-
-    #[test]
-    fn parse_focused_kitty_pids_prefers_focused_os_window_tab_and_window() {
-        let data = r#"
-[
-  {
-    "is_focused": false,
-    "tabs": [
-      {"is_focused": true, "windows": [{"is_focused": true, "pid": 999}]}
-    ]
-  },
-  {
-    "is_focused": true,
-    "tabs": [
-      {
-        "is_focused": true,
-        "windows": [
-          {
-            "is_focused": false,
-            "pid": 1000
-          },
-          {
-            "is_focused": true,
-            "pid": 2000,
-            "foreground_processes": [{"pid": 2001}, {"pid": 2002}]
-          }
-        ]
-      }
-    ]
-  }
-]
-"#;
-
-        assert_eq!(parse_focused_kitty_pids(data), Some(vec![2001, 2002, 2000]));
-    }
-
-    #[test]
-    fn parse_focused_kitty_pids_returns_empty_on_invalid_json() {
-        assert_eq!(parse_focused_kitty_pids("not-json"), None);
-    }
-
-    #[test]
-    fn parse_focused_kitty_pids_returns_none_without_focus_markers() {
-        let data = r#"
-[
-  {
-    "tabs": [
-      {
-        "windows": [
-          {"pid": 2000}
-        ]
-      }
-    ]
-  }
-]
-"#;
-        assert_eq!(parse_focused_kitty_pids(data), None);
     }
 
     #[test]
