@@ -13,7 +13,8 @@
 [ ] 1. bd close <id1> <id2> ...   (close completed issues)
 [ ] 2. run quality gates        (tests, linters, builds when relevant)
 [ ] 3. git status               (maintain good Git/Dolt hygiene)
-       git add <intended-paths> && git commit -m "..."
+       git add -- <owned-paths>
+       git commit --only -m "..." -- <owned-paths>
        bd dolt push
        git push
 ```
@@ -97,7 +98,8 @@ bd update <id> --claim  # Claim it
 ```bash
 bd close <id1> <id2> ...    # Close all completed issues at once
 git status                  # Check changed files
-git add <intended-paths> && git commit -m "..."
+git add -- <owned-paths>
+git commit --only -m "..." -- <owned-paths>
 bd dolt push
 git push
 ```
