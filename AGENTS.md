@@ -72,7 +72,10 @@ That proves deployment only. Also exercise each affected route through its real 
 Shared Kitty daemons require a unique launch token passed with `--os-window-tag`,
 exposed as Hyprland `xdgTag` and Kitty `wm_name`. The terminal package must actually
 forward that Wayland tag. Class names retain their existing role. Untagged Kitty
-remains supported only when its daemon reports exactly one OS window.
+remains supported only when its daemon reports exactly one OS window. A Kitty with
+remote control off (latch's locked.conf) owns no `kitty-<pid>` socket; its
+process tree is walked like any terminal only when Hyprland shows that pid
+owning exactly one window, and close refuses otherwise.
 
 The resolver matches tag plus class, verifies foreground-process ancestry, and
 selects the active tab and pane inside that OS window. It never searches another

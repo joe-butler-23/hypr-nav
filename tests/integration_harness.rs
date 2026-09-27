@@ -173,6 +173,27 @@ impl HyprServer {
         stop_after_activewindow: bool,
         next_active_response: Option<&str>,
     ) -> Self {
+        Self::start_with_clients(
+            runtime_dir,
+            sig,
+            active_response,
+            dispatch_response,
+            stop_after_activewindow,
+            next_active_response,
+            None,
+        )
+    }
+
+    /// Like `start_with_options`, also answering the `clients` query.
+    fn start_with_clients(
+        runtime_dir: &Path,
+        sig: &str,
+        active_response: &str,
+        dispatch_response: &str,
+        stop_after_activewindow: bool,
+        next_active_response: Option<&str>,
+        clients_response: Option<&str>,
+    ) -> Self {
         let socket_dir = runtime_dir.join("hypr").join(sig);
         fs::create_dir_all(&socket_dir).expect("hypr runtime dir should be created");
         let socket_path = socket_dir.join(".socket.sock");
@@ -189,6 +210,7 @@ impl HyprServer {
         let next_active_response = next_active_response.map(str::to_string);
         let mut active_queries = 0;
         let dispatch_response = dispatch_response.to_string();
+        let clients_response = clients_response.map(str::to_string);
         let socket_path_for_thread = socket_path.clone();
 
         let handle = thread::spawn(move || {
@@ -212,6 +234,10 @@ impl HyprServer {
                             }
                         } else if request.starts_with("dispatch ") {
                             let _ = stream.write_all(dispatch_response.as_bytes());
+                        } else if request == "clients" {
+                            if let Some(response) = &clients_response {
+                                let _ = stream.write_all(response.as_bytes());
+                            }
                         }
                         requests_clone
                             .lock()
@@ -843,6 +869,62 @@ fn hypr_smart_close_closes_captured_kitty_hypr_window_only() {
     assert!(
         !log.contains("close-window"),
         "smart-close must not remotely close a kitty window, got {log}"
+    );
+}
+
+/// Latch windows run Kitty with remote control off, so no probe can
+/// establish their identity. A Kitty that owns no control socket and exactly
+/// one Hyprland window is walked like any other terminal; a second window for
+/// the same process keeps close refused.
+fn locked_kitty_close_case(windows_for_pid: usize) -> (bool, Vec<String>) {
+    let harness = Harness::new("locked-kitty-close");
+    let mut kitty_process = spawn_process_named("kitty");
+    let pid = kitty_process.id();
+    let active = format!("Window abc123 -> herdr-gk:\nclass: herdr-gk\npid: {pid}\n");
+    let clients = (0..windows_for_pid)
+        .map(|i| format!("Window {i}abc -> herdr-gk:\n\tclass: herdr-gk\n\tpid: {pid}\n"))
+        .collect::<String>();
+    let hypr = HyprServer::start_with_clients(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        &active,
+        "ok",
+        false,
+        None,
+        Some(&clients),
+    );
+    let mut envs = harness.envs();
+    envs.push(("TEST_KITTY_LS_EXIT".into(), "1".into()));
+    let status = run_binary_status("hypr-smart-close", &[], &envs);
+    let _ = kitty_process.kill();
+    let _ = kitty_process.wait();
+    (status.success(), hypr.requests())
+}
+
+#[test]
+fn hypr_smart_close_closes_single_window_kitty_without_remote_control() {
+    let (success, requests) = locked_kitty_close_case(1);
+    assert!(
+        success,
+        "locked single-window kitty should close, got {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request == "dispatch hl.dsp.window.close({address = \"0xabc123\"})"),
+        "expected captured-address close, got {requests:?}"
+    );
+}
+
+#[test]
+fn hypr_smart_close_refuses_multi_window_kitty_without_remote_control() {
+    let (success, requests) = locked_kitty_close_case(2);
+    assert!(!success, "shared kitty without identity must refuse");
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.starts_with("dispatch ")),
+        "must not dispatch a close, got {requests:?}"
     );
 }
 

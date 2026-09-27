@@ -531,6 +531,25 @@ pub fn get_active_window_snapshot(socket_path: &PathBuf) -> Option<ActiveWindowI
     }
 }
 
+/// Number of Hyprland windows owned by `pid`, from one `clients` query.
+fn hypr_window_count_for_pid(pid: u32) -> Option<usize> {
+    let mut stream = UnixStream::connect(find_hyprland_socket()?).ok()?;
+    configure_socket(&stream).then_some(())?;
+    stream.write_all(b"clients").ok()?;
+    stream.shutdown(std::net::Shutdown::Write).ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    Some(count_windows_for_pid(&response, pid))
+}
+
+fn count_windows_for_pid(clients: &str, pid: u32) -> usize {
+    clients
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("pid: "))
+        .filter(|value| value.trim().parse::<u32>().ok() == Some(pid))
+        .count()
+}
+
 /// Get active window class and PID in a single Hyprland query.
 pub fn get_active_window_info(socket_path: &PathBuf) -> Option<(String, u32)> {
     let info = get_active_window_snapshot(socket_path)?;
@@ -1408,16 +1427,31 @@ fn detect_terminal_runtime_from_kitty(active: &ActiveWindowInfo) -> Option<Kitty
 /// Combined detection: find TTY plus nested runtime metadata from process tree.
 pub fn detect_terminal_runtime(active: &ActiveWindowInfo) -> Option<TerminalRuntime> {
     if is_kitty_window(&active.class, active.pid) {
-        let result = detect_terminal_runtime_from_kitty(active)?;
-        return Some(TerminalRuntime {
-            tty: result.tty,
-            tmux: result.tmux,
-            nvim: result
-                .nvim_socket
-                .filter(|socket| nvim_socket_is_live(socket))
-                .map(|socket_path| NvimRuntime { socket_path }),
-            herdr: result.herdr,
-        });
+        if let Some(result) = detect_terminal_runtime_from_kitty(active) {
+            return Some(TerminalRuntime {
+                tty: result.tty,
+                tmux: result.tmux,
+                nvim: result
+                    .nvim_socket
+                    .filter(|socket| nvim_socket_is_live(socket))
+                    .map(|socket_path| NvimRuntime { socket_path }),
+                herdr: result.herdr,
+            });
+        }
+        // A Kitty with remote control off (latch's locked.conf) cannot be
+        // probed. Its process tree is still exact when Hyprland shows that
+        // process owning only this window; anything else stays unresolved.
+        let own_socket = kitty_socket_path_for_pid(Path::new(&runtime_dir()), active.pid);
+        if unix_socket_uri_if_live(&own_socket).is_some()
+            || hypr_window_count_for_pid(active.pid) != Some(1)
+        {
+            return None;
+        }
+        debug_log!(
+            "lib",
+            "kitty pid={} has no control socket and one window; walking its process tree",
+            active.pid
+        );
     }
     let pid = active.pid;
     let mut tmux_result: Option<TmuxRuntime> = None;
@@ -1976,6 +2010,21 @@ mod tests {
         assert_eq!(found, None);
 
         let _ = fs::remove_dir_all(runtime_dir);
+    }
+
+    #[test]
+    fn count_windows_for_pid_counts_exact_pid_matches() {
+        let clients = "\
+Window 1 -> a:
+\tpid: 4242
+Window 2 -> b:
+\tpid: 42420
+Window 3 -> c:
+\tpid: 4242
+";
+        assert_eq!(count_windows_for_pid(clients, 4242), 2);
+        assert_eq!(count_windows_for_pid(clients, 42420), 1);
+        assert_eq!(count_windows_for_pid(clients, 7), 0);
     }
 
     #[test]
