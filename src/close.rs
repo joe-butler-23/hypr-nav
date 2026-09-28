@@ -6,7 +6,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
-use std::process;
+use std::process::{self, Command};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CLOSE_LOG_MAX_BYTES: u64 = 1024 * 1024;
@@ -28,35 +28,27 @@ fn main() {
     log_close_event("invoked", json!({ "argv": args }));
     let hypr_socket = match find_hyprland_socket() {
         Some(path) => path,
-        None => {
-            log_close_event("no_hypr_socket", json!({}));
-            std::process::exit(1);
-        }
+        None => fail("no_hypr_socket", json!({})),
     };
     debug_log!("smart-close", "invoked");
 
     let active = match get_active_window_snapshot(&hypr_socket) {
         Some(info) => info,
-        None => {
-            log_close_event("active_window_unavailable", json!({}));
-            std::process::exit(1);
-        }
+        None => fail("active_window_unavailable", json!({})),
     };
     log_close_event("active_captured", active_window_json(&active));
 
     let terminal_window = is_terminal_window(&active.class, active.pid);
     let terminal = if terminal_window {
         let Some(runtime) = detect_terminal_runtime(&active) else {
-            log_close_event("terminal_identity_unresolved", active_window_json(&active));
-            std::process::exit(1);
+            fail("terminal_identity_unresolved", active_window_json(&active));
         };
         Some(runtime)
     } else {
         None
     };
     if terminal_window && !active_window_is_current(&hypr_socket, &active) {
-        log_close_event("active_window_changed", active_window_json(&active));
-        std::process::exit(1);
+        fail("active_window_changed", active_window_json(&active));
     }
     let nonterminal_herdr = (!terminal_window)
         .then(|| detect_herdr_runtime(active.pid, &active.class))
@@ -93,7 +85,7 @@ fn main() {
             }
             None => {
                 debug_log!("smart-close", "herdr runtime detected but close failed");
-                log_close_event(
+                fail(
                     "herdr_close_failed",
                     json!({
                         "active": active_window_json(&active),
@@ -101,7 +93,6 @@ fn main() {
                         "session": runtime.session,
                     }),
                 );
-                std::process::exit(1);
             }
         }
     }
@@ -156,7 +147,7 @@ fn main() {
                         "smart-close",
                         "tmux close handling failed; refusing unsafe window fallback"
                     );
-                    log_close_event(
+                    fail(
                         "tmux_close_failed",
                         json!({
                             "active": active_window_json(&active),
@@ -166,10 +157,9 @@ fn main() {
                             "socket": socket_path,
                         }),
                     );
-                    std::process::exit(1);
                 } else {
                     debug_log!("smart-close", "tmux runtime detected but no session target resolved; refusing unsafe window fallback");
-                    log_close_event(
+                    fail(
                         "tmux_target_unresolved",
                         json!({
                             "active": active_window_json(&active),
@@ -177,7 +167,6 @@ fn main() {
                             "socket": runtime.socket_path,
                         }),
                     );
-                    std::process::exit(1);
                 }
             } else {
                 debug_log!(
@@ -191,8 +180,7 @@ fn main() {
     }
 
     if !active_window_is_current(&hypr_socket, &active) {
-        log_close_event("active_window_changed", active_window_json(&active));
-        std::process::exit(1);
+        fail("active_window_changed", active_window_json(&active));
     }
     debug_log!(
         "smart-close",
@@ -210,14 +198,13 @@ fn main() {
             }),
         );
     } else {
-        log_close_event(
+        fail(
             "dispatch_closewindow_failed",
             json!({
                 "active": active_window_json(&active),
                 "dispatcher": dispatcher,
             }),
         );
-        std::process::exit(1);
     }
 }
 
@@ -320,6 +307,55 @@ fn choose_herdr_close_action(response: &Value) -> Option<HerdrCloseAction> {
     } else {
         Some(HerdrCloseAction::ClosePane(pane_id.to_string()))
     }
+}
+
+/// Record a close failure through the opt-in JSONL trace, then exit non-zero
+/// after guaranteeing a diagnostic trail that needs no `HYPR_CLOSE_LOG`. This
+/// is the only path a failing close should take: callers must not exit(1)
+/// without going through it, or the failure becomes invisible again.
+fn fail(event: &str, detail: Value) -> ! {
+    log_close_event(event, detail.clone());
+    report_failure(event, &detail);
+    std::process::exit(1);
+}
+
+/// Always-on failure reporting, independent of `HYPR_CLOSE_LOG`. Errors must
+/// be visible without opting in; only the verbose per-event trace stays
+/// opt-in. Window titles are stripped here (unlike the JSONL trace) since
+/// this path has no size cap or retention control.
+fn report_failure(event: &str, detail: &Value) {
+    let summary = strip_titles(detail);
+    let message = format!("hypr-smart-close: {event} failed: {summary}");
+    eprintln!("{message}");
+    send_to_journal(&message);
+}
+
+fn strip_titles(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| key.as_str() != "title")
+                .map(|(key, value)| (key.clone(), strip_titles(value)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(strip_titles).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Best-effort forward to the systemd journal so a failure is discoverable
+/// even when this process's own stderr is not: `hypr-smart-close` is usually
+/// launched as a delegate (e.g. from `hf close-guard`) whose caller inherits
+/// stdio but does not surface it. Bounded by the watchdog like every other
+/// subprocess call in this binary; silently skipped if systemd-cat is
+/// unavailable, leaving stderr as the baseline diagnostic channel.
+fn send_to_journal(message: &str) {
+    let _ = Command::new("systemd-cat")
+        .arg("--identifier=hypr-smart-close")
+        .arg("--priority=err")
+        .arg("echo")
+        .arg(message)
+        .watched_status();
 }
 
 fn log_close_event(event: &str, detail: serde_json::Value) {

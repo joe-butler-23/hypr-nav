@@ -24,7 +24,7 @@ bind = SUPER, l, exec, hypr-tmux-nav right
 bind = SUPER, c, exec, hypr-smart-close
 ```
 
-Set `HYPR_NAV_DEBUG=1` to print routing decisions to stderr. `HYPR_CLOSE_LOG=/path/to/events.jsonl` enables bounded JSONL close logging; it is opt-in because events can contain window titles.
+Set `HYPR_NAV_DEBUG=1` to print routing decisions to stderr. `HYPR_CLOSE_LOG=/path/to/events.jsonl` enables bounded JSONL close logging; it is opt-in because events can contain window titles. A `hypr-smart-close` failure is always reported to stderr and the systemd journal (`journalctl --user -t hypr-smart-close`), with titles stripped, regardless of either variable; only the verbose per-event trace stays opt-in.
 
 ## Ownership and Safety
 

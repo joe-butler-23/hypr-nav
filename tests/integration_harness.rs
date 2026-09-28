@@ -1209,6 +1209,33 @@ fn hypr_smart_close_fails_closed_when_active_window_identity_is_incomplete() {
 }
 
 #[test]
+fn hypr_smart_close_reports_failure_on_stderr_without_close_log() {
+    let harness = Harness::new("sc-fail-stderr");
+    let _hypr = HyprServer::start_with_response(
+        &harness.runtime_dir,
+        &harness.hypr_sig,
+        "class: kitty\npid: 123\n",
+    );
+
+    // No HYPR_CLOSE_LOG set: the opt-in JSONL trace stays off, but a failure
+    // must still be diagnosable without it.
+    let envs = harness.envs();
+    let output = binary_command("hypr-smart-close", &[], &envs)
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        !output.status.success(),
+        "incomplete activewindow data should fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("active_window_unavailable"),
+        "failure should be diagnosable on stderr without HYPR_CLOSE_LOG, got: {stderr}"
+    );
+}
+
+#[test]
 fn hypr_smart_close_fails_closed_when_tmux_target_is_ambiguous() {
     let harness = Harness::new("sc-tmux-ambig");
     let pid_file = harness.runtime_dir.join("terminal.pid");
