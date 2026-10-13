@@ -1214,12 +1214,20 @@ pub fn kitty_context(active: &ActiveWindowInfo) -> Option<KittyContext> {
     let os_window = select_kitty_window(data.as_array()?, active)?;
     let tab = selected_item(os_window.get("tabs")?.as_array()?)?;
     let window = selected_item(tab.get("windows")?.as_array()?)?;
+    let pane_pid = u32::try_from(window.get("pid")?.as_u64()?).ok()?;
+    if !pid_has_ancestor(pane_pid, active.pid, KITTY_PROBE_ANCESTRY_MAX_HOPS) {
+        return None;
+    }
+    // Daemonised clipboard helpers can be reparented to init while retaining
+    // this pane's session. Only a verified session leader can establish that
+    // ownership; an arbitrary shared daemon/session cannot identify a pane.
+    let pane_session = unsafe { libc::getsid(pane_pid as libc::pid_t) };
     let pids = read_pids_from_kitty_window(window);
-    if pids.is_empty()
-        || pids
-            .iter()
-            .any(|&pid| !pid_has_ancestor(pid, active.pid, KITTY_PROBE_ANCESTRY_MAX_HOPS))
-    {
+    if pids.iter().any(|&pid| {
+        !pid_has_ancestor(pid, active.pid, KITTY_PROBE_ANCESTRY_MAX_HOPS)
+            && (pane_session != pane_pid as libc::pid_t
+                || unsafe { libc::getsid(pid as libc::pid_t) } != pane_session)
+    }) {
         return None;
     }
     Some(KittyContext {

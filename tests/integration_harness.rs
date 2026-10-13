@@ -2377,6 +2377,101 @@ fn shared_kitty_ambiguous_or_failed_identity_refuses_close() {
     }
 }
 
+// A terminal's clipboard helper can be adopted by init while retaining the
+// terminal session. Keep a real orphan in a disposable session for this proof.
+struct ReparentedKitty {
+    root: Child,
+    helper_pid: u32,
+}
+
+impl ReparentedKitty {
+    fn start(dir: &Path) -> Self {
+        fs::write(
+            dir.join("orphan-pane"),
+            "mkfifo helper-hold pane-hold\nbash -c 'cat helper-hold >/dev/null & printf \"helper %s\\n\" \"$!\"'\nprintf 'ready\\n'\nread -r _ < pane-hold\n",
+        )
+        .unwrap();
+        let mut root = Command::new("setsid")
+            .args(["bash", "orphan-pane"])
+            .current_dir(dir)
+            .env_remove("NVIM")
+            .env_remove("TMUX")
+            .env_remove("HERDR_SESSION_NAME")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut reader = BufReader::new(root.stdout.take().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let helper_pid = line
+            .trim()
+            .strip_prefix("helper ")
+            .unwrap()
+            .parse()
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "ready"); // Intermediate parent has exited.
+        Self { root, helper_pid }
+    }
+}
+
+impl Drop for ReparentedKitty {
+    fn drop(&mut self) {
+        unsafe { libc::kill(-(self.root.id() as i32), libc::SIGTERM) };
+        let _ = self.root.wait();
+    }
+}
+
+#[test]
+fn shared_kitty_reparented_foreground_helper_requires_exact_pane_session() {
+    let harness = Harness::new("kitty-orphan");
+    let kitty = ReparentedKitty::start(&harness.runtime_dir);
+    let pane_pid = kitty.root.id();
+    assert_eq!(unsafe { libc::getsid(pane_pid as i32) }, pane_pid as i32);
+    assert_eq!(
+        unsafe { libc::getsid(kitty.helper_pid as i32) },
+        pane_pid as i32
+    );
+    let status = fs::read_to_string(format!("/proc/{}/status", kitty.helper_pid)).unwrap();
+    let parent: u32 = status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_ne!(parent, pane_pid, "helper must really be reparented");
+
+    for (foreground_pid, allowed) in [(std::process::id(), false), (kitty.helper_pid, true)] {
+        let harness = Harness::new("orphan-close");
+        let hypr = HyprServer::start_with_response(
+            &harness.runtime_dir,
+            &harness.hypr_sig,
+            &format!(
+                "Window abc123 -> shell:\nclass: kitty\npid: {pane_pid}\nxdgTag: orphan-target\n"
+            ),
+        );
+        let mut windows = singleton_kitty("kitty", pane_pid);
+        windows[0]["wm_name"] = "orphan-target".into();
+        windows[0]["tabs"][0]["windows"][0]["foreground_processes"] =
+            serde_json::json!([{"pid": foreground_pid}]);
+        let mut sibling = singleton_kitty("kitty", std::process::id())[0].clone();
+        sibling["wm_name"] = "sibling".into();
+        windows.as_array_mut().unwrap().push(sibling);
+        let mut envs = harness.envs();
+        envs.push(("TEST_KITTY_LS_JSON".into(), windows.to_string()));
+        let result = run_binary_status("hypr-smart-close", &[], &envs);
+        let dispatched = hypr
+            .requests()
+            .iter()
+            .any(|request| request.starts_with("dispatch "));
+        eprintln!("reparented helper allowed={allowed}: exit={result} dispatched={dispatched}");
+        assert_eq!(result.success(), allowed);
+        assert_eq!(dispatched, allowed);
+    }
+}
+
 #[test]
 fn shared_kitty_neighbor_uses_exact_tagged_pane_id() {
     let harness = Harness::new("shared-kitty-nav");

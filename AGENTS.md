@@ -77,8 +77,10 @@ remote control off (latch's locked.conf) owns no `kitty-<pid>` socket; its
 process tree is walked like any terminal only when Hyprland shows that pid
 owning exactly one window, and close refuses otherwise.
 
-The resolver matches tag plus class, verifies foreground-process ancestry, and
-selects the active tab and pane inside that OS window. It never searches another
+The resolver matches tag plus class, verifies the pane root belongs to Kitty,
+and selects the active tab and pane inside that OS window. Foreground processes
+must descend from Kitty or belong to the verified pane root's own Linux session;
+this admits reparented clipboard helpers without trusting another session. It never searches another
 Kitty window's process tree when identity is absent, ambiguous, or unavailable.
 Navigation falls through to Hyprland when inner context cannot be established;
 close refuses that ambiguity. A changed captured window cancels an inner action.
