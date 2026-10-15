@@ -52,7 +52,7 @@ for binary in hypr-nav hypr-tmux-nav hypr-smart-close; do realpath "$(command -v
 That proves deployment only. Also exercise each affected route through its real Hyprland keybinding in a disposable topology and confirm the visible focus or close result; do not infer live correctness from the store path or harness alone.
 
 <!-- clai:instructions:coding:start -->
-<!-- source-sha256:6f3b2f54126ffc9b8e0b8423037f6d453e240d165cb3de8123df9605010b281b -->
+<!-- source-sha256:c0fc6361a73eee09463db171fabdb27b6fc171fb1cb3db0a19b7055a5b020898 -->
 ## Engineering Principles
 
 - **Modern and idiomatic:** Use current, supported language, framework, and platform conventions. Match surrounding code when it is sound; do not reproduce obsolete patterns merely for consistency.
@@ -64,6 +64,10 @@ That proves deployment only. Also exercise each affected route through its real 
 - **Timing and state:** Use time to model time, not to infer state. When work involves polling, debounce, readiness, timeouts, TTLs, cooldowns, throttling, retries, scheduling, animation timing, or event delivery, load the `timer-inference` skill.
 - **Process identity:** Never identify a process with `pgrep -f` or `pkill -f`, and least of all over ssh: the invoking shell carries your pattern in its own command line and matches too, so a pattern kill takes the session with it and returns 255. `psfind <pattern>` lists matches while excluding its own ancestors; act on a PID you have looked at, and use `psfind -q` when a script needs them.
 - **Context economy:** Prefer quiet output on noisy commands (`--reporter=dot`, `-q`, filtered tails) — verbose tool output occupies session context permanently.
+
+## Heavy jobs on Minworker
+
+Minworker shares 12 GB of RAM across agents. Run direct foreground builds, clippy, Cargo tests and other heavy verification through `agent-heavy <command>`. It queues work under the same host lock as native build and release runners, with lower CPU and I/O priority; it does not depend on a PTT checkout. Invoke runners that already own admission (`scripts/ship`, `release`, `overlay-updates.service`) directly. Use the repository's normal warm build directory, retain Cargo's managed default concurrency, and run each required heavy check once. Formatting, evaluation, Git and searches do not need the heavy-work queue.
 <!-- clai:instructions:coding:end -->
 
 
