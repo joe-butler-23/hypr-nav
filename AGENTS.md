@@ -52,7 +52,7 @@ for binary in hypr-nav hypr-tmux-nav hypr-smart-close; do realpath "$(command -v
 That proves deployment only. Also exercise each affected route through its real Hyprland keybinding in a disposable topology and confirm the visible focus or close result; do not infer live correctness from the store path or harness alone.
 
 <!-- clai:instructions:coding:start -->
-<!-- source-sha256:c0fc6361a73eee09463db171fabdb27b6fc171fb1cb3db0a19b7055a5b020898 -->
+<!-- source-sha256:1a131f46fafd56730f2f1706abcc2b7ff7ebdcb45e3956551ba62a37bf184580 -->
 ## Engineering Principles
 
 - **Modern and idiomatic:** Use current, supported language, framework, and platform conventions. Match surrounding code when it is sound; do not reproduce obsolete patterns merely for consistency.
@@ -60,7 +60,7 @@ That proves deployment only. Also exercise each affected route through its real 
 - **Simple and explicit:** Use the least code and fewest moving parts that solve the problem. Prefer clear contracts, bounded resources, observable state, and existing project or platform primitives over speculative abstractions.
 - **Efficient by design:** Avoid repeated work and unnecessary process, file, database, or network round trips. Reuse long-lived resources, batch small operations, stream large inputs, and keep concurrency, buffering, and retries bounded.
 - **Evidence-led performance:** Set budgets and measure realistic workloads before optimizing. Fix algorithms, I/O, contention, and lifecycle design before micro-optimizing.
-- **Risk-proportionate verification:** Define success before editing. Run the cheapest sufficient checks first and escalate according to risk. Bugs require regression coverage, and completion requires evidence at the surface the user cares about. Every added test must fail when the change it covers is reverted, exercise the real surface rather than doubles wherever that surface is reachable, and not duplicate existing coverage; delete tests that fail any of these.
+- **Verification:** Use existing checks and direct observation when they establish the outcome. A new test should earn its maintenance cost by catching a meaningful failure that existing coverage misses.
 - **Timing and state:** Use time to model time, not to infer state. When work involves polling, debounce, readiness, timeouts, TTLs, cooldowns, throttling, retries, scheduling, animation timing, or event delivery, load the `timer-inference` skill.
 - **Process identity:** Never identify a process with `pgrep -f` or `pkill -f`, and least of all over ssh: the invoking shell carries your pattern in its own command line and matches too, so a pattern kill takes the session with it and returns 255. `psfind <pattern>` lists matches while excluding its own ancestors; act on a PID you have looked at, and use `psfind -q` when a script needs them.
 - **Context economy:** Prefer quiet output on noisy commands (`--reporter=dot`, `-q`, filtered tails) — verbose tool output occupies session context permanently.
