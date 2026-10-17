@@ -43,9 +43,11 @@ fn main() {
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .watched_status();
-                    if status.is_ok_and(|status| status.success()) {
-                        return;
+                    if !status.is_ok_and(|status| status.success()) {
+                        eprintln!("hypr-nav: Kitty navigation unacknowledged");
+                        std::process::exit(1);
                     }
+                    return;
                 }
             }
         }

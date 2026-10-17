@@ -8,8 +8,8 @@ Success means navigation reaches the intended split, pane, or window without sur
 
 - `hypr-nav <direction>` tries the active Kitty neighbour before falling through to Hyprland.
 - `hypr-tmux-nav <direction>` routes inward to outward: Neovim, Herdr, tmux, then Hyprland. Preserve that precedence and the cross-window entry-assist behaviour.
-- `hypr-smart-close` routes through Herdr or an exact tmux target before closing the captured Hyprland window address. Navigation may fall through when an inner layer is unavailable; close must fail closed on incomplete identity, ambiguity, timeout, or failed inner action.
-- `src/lib.rs` owns process-tree discovery, socket selection, IPC deadlines, and Hyprland dispatch. Runtime sockets and navigation state belong under `XDG_RUNTIME_DIR`, with `/run/user/<uid>` as the fallback; do not reintroduce `/tmp` runtime state.
+- `hypr-smart-close` routes through Herdr or an exact tmux target before closing the captured Hyprland window address. Navigation may fall through when inner discovery is unavailable or the provider explicitly reports an edge; an unacknowledged mutation stops routing. Close must fail closed on incomplete identity, ambiguity, timeout, or failed inner action.
+- `src/lib.rs` owns process-tree discovery, socket selection, IPC deadlines, and Hyprland dispatch. Runtime sockets belong under `XDG_RUNTIME_DIR`, with `/run/user/<uid>` as the fallback; do not reintroduce `/tmp` runtime state.
 - Lua dispatch is attempted first and legacy Hyprland syntax remains the compatibility fallback. Preserve active-window and process-ancestry checks so one Kitty instance or an inherited Herdr environment cannot redirect another window's action.
 
 ## Hyprland Configuration

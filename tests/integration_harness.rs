@@ -97,72 +97,15 @@ impl HyprServer {
         sig: &str,
         active_response: &str,
     ) -> Self {
-        Self::start_with_lua_fallback(runtime_dir, sig, active_response, false)
-    }
-
-    fn start_with_lua_fallback(
-        runtime_dir: &Path,
-        sig: &str,
-        active_response: &str,
-        stop_after_activewindow: bool,
-    ) -> Self {
-        let socket_dir = runtime_dir.join("hypr").join(sig);
-        fs::create_dir_all(&socket_dir).expect("hypr runtime dir should be created");
-        let socket_path = socket_dir.join(".socket.sock");
-        let listener = UnixListener::bind(&socket_path).expect("hypr socket should bind");
-        listener
-            .set_nonblocking(true)
-            .expect("hypr socket should be nonblocking");
-
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let stop = Arc::new(AtomicBool::new(false));
-        let requests_clone = Arc::clone(&requests);
-        let stop_clone = Arc::clone(&stop);
-        let active_response = active_response.to_string();
-        let socket_path_for_thread = socket_path.clone();
-
-        let handle = thread::spawn(move || {
-            while !stop_clone.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((mut stream, _addr)) => {
-                        let mut request = String::new();
-                        let _ = stream.read_to_string(&mut request);
-                        let request = request.trim().to_string();
-                        if request == "activewindow" {
-                            let _ = stream.write_all(active_response.as_bytes());
-                            if stop_after_activewindow {
-                                let _ = fs::remove_file(&socket_path_for_thread);
-                                stop_clone.store(true, Ordering::Relaxed);
-                            }
-                        } else if request.starts_with("dispatch ") {
-                            // Reject Lua-form dispatches (contain "hl.dsp."), accept legacy
-                            let is_lua_form = request.contains("hl.dsp.");
-                            let response = if is_lua_form {
-                                "error: lua form not supported"
-                            } else {
-                                "ok"
-                            };
-                            let _ = stream.write_all(response.as_bytes());
-                        }
-                        requests_clone
-                            .lock()
-                            .expect("requests lock should succeed")
-                            .push(request);
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        Self {
-            socket_path,
-            requests,
-            stop,
-            handle: Some(handle),
-        }
+        Self::start_with_clients(
+            runtime_dir,
+            sig,
+            &[active_response],
+            "ok",
+            false,
+            None,
+            false,
+        )
     }
 
     fn start_with_options(
@@ -176,23 +119,26 @@ impl HyprServer {
         Self::start_with_clients(
             runtime_dir,
             sig,
-            active_response,
+            &[
+                active_response,
+                next_active_response.unwrap_or(active_response),
+            ],
             dispatch_response,
             stop_after_activewindow,
-            next_active_response,
             None,
+            true,
         )
     }
 
-    /// Like `start_with_options`, also answering the `clients` query.
+    /// Script authoritative focus snapshots, also answering the `clients` query.
     fn start_with_clients(
         runtime_dir: &Path,
         sig: &str,
-        active_response: &str,
+        active_responses: &[&str],
         dispatch_response: &str,
         stop_after_activewindow: bool,
-        next_active_response: Option<&str>,
         clients_response: Option<&str>,
+        lua_supported: bool,
     ) -> Self {
         let socket_dir = runtime_dir.join("hypr").join(sig);
         fs::create_dir_all(&socket_dir).expect("hypr runtime dir should be created");
@@ -206,8 +152,8 @@ impl HyprServer {
         let stop = Arc::new(AtomicBool::new(false));
         let requests_clone = Arc::clone(&requests);
         let stop_clone = Arc::clone(&stop);
-        let active_response = active_response.to_string();
-        let next_active_response = next_active_response.map(str::to_string);
+        let active_responses: Vec<String> =
+            active_responses.iter().map(|s| s.to_string()).collect();
         let mut active_queries = 0;
         let dispatch_response = dispatch_response.to_string();
         let clients_response = clients_response.map(str::to_string);
@@ -221,11 +167,8 @@ impl HyprServer {
                         let _ = stream.read_to_string(&mut request);
                         let request = request.trim().to_string();
                         if request == "activewindow" {
-                            let response = if active_queries == 0 {
-                                &active_response
-                            } else {
-                                next_active_response.as_ref().unwrap_or(&active_response)
-                            };
+                            let response =
+                                &active_responses[active_queries.min(active_responses.len() - 1)];
                             active_queries += 1;
                             let _ = stream.write_all(response.as_bytes());
                             if stop_after_activewindow {
@@ -233,7 +176,12 @@ impl HyprServer {
                                 stop_clone.store(true, Ordering::Relaxed);
                             }
                         } else if request.starts_with("dispatch ") {
-                            let _ = stream.write_all(dispatch_response.as_bytes());
+                            let response = if !lua_supported && request.contains("hl.dsp.") {
+                                "Invalid dispatcher"
+                            } else {
+                                &dispatch_response
+                            };
+                            let _ = stream.write_all(response.as_bytes());
                         } else if request == "clients" {
                             if let Some(response) = &clients_response {
                                 let _ = stream.write_all(response.as_bytes());
@@ -887,11 +835,11 @@ fn locked_kitty_close_case(windows_for_pid: usize) -> (bool, Vec<String>) {
     let hypr = HyprServer::start_with_clients(
         &harness.runtime_dir,
         &harness.hypr_sig,
-        &active,
+        &[&active],
         "ok",
         false,
-        None,
         Some(&clients),
+        true,
     );
     let mut envs = harness.envs();
     envs.push(("TEST_KITTY_LS_EXIT".into(), "1".into()));
@@ -1418,19 +1366,6 @@ fn hypr_tmux_nav_exits_nonzero_when_hypr_fallback_dispatch_fails() {
         "failed Hypr dispatch should exit non-zero"
     );
     assert_eq!(hypr.requests(), vec!["activewindow".to_string()]);
-    let nav_state_exists = fs::read_dir(&harness.runtime_dir)
-        .expect("runtime dir should be readable")
-        .flatten()
-        .any(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("hypr-nav-navstate")
-        });
-    assert!(
-        !nav_state_exists,
-        "failed Hypr fallback should not record successful navigation state"
-    );
 }
 
 #[test]
@@ -1515,19 +1450,6 @@ fn hypr_tmux_nav_exits_nonzero_when_hypr_fallback_dispatch_reply_is_rejected() {
     assert!(
         has_lua || has_legacy,
         "expected either Lua or legacy movefocus dispatch, got {requests:?}"
-    );
-    let nav_state_exists = fs::read_dir(&harness.runtime_dir)
-        .expect("runtime dir should be readable")
-        .flatten()
-        .any(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("hypr-nav-navstate")
-        });
-    assert!(
-        !nav_state_exists,
-        "rejected Hypr fallback dispatch reply should not record successful navigation state"
     );
 }
 
@@ -2784,5 +2706,165 @@ fn herdr08_cross_window_entry_targets_observed_destination() {
         "already_on_edge",
     ] {
         check_herdr08_cross_window_entry(mode);
+    }
+}
+
+#[test]
+fn unknown_dispatch_outcome_never_replays_navigation_or_close() {
+    for reply in ["", "operation failed"] {
+        for (binary, args) in [
+            ("hypr-nav", vec!["left"]),
+            ("hypr-tmux-nav", vec!["left"]),
+            ("hypr-smart-close", vec![]),
+        ] {
+            let harness = Harness::new("dispatch-no-replay");
+            let hypr = HyprServer::start_with_dispatch_response(
+                &harness.runtime_dir,
+                &harness.hypr_sig,
+                "Window abc123 -> browser:\nclass: brave\npid: 4242\n",
+                reply,
+            );
+            assert!(!run_binary_status(binary, &args, &harness.envs()).success());
+            let mutations: Vec<_> = hypr
+                .requests()
+                .into_iter()
+                .filter(|request| request.starts_with("dispatch "))
+                .collect();
+            assert_eq!(
+                mutations.len(),
+                1,
+                "{binary}, reply={reply:?}: {mutations:?}"
+            );
+            assert!(mutations[0].contains("hl.dsp."));
+        }
+    }
+}
+
+#[test]
+fn cross_window_entry_uses_destination_and_cancels_after_focus_changes() {
+    for mode in ["tmux", "nvim", "nvim_failed", "changed"] {
+        let harness = Harness::new("terminal-entry");
+        let nvim_socket = harness.runtime_dir.join("nvim.sock");
+        let _nvim_listener = UnixListener::bind(&nvim_socket).unwrap();
+        let nvim_path = nvim_socket.display().to_string();
+        let mut child_env = vec![("TMUX", "/tmp/fake-tmux,4242,0")];
+        if mode.starts_with("nvim") {
+            child_env.push(("NVIM", &nvim_path));
+        }
+        let pty = PtyProcess::spawn(&harness.runtime_dir.join("terminal.pid"), &child_env);
+        let tty = fs::read_link(format!("/proc/{}/fd/0", pty.pid))
+            .unwrap()
+            .display()
+            .to_string();
+        let source = "Window abc123 -> browser:\nclass: brave\npid: 4242\n";
+        let destination = format!(
+            "Window def456 -> destination:\nclass: termstub\npid: {}\n",
+            pty.pid
+        );
+        let after_discovery = if mode == "changed" {
+            source
+        } else {
+            &destination
+        };
+        let hypr = HyprServer::start_with_clients(
+            &harness.runtime_dir,
+            &harness.hypr_sig,
+            &[source, &destination, after_discovery],
+            "ok",
+            false,
+            None,
+            true,
+        );
+        let mut envs = harness.envs();
+        envs.extend([
+            ("TERMINAL".into(), "termstub".into()),
+            ("TEST_TTY".into(), tty),
+            (
+                "TEST_TMUX_PANE_ROWS".into(),
+                "%1 0 1 1 1 1\n%2 1 0 1 1 0".into(),
+            ),
+        ]);
+        if mode == "nvim_failed" {
+            envs.push(("TEST_NVIM_SEND_OK".into(), "0".into()));
+        }
+        let status = run_binary_status("hypr-tmux-nav", &["right"], &envs);
+        assert_eq!(status.success(), mode != "changed" && mode != "nvim_failed");
+        let log = harness.log_contents();
+        if mode == "nvim" {
+            assert!(log.contains("999wincmd h"), "{log}");
+            assert!(!log.contains("tmux select-pane"), "{log}");
+            // A subsequent key belongs to its current target, with no entry debt.
+            run_binary("hypr-tmux-nav", &["right"], &envs);
+            let log = harness.log_contents();
+            assert_eq!(log.matches("999wincmd h").count(), 1, "{log}");
+            assert!(log.contains("execute('wincmd l')"), "{log}");
+        } else if mode == "tmux" {
+            assert!(log.contains("tmux select-pane -t %2\n"), "{log}");
+        } else {
+            assert!(!log.contains("tmux select-pane"), "changed target: {log}");
+        }
+        assert_eq!(
+            hypr.requests()
+                .iter()
+                .filter(|r| r.starts_with("dispatch "))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn inner_mutation_failure_never_falls_through_to_another_action() {
+    for mode in ["nvim", "herdr", "tmux", "kitty"] {
+        let harness = Harness::new("inner-no-replay");
+        let nvim_socket = harness.runtime_dir.join("nvim.sock");
+        let _nvim_listener = UnixListener::bind(&nvim_socket).unwrap();
+        let nvim_path = nvim_socket.display().to_string();
+        let server = HerdrServer::start(&harness.runtime_dir, "");
+        let herdr_path = server.socket_path.display().to_string();
+        let mut herdr =
+            spawn_process_named_with_env("herdr", &[("HERDR_SOCKET_PATH", &herdr_path)]);
+        let mut child_env = vec![("TMUX", "/tmp/fake-tmux,4242,0")];
+        if mode.starts_with("nvim") {
+            child_env.push(("NVIM", &nvim_path));
+        }
+        let pty = PtyProcess::spawn(&harness.runtime_dir.join("terminal.pid"), &child_env);
+        let (class, pid) = match mode {
+            "herdr" => ("herdr", herdr.id()),
+            "kitty" => ("kitty", pty.pid),
+            _ => ("termstub", pty.pid),
+        };
+        let hypr = HyprServer::start(&harness.runtime_dir, &harness.hypr_sig, class, pid);
+        let tty = fs::read_link(format!("/proc/{}/fd/0", pty.pid))
+            .unwrap()
+            .display()
+            .to_string();
+        let mut envs = harness.envs();
+        envs.extend([
+            ("TERMINAL".into(), "termstub".into()),
+            ("TEST_TTY".into(), tty),
+            ("TEST_NVIM_SEND_OK".into(), "0".into()),
+            ("TEST_TMUX_SELECT_OK".into(), "0".into()),
+        ]);
+        envs.push((
+            "TEST_KITTY_LS_JSON".into(),
+            singleton_kitty("kitty", pty.pid).to_string(),
+        ));
+        let (binary, direction) = if mode == "kitty" {
+            ("hypr-nav", "left")
+        } else {
+            ("hypr-tmux-nav", "right")
+        };
+        let status = run_binary_status(binary, &[direction], &envs);
+        let _ = herdr.kill();
+        let _ = herdr.wait();
+        assert!(!status.success(), "{mode} must report the uncertain action");
+        assert!(
+            !hypr.requests().iter().any(|r| r.starts_with("dispatch ")),
+            "{mode}"
+        );
+        if mode == "nvim" {
+            assert!(!harness.log_contents().contains("tmux select-pane"));
+        }
     }
 }

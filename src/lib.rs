@@ -127,7 +127,6 @@ pub struct HerdrRuntime {
 
 #[derive(Default)]
 pub struct TerminalRuntime {
-    pub tty: Option<String>,
     pub tmux: Option<TmuxRuntime>,
     pub nvim: Option<NvimRuntime>,
     pub herdr: Option<HerdrRuntime>,
@@ -144,7 +143,6 @@ pub struct ActiveWindowInfo {
 }
 
 struct KittyProbeResult {
-    tty: Option<String>,
     tmux: Option<TmuxRuntime>,
     nvim_socket: Option<String>,
     herdr: Option<HerdrRuntime>,
@@ -951,7 +949,7 @@ fn nvim_socket_is_live(socket: &str) -> bool {
 pub enum NvimNavOutcome {
     /// The window command executed and moved focus to a neighboring split.
     Moved,
-    /// There is no neighbor in that direction; nvim reported the edge sentinel.
+    /// Nvim explicitly reported no inner target (an edge or a single window).
     AtEdge,
     /// The nvim RPC call failed to spawn or exited non-zero.
     Error,
@@ -964,8 +962,8 @@ const NVIM_SINGLE_WINDOW_SENTINEL: &str = "HYPRNAV_SINGLE";
 /// `--remote-expr` call. The expression uses `execute()` to run the `wincmd`
 /// ex command, which works regardless of nvim's current mode (normal,
 /// insert, visual, ...) and never types into the buffer the way
-/// `--remote-send`-ing `<C-w>{dir}` keys would. Callers should treat `Error`
-/// the same as `AtEdge` (fail-open, fall through to the next nav layer).
+/// `--remote-send`-ing `<C-w>{dir}` keys would. Only `AtEdge` permits fallback;
+/// an RPC error leaves the mutation outcome unknown.
 pub fn nvim_navigate_or_edge(socket: &str, direction: Direction) -> NvimNavOutcome {
     let wincmd = direction.nvim_wincmd_char();
     let expr = format!(
@@ -1355,13 +1353,9 @@ fn detect_terminal_runtime_from_kitty(active: &ActiveWindowInfo) -> Option<Kitty
     let mut tmux_runtime: Option<TmuxRuntime> = None;
     let mut nvim_socket: Option<String> = None;
     let mut herdr_runtime: Option<HerdrRuntime> = None;
-    let mut tty: Option<String> = None;
 
     for pid in context.pids {
         let process_tty = read_process_tty(pid);
-        if tty.is_none() {
-            tty = process_tty.clone();
-        }
         let tmux_sock = read_tmux_socket_from_environ(pid);
         let has_tmux = tmux_sock.is_some() || process_has_tmux(pid);
         debug_log!(
@@ -1425,7 +1419,6 @@ fn detect_terminal_runtime_from_kitty(active: &ActiveWindowInfo) -> Option<Kitty
     }
 
     Some(KittyProbeResult {
-        tty,
         tmux: tmux_runtime,
         nvim_socket,
         herdr: herdr_runtime,
@@ -1437,7 +1430,6 @@ pub fn detect_terminal_runtime(active: &ActiveWindowInfo) -> Option<TerminalRunt
     if is_kitty_window(&active.class, active.pid) {
         if let Some(result) = detect_terminal_runtime_from_kitty(active) {
             return Some(TerminalRuntime {
-                tty: result.tty,
                 tmux: result.tmux,
                 nvim: result
                     .nvim_socket
@@ -1598,7 +1590,6 @@ pub fn detect_terminal_runtime(active: &ActiveWindowInfo) -> Option<TerminalRunt
     }
 
     Some(TerminalRuntime {
-        tty,
         tmux: tmux_result,
         nvim: nvim_result,
         herdr: herdr_result,
@@ -1659,12 +1650,12 @@ pub fn detect_herdr_runtime(pid: u32, class: &str) -> Option<HerdrRuntime> {
 }
 
 /// Attempt nvim entry assist: navigate to opposite-edge window on cross-window entry.
-/// Returns true if entry assist was applied (multiple windows and navigation succeeded).
+/// Returns `AtEdge` only when nvim explicitly reports a single window.
 ///
 /// Mode-safe and single-spawn: one `--remote-expr` call checks the window count
 /// and, when there is more than one window, runs `999wincmd {opposite}` via
 /// `execute()` so it works regardless of nvim's current mode.
-pub fn try_nvim_entry_assist(socket: &str, direction: Direction) -> bool {
+pub fn nvim_enter_edge(socket: &str, direction: Direction) -> NvimNavOutcome {
     let opposite = direction.nvim_entry_assist_char();
     let expr = format!(
         "winnr('$') <= 1 ? '{sentinel}' : execute('999wincmd {opposite}')",
@@ -1680,14 +1671,18 @@ pub fn try_nvim_entry_assist(socket: &str, direction: Direction) -> bool {
     let result = match output {
         Ok(out) if out.status.success() => {
             let result = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            result != NVIM_SINGLE_WINDOW_SENTINEL
+            if result == NVIM_SINGLE_WINDOW_SENTINEL {
+                NvimNavOutcome::AtEdge
+            } else {
+                NvimNavOutcome::Moved
+            }
         }
-        _ => false,
+        _ => NvimNavOutcome::Error,
     };
 
     debug_log!(
         "lib",
-        "try_nvim_entry_assist socket={} dir={} opposite={} -> {}",
+        "nvim_enter_edge socket={} dir={} opposite={} -> {:?}",
         socket,
         direction.tmux_flag(),
         opposite,
@@ -1896,57 +1891,40 @@ impl HyprDispatch {
     }
 }
 
-pub fn hypr_dispatch(socket_path: &PathBuf, dispatcher: &str) -> bool {
-    match UnixStream::connect(socket_path) {
-        Ok(mut stream) => {
-            if !configure_socket(&stream) {
-                debug_log!("lib", "hypr dispatch timeout setup failed");
-                return false;
-            }
-            let cmd = format!("dispatch {}", dispatcher);
-            debug_log!("lib", "hypr dispatch: {}", cmd);
-            if let Err(err) = stream.write_all(cmd.as_bytes()) {
-                debug_log!("lib", "hypr dispatch write failed: {}", err);
-                return false;
-            }
-            // The dispatch bytes are already written; a write-side shutdown
-            // error should not make callers report a failed action, but we
-            // still need to read Hyprland's reply to know whether it worked.
-            if let Err(err) = stream.shutdown(std::net::Shutdown::Write) {
-                debug_log!("lib", "hypr dispatch shutdown failed: {}", err);
-            }
-            let mut reply = String::new();
-            if let Err(err) = stream.read_to_string(&mut reply) {
-                debug_log!("lib", "hypr dispatch read failed: {}", err);
-                return false;
-            }
-            let trimmed = reply.trim();
-            if trimmed.to_lowercase().starts_with("ok") {
-                true
-            } else {
-                debug_log!("lib", "hypr dispatch failed reply: {}", trimmed);
-                false
-            }
+fn hypr_dispatch(socket_path: &PathBuf, dispatcher: &str) -> Option<String> {
+    let mut stream = UnixStream::connect(socket_path).ok()?;
+    if !configure_socket(&stream) {
+        return None;
+    }
+    let cmd = format!("dispatch {}", dispatcher);
+    debug_log!("lib", "hypr dispatch: {}", cmd);
+    // Once writing begins, transport failure leaves the outcome unknown.
+    // Only a complete provider reply can authorise a compatibility retry.
+    stream.write_all(cmd.as_bytes()).ok()?;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).ok()?;
+    Some(reply.trim().to_string())
+}
+
+/// Lua first; only stock Hyprland's explicit unknown-dispatcher rejection
+/// permits a legacy retry. A missing acknowledgement must never replay an action.
+pub fn hypr_dispatch_action(socket_path: &PathBuf, action: &HyprDispatch) -> bool {
+    match hypr_dispatch(socket_path, &action.lua_payload()).as_deref() {
+        Some("ok") => true,
+        Some("Invalid dispatcher") => {
+            debug_log!("lib", "Lua dispatcher unsupported; using legacy syntax");
+            hypr_dispatch(socket_path, &action.legacy_payload()).as_deref() == Some("ok")
         }
-        Err(err) => {
-            debug_log!("lib", "hypr dispatch connect failed: {}", err);
+        reply => {
+            debug_log!(
+                "lib",
+                "Hypr dispatch rejected or unacknowledged: {:?}",
+                reply
+            );
             false
         }
     }
-}
-
-/// Send a dispatcher action via Lua-IPC, with automatic fallback to legacy syntax.
-/// Attempts the Lua payload first; if that fails, retries with the legacy payload.
-/// Returns true if either attempt succeeded, false if both failed.
-pub fn hypr_dispatch_action(socket_path: &PathBuf, action: &HyprDispatch) -> bool {
-    let lua_payload = action.lua_payload();
-    if hypr_dispatch(socket_path, &lua_payload) {
-        return true;
-    }
-
-    let legacy_payload = action.legacy_payload();
-    debug_log!("lib", "lua dispatch failed, falling back to legacy syntax");
-    hypr_dispatch(socket_path, &legacy_payload)
 }
 
 #[cfg(test)]
