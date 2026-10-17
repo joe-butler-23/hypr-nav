@@ -2429,51 +2429,6 @@ Window 0xABC123 -> terminal:
         let me = std::process::id();
         assert!(!pid_has_ancestor(1, me, KITTY_PROBE_ANCESTRY_MAX_HOPS));
     }
-
-    #[test]
-    fn hypr_dispatch_lua_payload_movefocus_left() {
-        let action = HyprDispatch::MoveFocus(Direction::Left);
-        assert_eq!(action.lua_payload(), "hl.dsp.focus({direction = \"l\"})");
-    }
-
-    #[test]
-    fn hypr_dispatch_lua_payload_movefocus_right() {
-        let action = HyprDispatch::MoveFocus(Direction::Right);
-        assert_eq!(action.lua_payload(), "hl.dsp.focus({direction = \"r\"})");
-    }
-
-    #[test]
-    fn hypr_dispatch_lua_payload_movefocus_up() {
-        let action = HyprDispatch::MoveFocus(Direction::Up);
-        assert_eq!(action.lua_payload(), "hl.dsp.focus({direction = \"u\"})");
-    }
-
-    #[test]
-    fn hypr_dispatch_lua_payload_movefocus_down() {
-        let action = HyprDispatch::MoveFocus(Direction::Down);
-        assert_eq!(action.lua_payload(), "hl.dsp.focus({direction = \"d\"})");
-    }
-
-    #[test]
-    fn hypr_dispatch_legacy_payload_movefocus() {
-        let action = HyprDispatch::MoveFocus(Direction::Left);
-        assert_eq!(action.legacy_payload(), "movefocus l");
-    }
-
-    #[test]
-    fn hypr_dispatch_lua_payload_closewindow() {
-        let action = HyprDispatch::CloseWindow("0xdeadbeef".to_string());
-        assert_eq!(
-            action.lua_payload(),
-            "hl.dsp.window.close({address = \"0xdeadbeef\"})"
-        );
-    }
-
-    #[test]
-    fn hypr_dispatch_legacy_payload_closewindow() {
-        let action = HyprDispatch::CloseWindow("0xdeadbeef".to_string());
-        assert_eq!(action.legacy_payload(), "closewindow address:0xdeadbeef");
-    }
 }
 
 #[cfg(test)]

@@ -365,6 +365,13 @@ fn main() {
         debug_log!("tmux-nav", "active window info unavailable");
     }
 
+    if captured
+        .as_ref()
+        .is_some_and(|active| !active_window_is_current(&hypr_socket, active))
+    {
+        eprintln!("hypr-tmux-nav: source window changed before outer navigation");
+        std::process::exit(1);
+    }
     debug_log!("tmux-nav", "fallback to hypr movefocus {}", move_dir);
     let action = HyprDispatch::MoveFocus(direction);
     if hypr_dispatch_action(&hypr_socket, &action) {

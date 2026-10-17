@@ -101,7 +101,7 @@ impl HyprServer {
             runtime_dir,
             sig,
             &[active_response],
-            "ok",
+            ("ok", &[]),
             false,
             None,
             false,
@@ -123,19 +123,19 @@ impl HyprServer {
                 active_response,
                 next_active_response.unwrap_or(active_response),
             ],
-            dispatch_response,
+            (dispatch_response, &[]),
             stop_after_activewindow,
             None,
             true,
         )
     }
 
-    /// Script authoritative focus snapshots, also answering the `clients` query.
+    /// Manual focus races and acknowledged outer moves have separate snapshots.
     fn start_with_clients(
         runtime_dir: &Path,
         sig: &str,
         active_responses: &[&str],
-        dispatch_response: &str,
+        dispatch: (&str, &[&str]),
         stop_after_activewindow: bool,
         clients_response: Option<&str>,
         lua_supported: bool,
@@ -152,10 +152,11 @@ impl HyprServer {
         let stop = Arc::new(AtomicBool::new(false));
         let requests_clone = Arc::clone(&requests);
         let stop_clone = Arc::clone(&stop);
-        let active_responses: Vec<String> =
+        let mut active_responses: Vec<String> =
             active_responses.iter().map(|s| s.to_string()).collect();
         let mut active_queries = 0;
-        let dispatch_response = dispatch_response.to_string();
+        let dispatch_response = dispatch.0.to_string();
+        let after_dispatch: Vec<String> = dispatch.1.iter().map(|s| s.to_string()).collect();
         let clients_response = clients_response.map(str::to_string);
         let socket_path_for_thread = socket_path.clone();
 
@@ -182,6 +183,10 @@ impl HyprServer {
                                 &dispatch_response
                             };
                             let _ = stream.write_all(response.as_bytes());
+                            if response == "ok" && !after_dispatch.is_empty() {
+                                active_responses.clone_from(&after_dispatch);
+                                active_queries = 0;
+                            }
                         } else if request == "clients" {
                             if let Some(response) = &clients_response {
                                 let _ = stream.write_all(response.as_bytes());
@@ -836,7 +841,7 @@ fn locked_kitty_close_case(windows_for_pid: usize) -> (bool, Vec<String>) {
         &harness.runtime_dir,
         &harness.hypr_sig,
         &[&active],
-        "ok",
+        ("ok", &[]),
         false,
         Some(&clients),
         true,
@@ -2522,41 +2527,57 @@ fn shared_kitty_nvim_navigation_keeps_precedence() {
 
 #[test]
 fn shared_kitty_focus_change_refuses_stale_inner_action() {
-    let harness = Harness::new("shared-focus-change");
-    let server = HerdrServer::start_sequence(
-        &harness.runtime_dir,
-        vec![
-            close_snapshot(2, 1, 1).to_string(),
-            r#"{"result":{"type":"ok"}}"#.into(),
-        ],
-    );
-    let kitty = SharedKitty::start(&harness.runtime_dir, &server.socket_path);
-    let initial = format!(
-        "Window abc123 -> Herdr:\nclass: kitty\npid: {}\nxdgTag: nav-target\n",
-        kitty.root.id()
-    );
-    let changed = format!(
-        "Window def456 -> sibling:\nclass: kitty\npid: {}\nxdgTag: other\n",
-        kitty.root.id()
-    );
-    let hypr = HyprServer::start_with_options(
-        &harness.runtime_dir,
-        &harness.hypr_sig,
-        &initial,
-        "ok",
-        false,
-        Some(&changed),
-    );
-    let mut windows = kitty.windows("kitty");
-    windows[0]["tabs"][0]["windows"][0]["pid"] = kitty.herdr_pid.into();
-    let mut envs = harness.envs();
-    envs.push(("TEST_KITTY_LS_JSON".into(), windows.to_string()));
-    let status = run_binary_status("hypr-smart-close", &[], &envs);
-    assert!(!status.success());
-    assert!(server.requests().is_empty());
-    assert!(!hypr.requests().iter().any(|r| r.starts_with("dispatch ")));
+    for binary in ["hypr-smart-close", "hypr-nav", "hypr-tmux-nav"] {
+        let harness = Harness::new("shared-focus-change");
+        let server = HerdrServer::start_sequence(
+            &harness.runtime_dir,
+            vec![
+                close_snapshot(2, 1, 1).to_string(),
+                r#"{"result":{"type":"ok"}}"#.into(),
+            ],
+        );
+        let kitty = SharedKitty::start(&harness.runtime_dir, &server.socket_path);
+        let initial = format!(
+            "Window abc123 -> Herdr:\nclass: kitty\npid: {}\nxdgTag: nav-target\n",
+            kitty.root.id()
+        );
+        let changed = format!(
+            "Window def456 -> sibling:\nclass: kitty\npid: {}\nxdgTag: other\n",
+            kitty.root.id()
+        );
+        let snapshots = if binary == "hypr-tmux-nav" {
+            vec![initial.as_str(), initial.as_str(), changed.as_str()]
+        } else {
+            vec![initial.as_str(), changed.as_str()]
+        };
+        let hypr = HyprServer::start_with_clients(
+            &harness.runtime_dir,
+            &harness.hypr_sig,
+            &snapshots,
+            ("ok", &[]),
+            false,
+            None,
+            true,
+        );
+        let mut windows = kitty.windows("kitty");
+        if binary == "hypr-smart-close" {
+            windows[0]["tabs"][0]["windows"][0]["pid"] = kitty.herdr_pid.into();
+        } else {
+            windows[0]["tabs"][0]["windows"][0]["neighbors"] = serde_json::json!({});
+        }
+        let mut envs = harness.envs();
+        envs.push(("TEST_KITTY_LS_JSON".into(), windows.to_string()));
+        let args = if binary == "hypr-smart-close" {
+            vec![]
+        } else {
+            vec!["left"]
+        };
+        let status = run_binary_status(binary, &args, &envs);
+        assert!(!status.success());
+        assert!(server.requests().is_empty());
+        assert!(!hypr.requests().iter().any(|r| r.starts_with("dispatch ")));
+    }
 }
-
 #[test]
 fn herdr08_named_client_close_ignores_inherited_parent_socket() {
     let harness = Harness::new("herdr08-named");
@@ -2631,13 +2652,14 @@ fn check_herdr08_cross_window_entry(mode: &str) {
         "Window def456 -> destination:\nclass: herdr\npid: {}\n",
         app.id()
     );
-    let hypr = HyprServer::start_with_options(
+    let hypr = HyprServer::start_with_clients(
         &harness.runtime_dir,
         &harness.hypr_sig,
-        source,
-        "ok",
+        &[source],
+        ("ok", &[&destination]),
         false,
-        Some(&destination),
+        None,
+        true,
     );
     let mut envs = harness.envs();
     envs.push((
@@ -2769,8 +2791,8 @@ fn cross_window_entry_uses_destination_and_cancels_after_focus_changes() {
         let hypr = HyprServer::start_with_clients(
             &harness.runtime_dir,
             &harness.hypr_sig,
-            &[source, &destination, after_discovery],
-            "ok",
+            &[source],
+            ("ok", &[&destination, after_discovery]),
             false,
             None,
             true,

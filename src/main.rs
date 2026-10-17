@@ -23,11 +23,12 @@ fn main() {
     };
     debug_log!("kitty-nav", "input={} move_dir={}", args[1], move_dir);
 
-    if let Some(active) = get_active_window_snapshot(&hypr_socket) {
+    let captured = get_active_window_snapshot(&hypr_socket);
+    if let Some(ref active) = captured {
         if is_kitty_window(&active.class, active.pid) {
-            if let Some(context) = kitty_context(&active) {
+            if let Some(context) = kitty_context(active) {
                 if let Some(neighbor) = context.neighbor_id(direction) {
-                    if !active_window_is_current(&hypr_socket, &active) {
+                    if !active_window_is_current(&hypr_socket, active) {
                         return;
                     }
                     let target = format!("id:{neighbor}");
@@ -53,6 +54,13 @@ fn main() {
         }
     }
 
+    if captured
+        .as_ref()
+        .is_some_and(|active| !active_window_is_current(&hypr_socket, active))
+    {
+        eprintln!("hypr-nav: source window changed before outer navigation");
+        std::process::exit(1);
+    }
     debug_log!("kitty-nav", "fallback to hypr movefocus {}", move_dir);
     let action = HyprDispatch::MoveFocus(direction);
     if !hypr_dispatch_action(&hypr_socket, &action) {
