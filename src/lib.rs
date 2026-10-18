@@ -142,12 +142,6 @@ pub struct ActiveWindowInfo {
     pub xdg_tag: Option<String>,
 }
 
-struct KittyProbeResult {
-    tmux: Option<TmuxRuntime>,
-    nvim_socket: Option<String>,
-    herdr: Option<HerdrRuntime>,
-}
-
 pub fn debug_enabled() -> bool {
     static DEBUG_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DEBUG_ENABLED.get_or_init(|| match env::var("HYPR_NAV_DEBUG") {
@@ -548,12 +542,6 @@ fn count_windows_for_pid(clients: &str, pid: u32) -> usize {
         .count()
 }
 
-/// Get active window class and PID in a single Hyprland query.
-pub fn get_active_window_info(socket_path: &PathBuf) -> Option<(String, u32)> {
-    let info = get_active_window_snapshot(socket_path)?;
-    Some((info.class, info.pid))
-}
-
 fn parse_tmux_socket_from_value(tmux_value: &str) -> Option<String> {
     // TMUX format: "<socket_path>,<server_pid>,<session_id>"
     let mut parts = tmux_value.rsplitn(3, ',');
@@ -754,15 +742,6 @@ fn process_is_nvim(pid: u32) -> bool {
     false
 }
 
-pub fn parse_herdr_focus_changed(raw: &str) -> Option<bool> {
-    let parsed: Value = serde_json::from_str(raw.trim()).ok()?;
-    let changed = parsed
-        .get("changed")
-        .or_else(|| parsed.pointer("/result/navigate/changed"))
-        .or_else(|| parsed.pointer("/result/focus/changed"))?;
-    parse_json_boolish(changed)
-}
-
 pub fn herdr_config_dir() -> Option<PathBuf> {
     if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
         let trimmed = config_home.trim();
@@ -851,32 +830,6 @@ pub fn herdr_request(
             debug_log!("herdr-rpc", "response parse failed: {}", err);
             None
         }
-    }
-}
-
-fn parse_json_boolish(changed: &Value) -> Option<bool> {
-    if let Some(value) = changed.as_bool() {
-        Some(value)
-    } else if let Some(value) = changed.as_str() {
-        match value.to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" => Some(true),
-            "0" | "false" | "no" => Some(false),
-            _ => None,
-        }
-    } else if let Some(value) = changed.as_i64() {
-        match value {
-            0 => Some(false),
-            1 => Some(true),
-            _ => None,
-        }
-    } else if let Some(value) = changed.as_u64() {
-        match value {
-            0 => Some(false),
-            1 => Some(true),
-            _ => None,
-        }
-    } else {
-        None
     }
 }
 
@@ -1106,12 +1059,6 @@ fn kitty_control_socket_uri_from(
     }
 
     single_kitty_socket_uri(xdg_runtime_dir)
-}
-
-pub fn kitty_control_socket_uri() -> Option<String> {
-    let xdg = runtime_dir();
-    let listen_on = env::var("KITTY_LISTEN_ON").ok();
-    kitty_control_socket_uri_from(None, Path::new(&xdg), listen_on.as_deref())
 }
 
 pub fn kitty_control_socket_uri_for_pid(pid: u32) -> Option<String> {
@@ -1348,7 +1295,7 @@ fn pid_has_ancestor(pid: u32, ancestor: u32, max_hops: usize) -> bool {
 /// process tree.
 const KITTY_PROBE_ANCESTRY_MAX_HOPS: usize = 15;
 
-fn detect_terminal_runtime_from_kitty(active: &ActiveWindowInfo) -> Option<KittyProbeResult> {
+fn detect_terminal_runtime_from_kitty(active: &ActiveWindowInfo) -> Option<TerminalRuntime> {
     let context = kitty_context(active)?;
     let mut tmux_runtime: Option<TmuxRuntime> = None;
     let mut nvim_socket: Option<String> = None;
@@ -1418,9 +1365,11 @@ fn detect_terminal_runtime_from_kitty(active: &ActiveWindowInfo) -> Option<Kitty
         }
     }
 
-    Some(KittyProbeResult {
+    Some(TerminalRuntime {
         tmux: tmux_runtime,
-        nvim_socket,
+        nvim: nvim_socket
+            .filter(|socket| nvim_socket_is_live(socket))
+            .map(|socket_path| NvimRuntime { socket_path }),
         herdr: herdr_runtime,
     })
 }
@@ -1428,15 +1377,8 @@ fn detect_terminal_runtime_from_kitty(active: &ActiveWindowInfo) -> Option<Kitty
 /// Combined detection: find TTY plus nested runtime metadata from process tree.
 pub fn detect_terminal_runtime(active: &ActiveWindowInfo) -> Option<TerminalRuntime> {
     if is_kitty_window(&active.class, active.pid) {
-        if let Some(result) = detect_terminal_runtime_from_kitty(active) {
-            return Some(TerminalRuntime {
-                tmux: result.tmux,
-                nvim: result
-                    .nvim_socket
-                    .filter(|socket| nvim_socket_is_live(socket))
-                    .map(|socket_path| NvimRuntime { socket_path }),
-                herdr: result.herdr,
-            });
+        if let Some(runtime) = detect_terminal_runtime_from_kitty(active) {
+            return Some(runtime);
         }
         // A Kitty with remote control off (latch's locked.conf) cannot be
         // probed. Its process tree is still exact when Hyprland shows that
@@ -1554,27 +1496,25 @@ pub fn detect_terminal_runtime(active: &ActiveWindowInfo) -> Option<TerminalRunt
         );
     }
 
-    // Build tmux result from BFS if not already found via kitty
-    if tmux_result.is_none() {
-        if has_tmux {
-            let runtime = tty.clone().map(|tty| TmuxRuntime {
-                tty,
-                socket_path: tmux_socket_path,
-            });
-            if let Some(r) = runtime.as_ref() {
-                debug_log!(
-                    "lib",
-                    "tmux runtime tty={} socket={}",
-                    r.tty,
-                    r.socket_path.as_deref().unwrap_or("<default>")
-                );
-            } else {
-                debug_log!("lib", "tmux detected but tty missing");
-            }
-            tmux_result = runtime;
+    // Build tmux result from BFS.
+    if has_tmux {
+        let runtime = tty.map(|tty| TmuxRuntime {
+            tty,
+            socket_path: tmux_socket_path,
+        });
+        if let Some(r) = runtime.as_ref() {
+            debug_log!(
+                "lib",
+                "tmux runtime tty={} socket={}",
+                r.tty,
+                r.socket_path.as_deref().unwrap_or("<default>")
+            );
         } else {
-            debug_log!("lib", "no tmux runtime under pid {}", pid);
+            debug_log!("lib", "tmux detected but tty missing");
         }
+        tmux_result = runtime;
+    } else {
+        debug_log!("lib", "no tmux runtime under pid {}", pid);
     }
 
     // Build nvim result, validating socket liveness
@@ -1740,18 +1680,6 @@ fn parse_tmux_client_target(rows: &str, tty: &str) -> Option<TmuxClientTarget> {
                 parts[6] == "1",
             ],
         });
-    }
-    None
-}
-
-#[cfg(test)]
-fn parse_tmux_tty_keyed_value(rows: &str, tty: &str) -> Option<String> {
-    for line in rows.lines() {
-        if let Some((key, value)) = line.split_once('\t') {
-            if key.trim() == tty {
-                return Some(value.trim().to_string());
-            }
-        }
     }
     None
 }
@@ -2048,45 +1976,6 @@ Window 0xABC123 -> terminal:
     }
 
     #[test]
-    fn parse_tmux_tty_keyed_value_matches_exact_tty() {
-        let data = "/dev/pts/2\t%11\n/dev/pts/9\t%42\n";
-        assert_eq!(
-            parse_tmux_tty_keyed_value(data, "/dev/pts/9"),
-            Some("%42".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_tmux_tty_keyed_value_ignores_malformed_rows_without_tab() {
-        let data = "invalid-line\n/dev/pts/5\t%7\n";
-        assert_eq!(
-            parse_tmux_tty_keyed_value(data, "/dev/pts/5"),
-            Some("%7".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_tmux_tty_keyed_value_returns_none_when_tty_missing() {
-        let data = "/dev/pts/2\t%11\n/dev/pts/9\t%42\n";
-        assert_eq!(parse_tmux_tty_keyed_value(data, "/dev/pts/4"), None);
-    }
-
-    #[test]
-    fn parse_tmux_tty_keyed_value_preserves_names_with_spaces() {
-        let data = "/dev/pts/9\twork session\n";
-        assert_eq!(
-            parse_tmux_tty_keyed_value(data, "/dev/pts/9"),
-            Some("work session".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_tmux_tty_keyed_value_rejects_spaced_value_with_wrong_tty() {
-        let data = "/dev/pts/9\twork session\n";
-        assert_eq!(parse_tmux_tty_keyed_value(data, "/dev/pts/4"), None);
-    }
-
-    #[test]
     fn parse_tmux_socket_from_value_extracts_socket_path() {
         let value = "/tmp/tmux-1000/custom,41204,7";
         assert_eq!(
@@ -2171,43 +2060,6 @@ Window 0xABC123 -> terminal:
 
         assert_eq!(parse_herdr_client_runtime_from_args(&status_args), None);
         assert_eq!(parse_herdr_client_runtime_from_args(&pane_args), None);
-    }
-
-    #[test]
-    fn parse_herdr_focus_changed_returns_true() {
-        assert_eq!(
-            parse_herdr_focus_changed(r#"{"changed": true}"#),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn parse_herdr_focus_changed_no_neighbor_is_false() {
-        assert_eq!(
-            parse_herdr_focus_changed(r#"{"changed": false}"#),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn parse_herdr_focus_changed_reads_cli_result_shape() {
-        let output = r#"{
-            "id": "cli:pane:focus",
-            "result": {
-                "focus": {
-                    "changed": true,
-                    "focused_pane_id": "w3:p9"
-                },
-                "type": "pane_focus_direction"
-            }
-        }"#;
-
-        assert_eq!(parse_herdr_focus_changed(output), Some(true));
-    }
-
-    #[test]
-    fn parse_herdr_focus_changed_invalid_output_is_none() {
-        assert_eq!(parse_herdr_focus_changed("not-json"), None);
     }
 
     #[test]
