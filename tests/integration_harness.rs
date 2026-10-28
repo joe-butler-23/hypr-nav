@@ -554,7 +554,23 @@ exit 1
     }
 }
 
+// Resolve bash from PATH: the Nix build sandbox has no /usr/bin/env.
+fn bash_shebang() -> String {
+    let bash = std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("bash"))
+                .find(|candidate| candidate.is_file())
+        })
+        .unwrap_or_else(|| PathBuf::from("/bin/bash"));
+    format!("#!{}", bash.display())
+}
+
 fn write_script(path: &Path, contents: &str) {
+    let contents = match contents.strip_prefix("#!/usr/bin/env bash") {
+        Some(rest) => format!("{}{rest}", bash_shebang()),
+        None => contents.to_string(),
+    };
     fs::write(path, contents).expect("script should be written");
     let mut perms = fs::metadata(path)
         .expect("script metadata should exist")
