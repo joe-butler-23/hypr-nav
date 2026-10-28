@@ -8,7 +8,8 @@
 - A window resolves into a chain of layers by following foreground processes inward. Kitty names its focused pane over `$XDG_RUNTIME_DIR/kitty-<pid>`; any other window with exactly one terminal session uses that session. Each pane's terminal foreground process group leader is classified by name (`nvim`, `tmux`, `herdr`), and that layer names its own focused pane's foreground process. Cost follows the nesting present, never the number of supported layers: adding a layer is one `Layer` variant and one name.
 - Actions run innermost first. A layer returns `Pass` only when it has nothing to do (an edge, a final pane); then the next outer layer acts, ending at Hyprland. Any unacknowledged or failed action stops routing.
 - After an outer move, entry lands on the near edge of the destination, outermost layer first, and stops at the first layer that moves.
-- Close refuses an incomplete chain. The compositor identity (address, class, pid, `xdgTag`) is revalidated before every mutation.
+- Decide each action from one read of the layer that performs it and address exactly what that read named; where a layer decides and acts in one request (Neovim `wincmd`, Herdr `focus_direction`, Herdr snapshot-then-close), let it. A close destroys at most the one pane it names. Only Hyprland's relative move is guarded by re-reading the active window. Close refuses an incomplete chain.
+- `model/HyprNav.tla` is the protocol's contract (`model/README.md`): contained and exact close, exact navigation, bounded mutation and termination, checked by TLC. Change the model with any routing change.
 - Every socket and subprocess shares one 1.5 s keypress budget. All IPC except tmux is in-process over sockets: Hyprland, Kitty's control protocol, Herdr's JSON lines, Neovim msgpack-RPC.
 - Only Lua Hyprland is supported (`dispatch hl.dsp...`).
 
@@ -25,7 +26,7 @@ Set `HYPR_NAV_DEBUG=1` to print the resolved chain and the acting layer to stder
 
 ## Layer identity
 
-- Kitty: a shared Kitty process can own several OS windows; Hyprland `xdgTag` must equal Kitty `wm_name` (launch with `--os-window-tag`). Untagged Kitty is used only when its process reports one OS window. Neighbours resolve to explicit pane IDs, preferring the most recently active group as Kitty does. Close closes the focused Kitty pane while the OS window has others.
+- Kitty: a shared Kitty process can own several OS windows; Hyprland `xdgTag` must equal Kitty `wm_name` (launch with `--os-window-tag`). Untagged Kitty is used only when its process reports one OS window. Neighbours resolve to explicit pane IDs, preferring the most recently active group as Kitty does. Close closes the pane it read; Kitty closes the tab and OS window with their last pane, so a split opened meanwhile survives.
 - tmux: the client's `-S`/`-L` flags and `TMUX_TMPDIR` select the server; one `list-clients` row gives pane, edges, pane pid and close policy. Named sessions and a final pane detach the client; other panes are killed.
 - Herdr: explicit `--session` beats inherited `HERDR_*` variables; remote clients and one-shot commands are not layers. Success is the absence of an error (0.9.5 acknowledges `pane.focus` with `pane_info`). Close removes the focused pane after checking the snapshot is consistent; the final pane passes outward so the session survives.
 - Neovim: the server socket is `--listen` or `nvim.<pid>.0` of the process or its embedded server child. Commands run through `execute()` so they work in every mode.
@@ -43,7 +44,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Tests drive real protocols, not fakes: a headless Neovim, and a real tmux server with a pty client and Neovim inside it. Pure decisions (Kitty neighbour choice, Herdr entry and close, tmux rows) use captured response shapes. Herdr and Kitty are not in the build sandbox: after changing either layer, check it against a disposable Herdr session and the live Kitty before release.
+Tests drive real protocols, not fakes: a headless Neovim, a real tmux server with a pty client and Neovim inside it, and TLC over the routing model (`tests/model.rs`, about 20 s). Pure decisions (Kitty neighbour choice, Herdr entry and close, tmux rows) use captured response shapes. Herdr and Kitty are not in the build sandbox: after changing either layer, check it against a disposable Herdr session and the live Kitty before release.
 
 After deploying through `~/nix-config`, confirm `realpath "$(command -v hypr-nav)"` is the new store path, then exercise each affected route through its real keybinding.
 

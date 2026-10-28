@@ -224,12 +224,14 @@ fn navigate(dir: Dir) -> R<()> {
     let source = hypr.active()?;
     if let Some(window) = &source {
         for layer in layers(window).0 {
-            hypr.still(window)?;
             if layer.navigate(dir)? == Step::Done {
                 debug!("{} moved {}", layer.name(), dir.name());
                 return Ok(());
             }
         }
+        // Every layer action names what its own read saw, or lets the layer
+        // decide and act in one request. Hyprland's move is relative, so its
+        // origin must still be the source window.
         hypr.still(window)?;
     }
     hypr.dispatch(&format!(
@@ -245,7 +247,6 @@ fn navigate(dir: Dir) -> R<()> {
     // Entry stops at the first layer that moves: inner layers then belong to
     // a different pane than the one resolved.
     for layer in layers(&target).0.iter().rev() {
-        hypr.still(&target)?;
         if layer.enter(dir)? == Step::Done {
             debug!("{} entered from {}", layer.name(), dir.name());
             break;
@@ -260,13 +261,11 @@ fn close() -> R<()> {
     let (layers, status) = layers(&window);
     status.map_err(|err| format!("cannot identify {} contents: {err}", window.class))?;
     for layer in layers {
-        hypr.still(&window)?;
         if layer.close()? == Step::Done {
             debug!("{} closed its pane", layer.name());
             return Ok(());
         }
     }
-    hypr.still(&window)?;
     hypr.dispatch(&format!(
         "hl.dsp.window.close({{address = \"{}\"}})",
         window.address

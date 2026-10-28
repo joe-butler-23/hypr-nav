@@ -8,7 +8,6 @@ pub struct Kitty {
     socket: PathBuf,
     tab: Value,
     window: Value,
-    tabs: usize,
 }
 
 impl Kitty {
@@ -24,12 +23,11 @@ impl Kitty {
             .as_str()
             .and_then(|data| serde_json::from_str(data).ok())
             .ok_or("kitty ls: malformed data")?;
-        let (tab, pane, tabs) = focused(&data, window).ok_or("kitty: no unique focused pane")?;
+        let (tab, pane) = focused(&data, window).ok_or("kitty: no unique focused pane")?;
         Ok(Some(Self {
             socket,
             tab: tab.clone(),
             window: pane.clone(),
-            tabs,
         }))
     }
 
@@ -58,13 +56,12 @@ impl Kitty {
         }
     }
 
-    /// Close the focused pane while its OS window has others.
+    /// Close exactly the pane that was read; Kitty closes its tab and OS
+    /// window with their last pane. Closing the window through Hyprland
+    /// instead would take any pane opened since the read (model/README.md).
     pub fn close(&self) -> R<Step> {
-        let panes = self.tab["windows"].as_array().map_or(0, Vec::len);
-        match (self.tabs > 1 || panes > 1, self.window["id"].as_u64()) {
-            (true, Some(window)) => self.act("close-window", window),
-            _ => Ok(Step::Pass),
-        }
+        let window = self.window["id"].as_u64().ok_or("kitty pane has no id")?;
+        self.act("close-window", window)
     }
 }
 
@@ -87,7 +84,7 @@ fn command(socket: &std::path::Path, name: &str, payload: Value) -> R<Value> {
 
 /// One shared Kitty process can own many OS windows; Hyprland's `xdgTag`
 /// (Kitty's `wm_name`) says which. Untagged, only a sole OS window is safe.
-fn focused<'a>(data: &'a Value, window: &Window) -> Option<(&'a Value, &'a Value, usize)> {
+fn focused<'a>(data: &'a Value, window: &Window) -> Option<(&'a Value, &'a Value)> {
     let os_windows = data.as_array()?;
     if window.tag.is_empty() && os_windows.len() != 1 {
         return None;
@@ -96,10 +93,11 @@ fn focused<'a>(data: &'a Value, window: &Window) -> Option<(&'a Value, &'a Value
         os["wm_class"] == window.class.as_str()
             && (window.tag.is_empty() || os["wm_name"] == window.tag.as_str())
     })?;
-    let tabs = os_window["tabs"].as_array()?;
-    let tab = only(tabs, |tab| tab["is_active"] == true)?;
+    let tab = only(os_window["tabs"].as_array()?, |tab| {
+        tab["is_active"] == true
+    })?;
     let pane = only(tab["windows"].as_array()?, |pane| pane["is_active"] == true)?;
-    Some((tab, pane, tabs.len()))
+    Some((tab, pane))
 }
 
 fn only(items: &[Value], predicate: impl Fn(&Value) -> bool) -> Option<&Value> {
@@ -206,7 +204,7 @@ mod tests {
             pid: 9,
             tag: tag.into(),
         };
-        assert_eq!(focused(&data, &window("kitty-b")).map(|f| f.2), Some(1));
+        assert!(focused(&data, &window("kitty-b")).is_some());
         assert!(focused(&data, &window("")).is_none());
         assert!(focused(&data, &window("kitty-c")).is_none());
     }
