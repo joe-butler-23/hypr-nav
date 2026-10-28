@@ -1,55 +1,51 @@
 # Purpose — hypr-nav
 
-`hypr-nav` provides one set of directional navigation and close keybindings across nested Hyprland, Kitty, Neovim, Herdr, and tmux contexts. It must act on exactly one current target, make edge transitions predictable, keep the keypress path bounded, and refuse any close whose target is not proven.
-
-Success means navigation reaches the intended split, pane, or window without surprising fall-through; close affects only the captured target; failures are bounded and observable; and the installed behaviour matches the tested source.
+`hypr-nav` gives one set of directional navigation and close keybindings across nested Hyprland, Kitty, tmux, Herdr and Neovim. It must act on exactly one current target, make edge transitions predictable, keep the keypress path bounded, and refuse any close whose target is not proven.
 
 ## Runtime Contract
 
-- `hypr-nav <direction>` tries the active Kitty neighbour before falling through to Hyprland.
-- `hypr-tmux-nav <direction>` routes inward to outward: Neovim, Herdr, tmux, then Hyprland. Preserve that precedence and the cross-window entry-assist behaviour.
-- `hypr-smart-close` routes through Herdr or an exact tmux target before closing the captured Hyprland window address. Navigation may fall through when inner discovery is unavailable or the provider explicitly reports an edge; an unacknowledged mutation stops routing. Close must fail closed on incomplete identity, ambiguity, timeout, or failed inner action.
-- `src/lib.rs` owns process-tree discovery, socket selection, IPC deadlines, and Hyprland dispatch. Runtime sockets belong under `XDG_RUNTIME_DIR`, with `/run/user/<uid>` as the fallback; do not reintroduce `/tmp` runtime state.
-- Lua dispatch is attempted first and legacy Hyprland syntax remains the compatibility fallback. Preserve active-window and process-ancestry checks so one Kitty instance or an inherited Herdr environment cannot redirect another window's action.
+- One binary: `hypr-nav <left|right|up|down>` navigates and `hypr-nav close` closes. Neither has an alternative entry point.
+- A window resolves into a chain of layers by following foreground processes inward. Kitty names its focused pane over `$XDG_RUNTIME_DIR/kitty-<pid>`; any other window with exactly one terminal session uses that session. Each pane's terminal foreground process group leader is classified by name (`nvim`, `tmux`, `herdr`), and that layer names its own focused pane's foreground process. Cost follows the nesting present, never the number of supported layers: adding a layer is one `Layer` variant and one name.
+- Actions run innermost first. A layer returns `Pass` only when it has nothing to do (an edge, a final pane); then the next outer layer acts, ending at Hyprland. Any unacknowledged or failed action stops routing.
+- After an outer move, entry lands on the near edge of the destination, outermost layer first, and stops at the first layer that moves.
+- Close refuses an incomplete chain. The compositor identity (address, class, pid, `xdgTag`) is revalidated before every mutation.
+- Every socket and subprocess shares one 1.5 s keypress budget. All IPC except tmux is in-process over sockets: Hyprland, Kitty's control protocol, Herdr's JSON lines, Neovim msgpack-RPC.
+- Only Lua Hyprland is supported (`dispatch hl.dsp...`).
 
 ## Hyprland Configuration
 
-A typical configuration binds the layered navigator in each direction and smart close separately:
-
-```ini
-bind = SUPER, h, exec, hypr-tmux-nav left
-bind = SUPER, j, exec, hypr-tmux-nav down
-bind = SUPER, k, exec, hypr-tmux-nav up
-bind = SUPER, l, exec, hypr-tmux-nav right
-bind = SUPER, c, exec, hypr-smart-close
+```lua
+for key, dir in pairs({h = "left", j = "down", k = "up", l = "right"}) do
+    hl.bind("SUPER + " .. key, hl.dsp.exec_cmd("hypr-nav " .. dir))
+end
+hl.bind("SUPER + C", hl.dsp.exec_cmd("hypr-nav close"))
 ```
 
-Set `HYPR_NAV_DEBUG=1` to print routing decisions to stderr. `HYPR_CLOSE_LOG=/path/to/events.jsonl` enables bounded JSONL close logging; it is opt-in because events can contain window titles. A `hypr-smart-close` failure is always reported to stderr and the systemd journal (`journalctl --user -t hypr-smart-close`), with titles stripped, regardless of either variable; only the verbose per-event trace stays opt-in.
+Set `HYPR_NAV_DEBUG=1` to print the resolved chain and the acting layer to stderr. Failures always reach stderr and the journal: `journalctl --user -t hypr-nav`.
+
+## Layer identity
+
+- Kitty: a shared Kitty process can own several OS windows; Hyprland `xdgTag` must equal Kitty `wm_name` (launch with `--os-window-tag`). Untagged Kitty is used only when its process reports one OS window. Neighbours resolve to explicit pane IDs, preferring the most recently active group as Kitty does. Close closes the focused Kitty pane while the OS window has others.
+- tmux: the client's `-S`/`-L` flags and `TMUX_TMPDIR` select the server; one `list-clients` row gives pane, edges, pane pid and close policy. Named sessions and a final pane detach the client; other panes are killed.
+- Herdr: explicit `--session` beats inherited `HERDR_*` variables; remote clients and one-shot commands are not layers. Success is the absence of an error (0.9.5 acknowledges `pane.focus` with `pane_info`). Close removes the focused pane after checking the snapshot is consistent; the final pane passes outward so the session survives.
+- Neovim: the server socket is `--listen` or `nvim.<pid>.0` of the process or its embedded server child. Commands run through `execute()` so they work in every mode.
 
 ## Ownership and Safety
 
-- This repository owns routing, detection, and protocol behaviour. `~/nix-config` owns packaging, the pinned source revision, and deployment; do not copy or install binaries manually on this NixOS system.
-- Use `tests/integration_harness.rs` for automated behaviour proof against fake Hyprland, Kitty, Neovim, Herdr, and tmux interfaces. Do not invoke real close, tmux detach, or pane-kill paths against live work. Any live close proof requires an explicitly disposable fixture and user approval.
+- This repository owns routing, detection and protocol behaviour. `~/nix-config` owns packaging, the pinned revision and deployment; Chezmoi owns the binds; `hf close-guard` (hypr-focus) runs `hypr-nav close`. Do not install binaries manually.
+- Never exercise close against live work. Live checks use disposable tmux servers (`-L`) and Herdr sessions, removed afterwards.
 
 ## Verification
 
-For every Rust change:
-
 ```bash
 cargo fmt --check
-cargo test
 cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
-`cargo test` runs both unit tests and the fake cross-runtime integration harness. Use a focused test while iterating, then run the full gate before completion.
+Tests drive real protocols, not fakes: a headless Neovim, and a real tmux server with a pty client and Neovim inside it. Pure decisions (Kitty neighbour choice, Herdr entry and close, tmux rows) use captured response shapes. Herdr and Kitty are not in the build sandbox: after changing either layer, check it against a disposable Herdr session and the live Kitty before release.
 
-When a behaviour change is intended to become active, update and deploy the `hypr-nav` input through `~/nix-config`, then prove the installed binaries resolve to the new Nix store closure:
-
-```bash
-for binary in hypr-nav hypr-tmux-nav hypr-smart-close; do realpath "$(command -v "$binary")"; done
-```
-
-That proves deployment only. Also exercise each affected route through its real Hyprland keybinding in a disposable topology and confirm the visible focus or close result; do not infer live correctness from the store path or harness alone.
+After deploying through `~/nix-config`, confirm `realpath "$(command -v hypr-nav)"` is the new store path, then exercise each affected route through its real keybinding.
 
 <!-- clai:instructions:coding:start -->
 <!-- source-sha256:1a131f46fafd56730f2f1706abcc2b7ff7ebdcb45e3956551ba62a37bf184580 -->
@@ -69,46 +65,3 @@ That proves deployment only. Also exercise each affected route through its real 
 
 Minworker shares 12 GB of RAM across agents. Run direct foreground builds, clippy, Cargo tests and other heavy verification through `agent-heavy <command>`. It queues work under the same host lock as native build and release runners, with lower CPU and I/O priority; it does not depend on a PTT checkout. Invoke runners that already own admission (`scripts/ship`, `release`, `overlay-updates.service`) directly. Use the repository's normal warm build directory, retain Cargo's managed default concurrency, and run each required heavy check once. Formatting, evaluation, Git and searches do not need the heavy-work queue.
 <!-- clai:instructions:coding:end -->
-
-
-## Kitty shared-process identity
-
-Shared Kitty daemons require a unique launch token passed with `--os-window-tag`,
-exposed as Hyprland `xdgTag` and Kitty `wm_name`. The terminal package must actually
-forward that Wayland tag. Class names retain their existing role. Untagged Kitty
-remains supported only when its daemon reports exactly one OS window. A Kitty with
-remote control off (latch's locked.conf) owns no `kitty-<pid>` socket; its
-process tree is walked like any terminal only when Hyprland shows that pid
-owning exactly one window, and close refuses otherwise.
-
-The resolver matches tag plus class, verifies the pane root belongs to Kitty,
-and selects the active tab and pane inside that OS window. Foreground processes
-must descend from Kitty or belong to the verified pane root's own Linux session;
-this admits reparented clipboard helpers without trusting another session. It never searches another
-Kitty window's process tree when identity is absent, ambiguous, or unavailable.
-Navigation falls through to Hyprland when inner context cannot be established;
-close refuses that ambiguity. A changed captured window cancels an inner action.
-Standalone Kitty split navigation resolves neighbour groups to explicit pane IDs.
-
-`tests/evidence/2026-09-12-kitty-identity` records eight isolated regression pairs
-against the pre-fix source, including tagged Herdr/tmux/Neovim routing, custom
-classes, stale daemon focus, ambiguous metadata and a focus change. All protocol
-fixtures are disposable; these results do not claim live compositor deployment.
-
-
-## Herdr API compatibility
-
-Herdr 0.8 navigation uses `pane.focus_direction`. Cross-window entry resolves
-the actual destination after the Hyprland focus dispatch, reads `pane.layout`,
-and focuses a pane on the entering edge with `pane.focus`. An unrelated window
-does not cause requests to the default Herdr server. Ambiguous layouts and a
-changed compositor target cancel the entry action.
-
-Named clients accept `--session NAME` and `--session=NAME`, with or without an
-explicit `client` command. Explicit session identity takes precedence over
-parent-session environment variables. Remote clients and one-shot commands
-are not treated as attached local clients. Every outer close revalidates the
-captured compositor identity, including after a Herdr final-pane snapshot.
-
-`tests/evidence/2026-09-12-herdr08` records isolated regression pairs against
-94de958, the inspected protocol 22 schema subset, and the complete Rust gates.
