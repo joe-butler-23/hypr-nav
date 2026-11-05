@@ -22,7 +22,14 @@ fn tlc() -> Command {
 #[test]
 fn routing_model_holds() {
     let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("model");
-    for config in ["close-1", "left-1", "right-1"] {
+    for config in [
+        "close-1",
+        "left-1",
+        "right-1",
+        "close-1-tmux",
+        "left-1-tmux",
+        "right-1-tmux",
+    ] {
         let scratch =
             std::env::temp_dir().join(format!("hypr-nav-tlc-{config}-{}", std::process::id()));
         std::fs::create_dir_all(&scratch).unwrap();

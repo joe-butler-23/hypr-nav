@@ -17,7 +17,8 @@ any two: focus another window, focus another pane in any layer, open a pane
 and any mutating request may lose its reply, with or without effect.
 
 Fixed topology: Kitty window W1 (panes k1, k2) beside an application window W2.
-k1 runs a Herdr client (h1, h2), k2 a tmux client (t1, t2), h1 Neovim (n1, n2).
+k1 runs a Herdr client (h1, h2), k2 a tmux client (t1, t2), and `NvimHost`
+runs Neovim (n1, n2): h1 in the plain configurations, t1 in `-tmux`.
 Panes in a layer are ordered left to right. Initial states cover every
 non-empty pane set and focus per layer, named or unnamed tmux, either window
 focused: 1,024 starting desktops. Herdr and tmux sessions outlive clients;
@@ -56,6 +57,17 @@ TLC 2.19, 2026-10-28, six workers, no symmetry or state constraint:
 | right-1 | 393,176 | 18 | 7 s |
 | right-2 | 3,871,630 | 19 | 45 s |
 
+Neovim inside tmux, 2026-11-05, six workers:
+
+| Configuration | Distinct states | Depth | Time |
+| --- | ---: | ---: | ---: |
+| close-1-tmux | 204,120 | 11 | in `cargo test` |
+| close-2-tmux | 1,923,112 | 12 | 18 s |
+| left-1-tmux | 557,268 | 18 | in `cargo test` |
+| left-2-tmux | 5,565,958 | 19 | 49 s |
+| right-1-tmux | 393,812 | 18 | in `cargo test` |
+| right-2-tmux | 3,861,936 | 19 | 31 s |
+
 All pass. This is exhaustive within this topology and these bounds, **not an
 unbounded proof**.
 
@@ -92,6 +104,6 @@ should do (`src/proc.rs`).
 
 Not modelled: Kitty tabs and overlay groups, two-dimensional layouts and
 Kitty's recency-based neighbour choice (unit-tested in `src/kitty.rs`), more
-than two panes per layer, multiple monitors, window identity reuse, timing,
-and the Rust itself. `tests` in `src/` drive the real Neovim and tmux
+than two panes per layer, other nestings (tmux in tmux, Herdr in tmux),
+multiple monitors, window identity reuse, timing, and the Rust itself. `tests` in `src/` drive the real Neovim and tmux
 protocols; Herdr and Kitty are checked live before release.

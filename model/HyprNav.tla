@@ -7,14 +7,16 @@
 (*                                                                         *)
 (* Fixed topology.  Window W1 (left) is Kitty with panes k1,k2.  k1 runs a *)
 (* Herdr client (session panes h1,h2), k2 a tmux client (panes t1,t2), and *)
-(* h1 runs Neovim (windows n1,n2).  W2 (right) is a plain application.     *)
+(* NvimHost (h1 or t1) runs Neovim (windows n1,n2).  W2 (right) is a plain *)
+(* application.                                                            *)
 (* Panes in a layer are ordered left to right.  Herdr and tmux sessions    *)
 (* outlive their clients; Kitty panes and Neovim windows do not.           *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets
 
-CONSTANTS Op,     \* "close", "left" or "right"
-          MaxEnv  \* user actions allowed while hypr-nav runs
+CONSTANTS Op,       \* "close", "left" or "right"
+          MaxEnv,   \* user actions allowed while hypr-nav runs
+          NvimHost  \* the pane running Neovim: "h1" (Herdr) or "t1" (tmux)
 
 NONE == "none"
 Dir == IF Op = "left" THEN -1 ELSE 1
@@ -25,7 +27,7 @@ Layers == {"K", "H", "T", "N"}
 PaneSet(l) == {Pool[l][1], Pool[l][2]}
 Pos(l, p) == IF Pool[l][1] = p THEN 1 ELSE 2
 LayerOf(p) == CHOOSE l \in Layers : p \in PaneSet(l)
-Hosted(p) == CASE p = "k1" -> "H" [] p = "k2" -> "T" [] p = "h1" -> "N"
+Hosted(p) == CASE p = "k1" -> "H" [] p = "k2" -> "T" [] p = NvimHost -> "N"
                   [] OTHER -> NONE
 Windows == <<"W1", "W2">>
 
@@ -278,7 +280,8 @@ Attach ==
                                        !.pane = cur["T"],
                                        !.keep = named \/ Cardinality(panes["T"]) = 1,
                                        !.edge = Neighbor("T", cur["T"], Dir, panes) = NONE]]
-                              /\ res' = Append(res, "T") /\ nxt' = NONE
+                              /\ res' = Append(res, "T")
+                              /\ nxt' = Inner("T", World)    \* pane_pid's foreground
                            [] nxt = "H" ->
                               /\ cap' = [cap EXCEPT !["H"] = [NoCap EXCEPT !.pane = cur["H"]]]
                               /\ res' = Append(res, "H")
