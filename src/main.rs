@@ -47,8 +47,26 @@ fn remaining() -> io::Result<Duration> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "keypress budget exhausted"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Every IPC request this thread sent, for checking the model's
+    /// properties against the real protocols.
+    static TRACE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn trace(request: String) {
+    TRACE.with_borrow_mut(|trace| trace.push(request));
+}
+
 /// Send `request` and read until `done` accepts the reply or the peer closes.
 fn exchange(path: &Path, request: &[u8], done: impl Fn(&[u8]) -> bool) -> R<Vec<u8>> {
+    #[cfg(test)]
+    trace(format!(
+        "{} {}",
+        path.display(),
+        String::from_utf8_lossy(request)
+    ));
     let run = || -> io::Result<Vec<u8>> {
         let mut stream = UnixStream::connect(path)?;
         stream.set_write_timeout(Some(remaining()?))?;
@@ -219,15 +237,24 @@ fn descend(layers: &mut Vec<Layer>, mut pid: Option<u32>) -> R<()> {
     Ok(())
 }
 
+/// Run `action` on each layer in order until one does not pass; any failure
+/// stops routing. Returns the acting layer, or `None` if every layer passed.
+fn first_acting(layers: &[Layer], action: impl Fn(&Layer) -> R<Step>) -> R<Option<&'static str>> {
+    for layer in layers {
+        if action(layer)? == Step::Done {
+            return Ok(Some(layer.name()));
+        }
+    }
+    Ok(None)
+}
+
 fn navigate(dir: Dir) -> R<()> {
     let hypr = Hypr::connect()?;
     let source = hypr.active()?;
     if let Some(window) = &source {
-        for layer in layers(window).0 {
-            if layer.navigate(dir)? == Step::Done {
-                debug!("{} moved {}", layer.name(), dir.name());
-                return Ok(());
-            }
+        if let Some(name) = first_acting(&layers(window).0, |layer| layer.navigate(dir))? {
+            debug!("{name} moved {}", dir.name());
+            return Ok(());
         }
         // Every layer action names what its own read saw, or lets the layer
         // decide and act in one request. Hyprland's move is relative, so its
@@ -246,11 +273,10 @@ fn navigate(dir: Dir) -> R<()> {
     }
     // Entry stops at the first layer that moves: inner layers then belong to
     // a different pane than the one resolved.
-    for layer in layers(&target).0.iter().rev() {
-        if layer.enter(dir)? == Step::Done {
-            debug!("{} entered from {}", layer.name(), dir.name());
-            break;
-        }
+    let mut outermost_first = layers(&target).0;
+    outermost_first.reverse();
+    if let Some(name) = first_acting(&outermost_first, |layer| layer.enter(dir))? {
+        debug!("{name} entered from {}", dir.name());
     }
     Ok(())
 }
@@ -260,11 +286,9 @@ fn close() -> R<()> {
     let window = hypr.active()?.ok_or("no active window")?;
     let (layers, status) = layers(&window);
     status.map_err(|err| format!("cannot identify {} contents: {err}", window.class))?;
-    for layer in layers {
-        if layer.close()? == Step::Done {
-            debug!("{} closed its pane", layer.name());
-            return Ok(());
-        }
+    if let Some(name) = first_acting(&layers, Layer::close)? {
+        debug!("{name} closed its pane");
+        return Ok(());
     }
     hypr.dispatch(&format!(
         "hl.dsp.window.close({{address = \"{}\"}})",
@@ -377,22 +401,52 @@ mod tests {
             wait_for("nvim socket", &|| resolve(pid).len() == 2);
             let active = || tmux(&["display", "-p", "#{pane_index}"]);
 
+            let pane = || tmux(&["display", "-p", "#{pane_id}"]);
+            // The model's BoundedMutation and exact addressing, checked on
+            // the requests actually sent: tmux mutations after resolution,
+            // without the client flags.
+            let mutations = || {
+                TRACE
+                    .with_borrow_mut(std::mem::take)
+                    .iter()
+                    .filter_map(|request| {
+                        let args: Vec<&str> = request.split(' ').skip(3).collect();
+                        let mutating = ["select-pane", "kill-pane", "detach-client"];
+                        mutating.contains(args.first()?).then(|| args.join(" "))
+                    })
+                    .collect::<Vec<_>>()
+            };
+
             let layers = resolve(pid);
             assert_eq!(names(&layers), ["nvim", "tmux"]);
-            assert_eq!(layers[0].navigate(Dir::Right).unwrap(), Step::Pass);
-            assert_eq!(layers[1].navigate(Dir::Right).unwrap(), Step::Done);
+            let read = pane();
+            mutations();
+            let moved = first_acting(&layers, |layer| layer.navigate(Dir::Right));
+            assert_eq!(moved, Ok(Some("tmux")));
+            assert_eq!(mutations(), [format!("select-pane -t {read} -R")]);
             assert_eq!(active(), "1");
 
             let layers = resolve(pid);
             assert_eq!(names(&layers), ["tmux"]);
-            assert_eq!(layers[0].navigate(Dir::Right).unwrap(), Step::Pass);
-            assert_eq!(layers[0].enter(Dir::Right).unwrap(), Step::Done);
+            mutations();
+            let moved = first_acting(&layers, |layer| layer.navigate(Dir::Right));
+            assert_eq!(moved, Ok(None));
+            assert_eq!(
+                first_acting(&layers, |layer| layer.enter(Dir::Right)),
+                Ok(Some("tmux"))
+            );
+            let entered = mutations();
+            assert_eq!(entered.len(), 1);
+            assert!(entered[0].starts_with("select-pane -t %"));
             assert_eq!(active(), "0");
 
-            // An unnamed session with two panes loses only the focused pane.
+            // An unnamed session with two panes loses only the focused pane,
+            // in one request naming the pane resolution read.
             let layers = resolve(pid);
-            assert_eq!(layers[0].close().unwrap(), Step::Pass);
-            assert_eq!(layers[1].close().unwrap(), Step::Done);
+            let read = pane();
+            mutations();
+            assert_eq!(first_acting(&layers, Layer::close), Ok(Some("tmux")));
+            assert_eq!(mutations(), [format!("kill-pane -t {read}")]);
             wait_for("pane close", &|| tmux(&["list-panes", "-F", "x"]) == "x");
         });
         tmux(&["kill-server"]);

@@ -87,6 +87,14 @@ pub fn window_foreground(pid: u32) -> R<Option<u32>> {
 
 /// Run a short client command within the keypress budget.
 pub fn run(command: &mut Command) -> R<String> {
+    #[cfg(test)]
+    crate::trace(
+        std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
     let name = format!("{:?}", command.get_program());
     let mut child = command
         .stdin(Stdio::null())

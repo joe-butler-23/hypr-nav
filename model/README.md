@@ -105,5 +105,15 @@ should do (`src/proc.rs`).
 Not modelled: Kitty tabs and overlay groups, two-dimensional layouts and
 Kitty's recency-based neighbour choice (unit-tested in `src/kitty.rs`), more
 than two panes per layer, other nestings (tmux in tmux, Herdr in tmux),
-multiple monitors, window identity reuse, timing, and the Rust itself. `tests` in `src/` drive the real Neovim and tmux
-protocols; Herdr and Kitty are checked live before release.
+multiple monitors, window identity reuse, timing, and the Rust itself.
+
+## Code against model
+
+The real tmux and Neovim test in `src/main.rs` routes through the same
+innermost-first loop as `close` and `navigate`, records every request sent,
+and asserts `BoundedMutation` and exact addressing on it: one close is one
+`kill-pane` naming the pane resolution read, one move is one `select-pane`
+from that pane. Full trace validation against this spec is not attempted:
+Hyprland and Kitty cannot run in the build sandbox, so traces would cover
+only the layers least at risk. Herdr and Kitty are checked live before
+release.
