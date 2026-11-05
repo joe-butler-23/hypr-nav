@@ -9,3 +9,6 @@ repository = "https://github.com/joe-butler-23/hypr-nav"
 [dependencies]
 rmpv = "1"
 serde_json = "1"
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }

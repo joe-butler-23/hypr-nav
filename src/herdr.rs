@@ -286,4 +286,83 @@ mod tests {
         duplicate["tabs"][0]["pane_count"] = 2.into();
         assert_eq!(close_target(&duplicate), None);
     }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// A consistent session (1-2 workspaces of 1-2 tabs of 1-2 panes,
+        /// focus on one pane), then at most one corruption: a duplicated or
+        /// dangling id, a stale count, or a pane in the wrong tab.
+        fn snapshots() -> impl Strategy<Value = Value> {
+            let shape =
+                proptest::collection::vec(proptest::collection::vec(1usize..=2, 1..=2), 1..=2);
+            (shape, any::<proptest::sample::Index>(), 0u8..7, any::<proptest::sample::Index>())
+                .prop_map(|(shape, focus, corruption, victim)| {
+                    let (mut workspaces, mut tabs, mut panes) = (vec![], vec![], vec![]);
+                    for (w, ws) in shape.iter().enumerate() {
+                        let wid = format!("w{w}");
+                        workspaces.push(json!({"workspace_id": wid, "active_tab_id": format!("{wid}:t0"), "tab_count": ws.len()}));
+                        for (t, count) in ws.iter().enumerate() {
+                            let tid = format!("{wid}:t{t}");
+                            tabs.push(json!({"tab_id": tid, "workspace_id": wid, "pane_count": count}));
+                            for p in 0..*count {
+                                panes.push(json!({"pane_id": format!("{tid}:p{p}"), "tab_id": tid, "workspace_id": wid}));
+                            }
+                        }
+                    }
+                    // Focus a pane in an active tab, as Herdr reports it.
+                    let active: Vec<&Value> = panes.iter().filter(|p| p["tab_id"].as_str().unwrap().ends_with(":t0")).collect();
+                    let f = active[focus.index(active.len())].clone();
+                    let v = victim.index(panes.len());
+                    match corruption {
+                        0 => panes[v]["pane_id"] = f["pane_id"].clone(),
+                        1 => panes[v]["tab_id"] = "w9:t9".into(),
+                        2 => tabs[0]["pane_count"] = 9.into(),
+                        3 => workspaces[0]["tab_count"] = 9.into(),
+                        4 => panes[v]["workspace_id"] = "w9".into(),
+                        _ => {}
+                    }
+                    json!({"focused_pane_id": f["pane_id"], "focused_tab_id": f["tab_id"], "focused_workspace_id": f["workspace_id"],
+                           "panes": panes, "tabs": tabs, "workspaces": workspaces})
+                })
+        }
+
+        proptest! {
+            /// Close names only the focused pane, which must be unique and in
+            /// the focused tab and workspace, and never the session's last.
+            #[test]
+            fn close_names_only_the_unique_focused_pane(snapshot in snapshots()) {
+                let focused = snapshot["focused_pane_id"].as_str().unwrap();
+                let panes = snapshot["panes"].as_array().unwrap();
+                let named: Vec<&Value> = panes.iter().filter(|p| p["pane_id"] == focused).collect();
+                let total = |kind: &str| snapshot[kind].as_array().unwrap().len();
+                let decision = close_target(&snapshot);
+                if decision.is_some() {
+                    // Only a focused tab and workspace whose counts agree with
+                    // the lists decide.
+                    let listed = |kind: &str, key: &str, id: &Value| {
+                        snapshot[kind].as_array().unwrap().iter().filter(|c| c[key] == *id).count() as u64
+                    };
+                    let (tab, workspace) = (&snapshot["focused_tab_id"], &snapshot["focused_workspace_id"]);
+                    let find = |kind: &str, key: &str, id: &Value| {
+                        snapshot[kind].as_array().unwrap().iter().find(|c| c[key] == *id).cloned().unwrap()
+                    };
+                    prop_assert_eq!(find("tabs", "tab_id", tab)["pane_count"].as_u64(), Some(listed("panes", "tab_id", tab)));
+                    prop_assert_eq!(find("workspaces", "workspace_id", workspace)["tab_count"].as_u64(), Some(listed("tabs", "workspace_id", workspace)));
+                }
+                match decision {
+                    Some(Some(pane)) => {
+                        prop_assert_eq!(pane.as_str(), focused);
+                        prop_assert_eq!(named.len(), 1);
+                        prop_assert!(named[0]["tab_id"] == snapshot["focused_tab_id"]);
+                        prop_assert!(named[0]["workspace_id"] == snapshot["focused_workspace_id"]);
+                        prop_assert!(!(total("panes") == 1 && total("tabs") == 1 && total("workspaces") == 1));
+                    }
+                    Some(None) => prop_assert_eq!((total("panes"), total("tabs"), total("workspaces")), (1, 1, 1)),
+                    None => {}
+                }
+            }
+        }
+    }
 }

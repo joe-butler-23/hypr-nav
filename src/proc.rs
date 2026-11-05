@@ -138,4 +138,23 @@ mod tests {
         );
         assert!(run(&mut Command::new("false")).is_err());
     }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// The command name may contain anything, including `)` and
+            /// spaces; the fields are read after its last parenthesis.
+            #[test]
+            fn terminal_fields_survive_any_command_name(
+                comm in "[^\n]{0,16}",
+                tty in 0u64..1 << 20,
+                tpgid in 1u32..1 << 22,
+            ) {
+                let stat = format!("42 ({comm}) S 1 42 42 {tty} {tpgid} 4194304 0 0");
+                prop_assert_eq!(parse_terminal(&stat), Some((tty, tpgid)));
+            }
+        }
+    }
 }

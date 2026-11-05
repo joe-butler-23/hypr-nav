@@ -197,4 +197,78 @@ mod tests {
                 .ends_with("default")
         );
     }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn field(options: &'static [&'static str]) -> impl Strategy<Value = String> {
+            proptest::sample::select(options).prop_map(String::from)
+        }
+
+        /// tmux rows with colliding pids, unparseable numbers, named sessions
+        /// and truncated rows.
+        fn rows() -> impl Strategy<Value = Vec<String>> {
+            let row = (
+                field(&["7", "8", "x"]),
+                field(&["%1", "%2", "%3"]),
+                field(&["10", "11", "y"]),
+                proptest::collection::vec(field(&["0", "1"]), 6),
+                field(&["0", "my work", "w"]),
+                0usize..=11,
+            )
+                .prop_map(|(client, pane, pid, flags, session, keep)| {
+                    let mut fields = vec![client, "/dev/pts/1".into(), pane, pid];
+                    fields.extend(flags);
+                    fields.push(session);
+                    fields.truncate(keep.max(1));
+                    fields.join(" ")
+                });
+            proptest::collection::vec(row, 0..4)
+        }
+
+        proptest! {
+            /// A client comes only from a complete row naming its pid, and
+            /// carries that row's pane, pane pid and close policy.
+            #[test]
+            fn client_is_read_from_its_own_row(rows in rows()) {
+                let valid: Vec<Vec<&str>> = rows
+                    .iter()
+                    .map(|row| row.splitn(11, ' ').collect::<Vec<_>>())
+                    .filter(|f| f.len() == 11 && f[0] == "7" && f[3].parse::<u32>().is_ok())
+                    .collect();
+                match parse_client(&rows.join("\n"), 7) {
+                    None => prop_assert!(valid.is_empty()),
+                    Some(client) => {
+                        let row = &valid[0];
+                        prop_assert_eq!(client.pane.as_str(), row[2]);
+                        prop_assert_eq!(client.pane_pid.to_string(), row[3]);
+                        let named = row[10].parse::<u32>().is_err();
+                        prop_assert_eq!(client.keep, named || (row[8] == "1" && row[9] == "1"));
+                    }
+                }
+            }
+
+            /// Entry moves only to a listed pane on the entered edge, and
+            /// never when the active pane is already on it.
+            #[test]
+            fn entry_lands_on_a_listed_edge_pane(
+                panes in proptest::collection::vec((field(&["%1", "%2", "%3"]), proptest::collection::vec(field(&["0", "1"]), 4)), 0..4),
+                active in field(&["%1", "%2", "%3"]),
+                dir in proptest::sample::select(&[Dir::Left, Dir::Right, Dir::Up, Dir::Down][..]),
+            ) {
+                let rows: Vec<String> = panes.iter().map(|(id, flags)| format!("{id} {}", flags.join(" "))).collect();
+                let edge = dir.opposite() as usize;
+                let on_edge = |id: &str| panes.iter().any(|(p, f)| p == id && f[edge] == "1");
+                match entry_pane(&rows.join("\n"), dir, &active) {
+                    Some(pane) => {
+                        prop_assert!(on_edge(&pane));
+                        prop_assert!(pane != active);
+                        prop_assert!(!on_edge(&active));
+                    }
+                    None => prop_assert!(on_edge(&active) || !panes.iter().any(|(p, _)| on_edge(p))),
+                }
+            }
+        }
+    }
 }

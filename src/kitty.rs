@@ -250,4 +250,54 @@ mod tests {
         let unfocused = json!([os("kitty-a", false), os("kitty-a", false)]);
         assert!(focused(&unfocused, &window("kitty-a")).is_err());
     }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// OS windows sharing tags and focus, with any number of active tabs
+        /// and panes.
+        fn ls() -> impl Strategy<Value = Value> {
+            let pane = (1u64..5, any::<bool>())
+                .prop_map(|(id, active)| json!({"id": id, "is_active": active}));
+            let tab = (any::<bool>(), proptest::collection::vec(pane, 0..3))
+                .prop_map(|(active, windows)| json!({"is_active": active, "windows": windows}));
+            let os = (
+                proptest::sample::select(&["kitty", "yazi"][..]),
+                proptest::sample::select(&["a", "b", ""][..]),
+                any::<bool>(),
+                proptest::collection::vec(tab, 0..3),
+            )
+                .prop_map(|(class, tag, focused, tabs)| {
+                    json!({"wm_class": class, "wm_name": tag, "is_focused": focused, "tabs": tabs})
+                });
+            proptest::collection::vec(os, 0..4).prop_map(Value::from)
+        }
+
+        proptest! {
+            /// The pane read is the unique active pane of the unique active
+            /// tab of an OS window that matches the compositor's class and
+            /// tag, and Kitty's focus decides between several such windows.
+            #[test]
+            fn focused_pane_belongs_to_the_compositor_window(
+                data in ls(),
+                tag in proptest::sample::select(&["a", "b", ""][..]),
+            ) {
+                let window = Window { address: "0x1".into(), class: "kitty".into(), pid: 9, tag: tag.into() };
+                let matches = |os: &Value| os["wm_class"] == "kitty" && (tag.is_empty() || os["wm_name"] == tag);
+                let candidates: Vec<&Value> = data.as_array().unwrap().iter().filter(|os| matches(os)).collect();
+                if let Ok((tab, pane)) = focused(&data, &window) {
+                    let os = candidates
+                        .iter()
+                        .find(|os| os["tabs"].as_array().unwrap().iter().any(|t| std::ptr::eq(t, tab)))
+                        .expect("tab comes from a matching OS window");
+                    let focused = candidates.iter().filter(|os| os["is_focused"] == true).count();
+                    prop_assert!(candidates.len() == 1 || (os["is_focused"] == true && focused == 1));
+                    prop_assert!(tab["is_active"] == true && pane["is_active"] == true);
+                    prop_assert_eq!(os["tabs"].as_array().unwrap().iter().filter(|t| t["is_active"] == true).count(), 1);
+                    prop_assert_eq!(tab["windows"].as_array().unwrap().iter().filter(|p| p["is_active"] == true).count(), 1);
+                }
+            }
+        }
+    }
 }
