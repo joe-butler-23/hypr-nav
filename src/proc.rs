@@ -59,6 +59,10 @@ fn parse_terminal(stat: &str) -> Option<(u64, u32)> {
 }
 
 /// Leader of the foreground process group on `pid`'s controlling terminal.
+/// A process that cannot be read hosts no inner layer: a dead pane kept open
+/// (Kitty `--hold`, tmux `remain-on-exit`) or a pipeline whose leader was
+/// reaped (`cmd | less`). The outer layer then acts, which is what closing
+/// such a pane should do; refusing would block close while it persists.
 pub fn foreground(pid: u32) -> Option<u32> {
     terminal(pid)
         .filter(|(tty, _)| *tty != 0)

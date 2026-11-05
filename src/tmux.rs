@@ -119,10 +119,11 @@ fn parse_client(rows: &str, pid: u32) -> Option<Client> {
         else {
             return None;
         };
-        (client_pid.parse() == Ok(pid)).then(|| Client {
+        (client_pid.parse() == Ok(pid)).then_some(())?;
+        Some(Client {
             tty: tty.to_string(),
             pane: pane.to_string(),
-            pane_pid: pane_pid.parse().unwrap_or(0),
+            pane_pid: pane_pid.parse().ok()?,
             edges: [left, right, top, bottom].map(|edge| *edge == "1"),
             keep: session.parse::<u32>().is_err() || (*windows == "1" && *panes == "1"),
         })

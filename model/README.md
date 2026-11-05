@@ -84,6 +84,12 @@ still holds and is the guarantee under arbitrary concurrency. Re-reading focus
 before each layer only narrows such windows without making any property hold,
 so hypr-nav does not do it.
 
+A read that fails in the model is an IPC read (Kitty `ls`, tmux
+`list-clients`, Herdr, Neovim). Local `/proc` reads are not: a process that
+cannot be read hosts no inner layer (a dead pane kept open, or a pipeline whose
+leader was reaped), so the outer layer acts, which is what closing such a pane
+should do (`src/proc.rs`).
+
 Not modelled: Kitty tabs and overlay groups, two-dimensional layouts and
 Kitty's recency-based neighbour choice (unit-tested in `src/kitty.rs`), more
 than two panes per layer, multiple monitors, window identity reuse, timing,
