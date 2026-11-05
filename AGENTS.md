@@ -46,7 +46,7 @@ cargo test
 
 Tests drive real protocols, not fakes: a headless Neovim, a real tmux server with a pty client and Neovim inside it (routed through the real innermost-first loop, with the requests sent checked against the model's mutation bounds), and TLC over the routing model with Neovim in Herdr and in tmux (`tests/model.rs`, about 40 s). Pure decisions (Kitty neighbour choice, Herdr entry and close, tmux rows) use captured response shapes. Herdr and Kitty are not in the build sandbox: after changing either layer, check it against a disposable Herdr session and the live Kitty before release.
 
-After deploying through `~/nix-config`, confirm `realpath "$(command -v hypr-nav)"` is the new store path, then exercise each affected route through its real keybinding.
+To deploy a pushed change, start `systemctl start --no-block overlay-updates.service` on Minworker (it bumps the pin, validates both hosts and publishes `~/nix-config`), then ask the user to run `ns` on both hosts. After deploying, confirm `realpath "$(command -v hypr-nav)"` is the new store path, then exercise each affected route through its real keybinding.
 
 <!-- clai:instructions:coding:start -->
 <!-- source-sha256:1a131f46fafd56730f2f1706abcc2b7ff7ebdcb45e3956551ba62a37bf184580 -->
