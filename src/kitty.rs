@@ -23,7 +23,7 @@ impl Kitty {
             .as_str()
             .and_then(|data| serde_json::from_str(data).ok())
             .ok_or("kitty ls: malformed data")?;
-        let (tab, pane) = focused(&data, window).ok_or("kitty: no unique focused pane")?;
+        let (tab, pane) = focused(&data, window).map_err(|err| format!("kitty: {err}"))?;
         Ok(Some(Self {
             socket,
             tab: tab.clone(),
@@ -83,25 +83,61 @@ fn command(socket: &std::path::Path, name: &str, payload: Value) -> R<Value> {
 }
 
 /// One shared Kitty process can own many OS windows; Hyprland's `xdgTag`
-/// (Kitty's `wm_name`) says which. Untagged, only a sole OS window is safe.
-fn focused<'a>(data: &'a Value, window: &Window) -> Option<(&'a Value, &'a Value)> {
-    let os_windows = data.as_array()?;
-    if window.tag.is_empty() && os_windows.len() != 1 {
-        return None;
-    }
-    let os_window = only(os_windows, |os| {
-        os["wm_class"] == window.class.as_str()
-            && (window.tag.is_empty() || os["wm_name"] == window.tag.as_str())
-    })?;
-    let tab = only(os_window["tabs"].as_array()?, |tab| {
-        tab["is_active"] == true
-    })?;
-    let pane = only(tab["windows"].as_array()?, |pane| pane["is_active"] == true)?;
-    Some((tab, pane))
+/// (Kitty's `wm_name`) says which. Kitty gives OS windows it creates itself
+/// (a tab dragged out, `new_os_window`) the server's first tag, and untagged
+/// windows carry none, so several may match: then the one Kitty reports
+/// focused is the window Hyprland focused.
+fn focused<'a>(data: &'a Value, window: &Window) -> R<(&'a Value, &'a Value)> {
+    let os_windows = data.as_array().ok_or("ls is not a list")?;
+    let candidates: Vec<&Value> = os_windows
+        .iter()
+        .filter(|os| {
+            os["wm_class"] == window.class.as_str()
+                && (window.tag.is_empty() || os["wm_name"] == window.tag.as_str())
+        })
+        .collect();
+    let os_window = match candidates.as_slice() {
+        [] => {
+            let names: Vec<String> = os_windows
+                .iter()
+                .map(|os| format!("{}/{}", os["wm_class"], os["wm_name"]))
+                .collect();
+            return Err(format!(
+                "no OS window matches class {:?} tag {:?} (has {})",
+                window.class,
+                window.tag,
+                names.join(", ")
+            ));
+        }
+        [only] => *only,
+        several => {
+            only(several.iter().copied(), |os| os["is_focused"] == true).ok_or_else(|| {
+                format!(
+                    "{} OS windows match tag {:?} and none is uniquely focused",
+                    several.len(),
+                    window.tag
+                )
+            })?
+        }
+    };
+    let tab = only(
+        os_window["tabs"]
+            .as_array()
+            .ok_or("OS window has no tabs")?,
+        |tab| tab["is_active"] == true,
+    )
+    .ok_or("no unique active tab")?;
+    let pane = only(
+        tab["windows"].as_array().ok_or("tab has no windows")?,
+        |pane| pane["is_active"] == true,
+    )
+    .ok_or("no unique active pane")?;
+    Ok((tab, pane))
 }
 
-fn only(items: &[Value], predicate: impl Fn(&Value) -> bool) -> Option<&Value> {
-    let mut matches = items.iter().filter(|item| predicate(item));
+/// The single item satisfying `predicate`, if exactly one does.
+fn only<T>(items: impl IntoIterator<Item = T>, predicate: impl Fn(&T) -> bool) -> Option<T> {
+    let mut matches = items.into_iter().filter(|item| predicate(item));
     let found = matches.next()?;
     matches.next().is_none().then_some(found)
 }
@@ -195,17 +231,23 @@ mod tests {
     }
 
     #[test]
-    fn shared_process_needs_the_compositor_tag() {
-        let os = |tag: &str| json!({"wm_class": "kitty", "wm_name": tag, "tabs": [tab()]});
-        let data = json!([os("kitty-a"), os("kitty-b")]);
+    fn shared_process_resolves_by_tag_then_kitty_focus() {
+        let os = |tag: &str, focused: bool| json!({"wm_class": "kitty", "wm_name": tag, "is_focused": focused, "tabs": [tab()]});
         let window = |tag: &str| Window {
             address: "0x1".into(),
             class: "kitty".into(),
             pid: 9,
             tag: tag.into(),
         };
-        assert!(focused(&data, &window("kitty-b")).is_some());
-        assert!(focused(&data, &window("")).is_none());
-        assert!(focused(&data, &window("kitty-c")).is_none());
+        let distinct = json!([os("kitty-a", true), os("kitty-b", false)]);
+        assert!(focused(&distinct, &window("kitty-b")).is_ok());
+        assert!(focused(&distinct, &window("kitty-c")).is_err());
+        // A dragged-out tab reuses the server's tag: Kitty's focus decides.
+        let shared = json!([os("kitty-a", false), os("kitty-a", true)]);
+        let (tab, _) = focused(&shared, &window("kitty-a")).unwrap();
+        assert!(std::ptr::eq(tab, &shared[1]["tabs"][0]));
+        assert!(focused(&distinct, &window("")).is_ok());
+        let unfocused = json!([os("kitty-a", false), os("kitty-a", false)]);
+        assert!(focused(&unfocused, &window("kitty-a")).is_err());
     }
 }
