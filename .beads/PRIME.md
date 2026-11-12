@@ -11,8 +11,7 @@
 
 ```
 [ ] 1. bd close <id1> <id2> ...   (close completed issues)
-[ ] 2. run quality gates        (tests, linters, builds when relevant)
-[ ] 3. git status               (maintain good Git/Dolt hygiene)
+[ ] 2. git status               (maintain good Git/Dolt hygiene)
        git add -- <owned-paths>
        git commit --only -m "..." -- <owned-paths>
        bd dolt push
@@ -108,6 +107,6 @@ git push
 ```bash
 # Run bd create commands in parallel (use subagents for many items)
 bd create --title="Implement feature X" --description="Why this issue exists and what needs to be done" --type=feature
-bd create --title="Write tests for X" --description="Why this issue exists and what needs to be done" --type=task
-bd dep add beads-yyy beads-xxx  # Tests depend on Feature (Feature blocks tests)
+bd create --title="Implement feature Y" --description="Why this issue exists and what needs to be done" --type=feature
+bd dep add beads-yyy beads-xxx  # Y depends on X (X blocks Y)
 ```
