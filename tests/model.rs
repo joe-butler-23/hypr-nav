@@ -1,5 +1,6 @@
-//! Model-checks `model/HyprNav.tla` with TLC so the protocol model cannot
-//! drift from the build. The deeper `-2` bounds are run by hand (README).
+//! Model-checks `model/HyprNav.tla` with TLC so the Architecture 4A (`nav-v1`)
+//! protocol model cannot drift from the build. Runs both `-1` and `-2` bounds
+//! (including ABA focus flips `W1 -> W2 -> W1` under `MaxEnv = 2`!).
 
 use std::path::Path;
 use std::process::Command;
@@ -16,19 +17,11 @@ fn tlc() -> Command {
     }
 }
 
-/// Configurations run one at a time, each in a private scratch directory:
-/// TLC uses every core and unpacks its standard modules into the JVM's
-/// temporary directory, which concurrent runs would otherwise share.
 #[test]
 fn routing_model_holds() {
     let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("model");
     for config in [
-        "close-1",
-        "left-1",
-        "right-1",
-        "close-1-tmux",
-        "left-1-tmux",
-        "right-1-tmux",
+        "close-1", "left-1", "right-1", "close-2", "left-2", "right-2",
     ] {
         let scratch =
             std::env::temp_dir().join(format!("hypr-nav-tlc-{config}-{}", std::process::id()));

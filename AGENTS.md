@@ -1,50 +1,56 @@
 # Purpose — hypr-nav
 
-`hypr-nav` gives one set of directional navigation and close keybindings across nested Hyprland, Kitty, tmux, Herdr and Neovim. It must act on exactly one current target, make edge transitions predictable, keep the keypress path bounded, and refuse any close whose target is not proven.
+`hypr-nav` gives one directional navigation and close surface across Hyprland, Kitty, Herdr (local and remote `mw` over SSH), Neovim, and any universal `nav-v1` container (`$XDG_RUNTIME_DIR/nav-<pid>.sock`). It executes synchronously inside Hyprland on non-terminal surfaces, guards async fallbacks with strict monotone Epoch-CAS, keeps every keypress bounded, and refuses any close whose target is not proven.
 
-## Runtime Contract
+## Architecture (`nav-v1` Coalgebra)
 
-- One binary: `hypr-nav <left|right|up|down>` navigates and `hypr-nav close` closes. Neither has an alternative entry point.
-- A window resolves into a chain of layers by following foreground processes inward. Kitty names its focused pane over `$XDG_RUNTIME_DIR/kitty-<pid>`; any other window with exactly one terminal session uses that session. Each pane's terminal foreground process group leader is classified by name (`nvim`, `tmux`, `herdr`), and that layer names its own focused pane's foreground process. Cost follows the nesting present, never the number of supported layers: adding a layer is one `Layer` variant and one name.
-- Actions run innermost first. A layer returns `Pass` only when it has nothing to do (an edge, a final pane); then the next outer layer acts, ending at Hyprland. Any unacknowledged or failed action stops routing.
-- After an outer move, entry lands on the near edge of the destination, outermost layer first, and stops at the first layer that moves.
-- Decide each action from one read of the layer that performs it and address exactly what that read named; where a layer decides and acts in one request (Neovim `wincmd`, Herdr `focus_direction`, Herdr snapshot-then-close), let it. A close destroys at most the one pane it names. Only Hyprland's relative move is guarded by re-reading the active window. Close refuses an incomplete chain.
-- `model/HyprNav.tla` is the protocol's contract (`model/README.md`): contained and exact close, exact navigation, bounded mutation and termination, checked by TLC. Change the model with any routing change.
-- Every socket and subprocess shares one 1.5 s keypress budget. All IPC except tmux is in-process over sockets: Hyprland, Kitty's control protocol, Herdr's JSON lines, Neovim msgpack-RPC.
-- Only Lua Hyprland is supported (`dispatch hl.dsp...`).
+Every container implements one 3-verb, 4-outcome line protocol (`nav <left|right|up|down> | enter <left|right|up|down> | close` -> `done | pass | refuse <reason> | delegate <token> <cap> | enter <cap>`):
 
-## Hyprland Configuration
+- **Layer 0 — Compositor VM (`share/hypr-nav.lua`):** Loaded from `hyprland.lua` via `dofile`; Chezmoi `binds.lua` owns keybindings. Handles all non-Kitty/non-`nav-v1` windows (including Brave, Obsidian, Anki, `hf-slot`, `herdr-gk`) synchronously in Hyprland's Lua 5.5 VM (0 forks, 0 sockets, strictly linearizable). Detects Kitty (`kitty-<pid>`) and universal `nav-v1` (`nav-<pid>.sock`) sockets without forking (`io.open` `ENXIO=6` vs `ENOENT=2`), maintains a monotone `window.active` focus epoch `GEN`, and exposes atomic Epoch-CAS callbacks (`hn_cas_focus`, `hn_cas_close`, `hn_cli`) over `.socket.sock` `repl`.
+- **Layer 1 — Kitty VM (`share/kitty_nav.py`):** In-process `no_ui=True` Kitty kitten invoked over `$XDG_RUNTIME_DIR/kitty-<pid>` by absolute Nix store path (`HYPR_NAV_KITTEN` -> `<exe>/../../share/hypr-nav/kitty_nav.py` -> manifest fallback; zero edits to `kitty.conf`). Runs synchronously in Kitty's RAM using Kitty's own `boss.os_window_map`, `tab.neighboring_group_id`, `neighbors_for_any_window`, `boss.close_windows_no_confirm`, `os.tcgetpgrp(w.child.child_fd)` (falling back to `foreground_processes` only on a dead pipeline leader), and Layer-1 `w.id` CAS (`step_nav`, `step_close`). Internal moves `P -> Q` return `Q`'s near-edge entry in the same RAM call.
+- **Layers 2..3 + Universal Router (`src/main.rs`):** Single-file `#![forbid(unsafe_code)]` Rust binary (runtime deps strictly `{ rmpv, serde_json }`, zero `thread::sleep`/`try_wait`, zero background daemons or threads). Owns the program-agnostic `nav-v1` recursive router (`route_node`, `route_from_hypr`), Herdr 0.9.5 JSON-RPC shim (`pane.process_info`, `pane.focus_direction`, `pane.edges`, `session.snapshot`, `pane.close` — sparing the final pane so persistent sessions survive), Neovim 0.12.4 `rmpv` msgpack-RPC shim (skipping interleaved `rpcnotify` frames; `close` always passes), universal `$XDG_RUNTIME_DIR/nav-<pid>.sock` client, stateless remote `mw` recursion (`ssh -o BatchMode=yes -T <host> hypr-nav --herdr <session> ...` riding OpenSSH `ControlMaster`, bounded by kernel `SO_RCVTIMEO`, fail-closed on network drops), and `/run/systemd/journal/socket` error reporting.
+
+## Hyprland Configuration & CLI Entrypoints
+
+Chezmoi owns all binds (including `focus-jail`):
 
 ```lua
+local hyprNav = dofile("/run/current-system/sw/share/hypr-nav/hypr-nav.lua")
 for key, dir in pairs({h = "left", j = "down", k = "up", l = "right"}) do
-    hl.bind("SUPER + " .. key, hl.dsp.exec_cmd("hypr-nav " .. dir))
+    hl.bind("SUPER + " .. key, hyprNav.nav(dir))
 end
-hl.bind("SUPER + C", hl.dsp.exec_cmd("hypr-nav close"))
+hl.bind("SUPER + C", hyprNav.close)
 ```
 
-Set `HYPR_NAV_DEBUG=1` to print the resolved chain and the acting layer to stderr. Failures always reach stderr and the journal: `journalctl --user -t hypr-nav`.
-
-## Layer identity
-
-- Kitty: a shared Kitty process can own several OS windows; Hyprland `xdgTag` must equal Kitty `wm_name` (launch with `--os-window-tag`). Kitty gives OS windows it creates itself (a tab dragged out, `new_os_window`) the server's first tag, and untagged windows carry none: when several match, the one Kitty reports focused is used, and none or several refuses. Neighbours resolve to explicit pane IDs, preferring the most recently active group as Kitty does. Close closes the pane it read; Kitty closes the tab and OS window with their last pane, so a split opened meanwhile survives.
-- tmux: the client's `-S`/`-L` flags and `TMUX_TMPDIR` select the server; one `list-clients` row gives pane, edges, pane pid and close policy. Named sessions and a final pane detach the client; other panes are killed.
-- Herdr: explicit `--session` beats inherited `HERDR_*` variables; remote clients and one-shot commands are not layers. Success is the absence of an error (0.9.5 acknowledges `pane.focus` with `pane_info`). Close removes the focused pane after checking the snapshot is consistent; the final pane passes outward so the session survives.
-- Neovim: the server socket is `--listen` or `nvim.<pid>.0` of the process or its embedded server child. Commands run through `execute()` so they work in every mode.
+- Standalone CLI: `hypr-nav <left|right|up|down|close>` (routes through `share/hypr-nav.lua`'s `hn_cli`).
+- Internal subcommands: `--from-hypr ...` (from `share/hypr-nav.lua`), `--herdr <session> <nav <dir> | enter <dir> | close>` (stateless remote `nav-v1` hop over OpenSSH `ControlMaster`).
+- Environment overrides: `HYPR_NAV_BIN` (Lua -> binary path), `HYPR_NAV_KITTEN` (Rust -> `kitty_nav.py` path), `HYPR_NAV_SSH` (custom SSH wrapper for testing).
 
 ## Ownership and Safety
 
-- This repository owns routing, detection and protocol behaviour. `~/nix-config` owns packaging, the pinned revision and deployment; Chezmoi owns the binds; `hf close-guard` (hypr-focus) runs `hypr-nav close`. Do not install binaries manually.
-- Never exercise close against live work. Live checks use disposable tmux servers (`-L`) and Herdr sessions, removed afterwards.
+- This repository owns routing, dialect shims, formal proofs, and protocol verification. `~/nix-config` owns packaging (`install -Dm444 share/* $out/share/hypr-nav/`), the pinned revision, and deployment; Chezmoi owns Hyprland binds. Do not install binaries manually.
+- Never exercise close against live work. Live checks use isolated `/tmp` Herdr sessions, loopback `sshd`, and isolated nested Hyprland/Kitty instances with `DBUS_SESSION_BUS_ADDRESS` and `NOTIFY_SOCKET` unset, cleaned on exit.
 
 ## Verification
+
+```bash
+bash scripts/verify.sh
+```
+
+Or run checks directly:
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+lean -DwarningAsError=true proofs/HyprNav.lean
 ```
 
-Tests drive real protocols, not fakes: a headless Neovim, a real tmux server with a pty client and Neovim inside it (routed through the real innermost-first loop, with the requests sent checked against the model's mutation bounds), and TLC over the routing model with Neovim in Herdr and in tmux (`tests/model.rs`, about 40 s). Pure decisions (Kitty neighbour choice, Herdr entry and close, tmux rows) use captured response shapes. Herdr and Kitty are not in the build sandbox: after changing either layer, check it against a disposable Herdr session and the live Kitty before release.
+Verification spans two formal layers and live protocol proofs:
+- **Unbounded Lean 4 (`proofs/HyprNav.lean`):** 19 machine-checked theorems (`-DwarningAsError=true`, zero `sorryAx`/`native_decide`/custom axioms) covering Layer-0 strict linearizability, monotone `GEN` Epoch-CAS ABA-freedom, arbitrary-depth `nav-v1` `CloseContained`/`IncompleteChainRefusesClose`/`NavigationDestroysNothing`/`BoundedMutation`/`Termination`, remote SSH partition safety, Hyprland `{window = "address:..."}` exactness, and the Push-Cache Asymmetry counterexample.
+- **Bounded TLA+ / TLC (`model/HyprNav.tla`, `tests/model.rs`):** Exhaustively checks all 6 configs (`close`/`left`/`right` × `MaxEnv ∈ {1, 2}`, including ABA focus flips and `RemoteFault`).
+- **Layer B Lockstep Bisimulation (`src/bisim.rs`):** 25,000 randomized concurrent traces driving unmodified `route_node`, `route_from_hypr`, wire codecs, and `share/kitty_nav.py` helpers.
+- **Live isolated proofs (`scripts/verify.sh`):** `timer-audit` + 0-`sleep`/`try_wait` audit, real headless Neovim, real Herdr 0.9.5 + loopback OpenSSH `ControlMaster` `--herdr` remote `mw` & partition refusal, and isolated nested Hyprland 0.57.2 (`share/hypr-nav.lua`) + Kitty 0.50.0 (`share/kitty_nav.py`) + universal `nav-<pid>.sock` custom app.
 
 To deploy a pushed change, start `systemctl start --no-block overlay-updates.service` on Minworker (it bumps the pin, validates both hosts and publishes `~/nix-config`), then ask the user to run `ns` on both hosts. After deploying, confirm `realpath "$(command -v hypr-nav)"` is the new store path, then exercise each affected route through its real keybinding.
 
